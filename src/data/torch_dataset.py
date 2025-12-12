@@ -5,7 +5,7 @@ PyTorch Dataset 包装 processed jsonl。
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Literal, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -18,6 +18,8 @@ class FilterDesignDataset(Dataset):
         tokenizer,
         use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
         mix_real_prob: float = 0.3,
+        use_repr: Literal["vact", "sfci"] = "vact",
+        normalize_wave: bool = False,
     ):
         self.samples = []
         with open(jsonl_path, "r") as f:
@@ -26,6 +28,26 @@ class FilterDesignDataset(Dataset):
         self.tokenizer = tokenizer
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
+        self.use_repr = use_repr
+        self.normalize_wave = normalize_wave
+
+    def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
+        """
+        Convert pre-split tokens (already without special tokens) to ids.
+        Prefers fast tokenizer batching to avoid <unk> inflation.
+        """
+        if not tokens:
+            return []
+        if callable(getattr(self.tokenizer, "__call__", None)):
+            out = self.tokenizer(tokens, is_split_into_words=True, add_special_tokens=False)
+            ids = out.get("input_ids") or out.get("ids") or []
+        elif hasattr(self.tokenizer, "convert_tokens_to_ids"):
+            ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        elif hasattr(self.tokenizer, "encode"):
+            ids = self.tokenizer.encode(tokens, add_special_tokens=False)
+        else:
+            ids = [self.tokenizer.get(t, 0) for t in tokens]
+        return [int(i) for i in ids]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -57,16 +79,22 @@ class FilterDesignDataset(Dataset):
         type_id = 0 if s["filter_type"] == "lowpass" else 1
         scalar = torch.tensor([type_id, s["fc_hz"]], dtype=torch.float32)
 
-        sfci_tokens = s.get("vact_tokens") or s.get("sfci_tokens") or []
-        if hasattr(self.tokenizer, "encode"):
-            token_ids = self.tokenizer.encode(sfci_tokens)
-        else:
-            token_ids = [self.tokenizer[t] for t in sfci_tokens]
-        input_ids = torch.tensor(token_ids, dtype=torch.long)
+        tokens_raw = s.get("vact_tokens") if self.use_repr == "vact" else s.get("sfci_tokens")
+        tokens_raw = tokens_raw or []
+        token_ids = self._tokens_to_ids(tokens_raw)
+
+        if self.normalize_wave:
+            # channel-wise standardization to stabilize optimization
+            wave = wave - wave.mean(dim=-1, keepdim=True)
+            wave_std = wave.std(dim=-1, keepdim=True).clamp_min(1e-4)
+            wave = wave / wave_std
 
         return {
             "freq": freq,
             "wave": wave,
             "scalar": scalar,
-            "input_ids": input_ids,
+            # keep both keys so collate_fn can pick by repr
+            "input_ids": token_ids,
+            "vact_tokens": token_ids if self.use_repr == "vact" else None,
+            "sfci_tokens": token_ids if self.use_repr == "sfci" else None,
         }
