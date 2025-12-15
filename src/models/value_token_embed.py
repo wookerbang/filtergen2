@@ -44,8 +44,9 @@ class ValueAwareEmbedding(nn.Module):
         base = self.base_embedding(input_ids)
         mask = self.is_value_token[input_ids]
         if mask.any():
-            vals = self.value_lookup[input_ids][mask]
+            vals = self.value_lookup[input_ids][mask].float()
             val_vec = self.mlp(torch.log10(vals.unsqueeze(-1).clamp_min(1e-16)))
+            val_vec = val_vec.to(base.dtype)
             offset = torch.zeros_like(base)
             offset[mask] = val_vec
             return base + offset

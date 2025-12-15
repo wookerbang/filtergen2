@@ -4,7 +4,8 @@ from typing import Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
-from transformers import BaseModelOutput, T5Config, T5ForConditionalGeneration
+from transformers import T5Config, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 
 from .scalar_encoder import SpecEncoder
 from .value_token_embed import ValueAwareEmbedding

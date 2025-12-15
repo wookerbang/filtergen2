@@ -34,19 +34,28 @@ class FilterDesignDataset(Dataset):
     def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
         """
         Convert pre-split tokens (already without special tokens) to ids.
-        Prefers fast tokenizer batching to avoid <unk> inflation.
+
+        Note: the tokenizer here is WordLevel with a whitespace pre-tokenizer,
+        so feeding the tokens back into ``tokenizer(...)`` will split the
+        angle-bracket tokens and turn everything into <unk>. We therefore
+        map the tokens directly via ``convert_tokens_to_ids`` when available.
         """
         if not tokens:
             return []
-        if callable(getattr(self.tokenizer, "__call__", None)):
+
+        if hasattr(self.tokenizer, "convert_tokens_to_ids"):
+            ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        elif callable(getattr(self.tokenizer, "__call__", None)):
             out = self.tokenizer(tokens, is_split_into_words=True, add_special_tokens=False)
             ids = out.get("input_ids") or out.get("ids") or []
-        elif hasattr(self.tokenizer, "convert_tokens_to_ids"):
-            ids = self.tokenizer.convert_tokens_to_ids(tokens)
+            if ids and isinstance(ids[0], list):
+                # flatten batch-style output
+                ids = sum(ids, [])
         elif hasattr(self.tokenizer, "encode"):
             ids = self.tokenizer.encode(tokens, add_special_tokens=False)
         else:
             ids = [self.tokenizer.get(t, 0) for t in tokens]
+
         return [int(i) for i in ids]
 
     def __len__(self) -> int:

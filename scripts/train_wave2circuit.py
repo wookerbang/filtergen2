@@ -65,7 +65,7 @@ def make_collate_fn(tokenizer, use_repr: str):
 class Wave2CircuitTrainer(Trainer):
     """Custom Trainer that routes waveform/spec inputs into VACTT5."""
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         outputs = model(
             wave=inputs["wave"],
             filter_type=inputs["filter_type"],
@@ -163,6 +163,11 @@ def main() -> None:
 
     eval_strategy = "steps" if eval_ds is not None else "no"
 
+    save_steps = args.save_steps
+    if eval_ds is not None and save_steps % args.eval_steps != 0:
+        # align save/eval cadence to satisfy load_best_model_at_end requirement
+        save_steps = args.eval_steps
+
     training_args = TrainingArguments(
         output_dir=str(args.output),
         num_train_epochs=args.epochs,
@@ -171,7 +176,7 @@ def main() -> None:
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         logging_steps=args.log_steps,
-        save_steps=args.save_steps,
+        save_steps=save_steps,
         eval_steps=args.eval_steps,
         evaluation_strategy=eval_strategy,
         save_strategy="steps",
@@ -181,6 +186,7 @@ def main() -> None:
         greater_is_better=False,
         remove_unused_columns=False,
         report_to="none",
+        save_safetensors=False,  # tied embeddings -> avoid shared-tensor safetensors error
         warmup_ratio=0.05,
         weight_decay=0.01,
         max_grad_norm=1.0,
@@ -201,6 +207,10 @@ def main() -> None:
 
     trainer.train()
     trainer.save_model(str(args.output))
+    # Save minimal HF-style artifacts for eval/debug (avoid saving tied ValueAwareEmbedding weights here).
+    model.t5.config.save_pretrained(str(args.output))
+    model.t5.generation_config.save_pretrained(str(args.output))
+    tokenizer.save_pretrained(str(args.output))
 
 
 if __name__ == "__main__":
