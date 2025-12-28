@@ -96,6 +96,7 @@ def parse_args() -> argparse.Namespace:
         help="Target representation to decode.",
     )
     p.add_argument("--num", type=int, default=200, help="Number of samples to eval.")
+    p.add_argument("--sample-id", type=str, help="Evaluate a single sample_id (overrides --num).")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
     p.add_argument("--wave-norm", action="store_true", help="Normalize waveforms (must match training if enabled).")
@@ -170,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--error", choices=["mae_lin", "rmse_lin", "mae_db", "rmse_db", "maxe_lin", "maxe_db"], default="mae_lin")
     p.add_argument("--taus", type=str, default="0.01,0.02,0.05", help="Comma-separated τ thresholds for success@τ.")
+    p.add_argument("--debug-nan", action="store_true", help="Print debug info when simulated S21 contains NaN/Inf.")
 
     # refinement (topology fixed)
     p.add_argument("--refine-steps", type=int, default=0, help="Few-step differentiable refinement steps (0 disables).")
@@ -203,7 +205,13 @@ def main() -> None:
         freq_scale=args.freq_scale,
         include_s11=args.include_s11,
     )
-    idxs = random.sample(range(len(ds)), min(int(args.num), len(ds)))
+    if args.sample_id:
+        idxs = [i for i, s in enumerate(ds.samples) if s.get("sample_id") == args.sample_id]
+        if not idxs:
+            raise ValueError(f"sample_id not found in dataset: {args.sample_id}")
+        idxs = idxs[:1]
+    else:
+        idxs = random.sample(range(len(ds)), min(int(args.num), len(ds)))
 
     # model
     in_channels = ds[0]["wave"].shape[0]
@@ -312,6 +320,20 @@ def main() -> None:
         target_s21 = np.asarray(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [], dtype=float)
         if freq.size == 0 or target_s21.size == 0:
             continue
+        if args.debug_nan:
+            bad_tgt = ~np.isfinite(target_s21)
+            if bool(np.any(bad_tgt)):
+                bad_idx = np.where(bad_tgt)[0]
+                preview = bad_idx[:5]
+                preview_vals = [float(target_s21[j]) for j in preview]
+                preview_freq = [float(freq[j]) for j in preview]
+                print(
+                    "[nan_target]"
+                    f" sample_id={raw.get('sample_id')}"
+                    f" bad={len(bad_idx)}/{len(target_s21)}"
+                    f" freq={preview_freq}"
+                    f" s21={preview_vals}"
+                )
         z0 = float(raw.get("z0", 50.0))
         fc_hz_raw = raw.get("fc_hz")
         if fast_engine is None or float(fast_engine.z0) != z0:
@@ -403,8 +425,30 @@ def main() -> None:
                     fast_engine=fast_engine,
                 )
                 any_simulated = True
+                if args.debug_nan:
+                    bad_mask = ~np.isfinite(s21_db)
+                    if bool(np.any(bad_mask)):
+                        bad_idx = np.where(bad_mask)[0]
+                        preview = bad_idx[:5]
+                        preview_vals = [float(s21_db[j]) for j in preview]
+                        preview_freq = [float(freq[j]) for j in preview]
+                        comp_vals = [float(c.value_si) for c in comps]
+                        v_min = float(np.min(comp_vals)) if comp_vals else float("nan")
+                        v_max = float(np.max(comp_vals)) if comp_vals else float("nan")
+                        print(
+                            "[nan_s21]"
+                            f" sample_id={raw.get('sample_id')}"
+                            f" cand={i_seq}"
+                            f" bad={len(bad_idx)}/{len(s21_db)}"
+                            f" freq={preview_freq}"
+                            f" s21={preview_vals}"
+                            f" val_range=[{v_min:.3e},{v_max:.3e}]"
+                        )
                 e0 = waveform_error(s21_db, target_s21, kind=args.error)
-                cand_records.append((float(e0.value), e0, comps, toks))
+                err_val = float(e0.value)
+                if not np.isfinite(err_val):
+                    err_val = float("inf")
+                cand_records.append((err_val, e0, comps, toks))
             except Exception:
                 cand_records.append((float("inf"), None, None, None))
 
@@ -455,7 +499,10 @@ def main() -> None:
                         fast_engine=fast_engine,
                     )
                     err_r = waveform_error(s21_db_r, target_s21, kind=args.error)
-                    refined_records[j] = (float(err_r.value), err_r, comps_r, toks0)
+                    err_val = float(err_r.value)
+                    if not np.isfinite(err_val):
+                        err_val = float("inf")
+                    refined_records[j] = (err_val, err_r, comps_r, toks0)
                 except Exception:
                     pass
             cand_records = refined_records

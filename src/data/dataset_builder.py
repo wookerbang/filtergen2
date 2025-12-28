@@ -70,6 +70,7 @@ def build_dataset(
     q_C: float | None = 50.0,
     tol_frac: float = 0.05,
     q_model: str = "freq_dependent",
+    check_insertion_loss: bool = True,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -171,19 +172,20 @@ def build_dataset(
             if real_s21_db is None or np.any(np.isnan(real_s21_db)):
                 print(f"Sample {i}: Simulation failed or NaN.")
                 continue
-            is_broken = False
-            ftype = spec.get("filter_type", "lowpass")
-            if ftype == "lowpass":
-                if np.mean(real_s21_db[:10]) < -10.0:
-                    is_broken = True
-            elif ftype == "bandpass":
-                mid = len(real_s21_db) // 2
-                window = real_s21_db[max(0, mid - 5) : mid + 5]
-                if np.mean(window) < -10.0:
-                    is_broken = True
-            if is_broken:
-                print(f"Sample {i}: Circuit broken (High insertion loss).")
-                continue
+            if check_insertion_loss:
+                is_broken = False
+                ftype = spec.get("filter_type", "lowpass")
+                if ftype == "lowpass":
+                    if np.mean(real_s21_db[:10]) < -10.0:
+                        is_broken = True
+                elif ftype == "bandpass":
+                    mid = len(real_s21_db) // 2
+                    window = real_s21_db[max(0, mid - 5) : mid + 5]
+                    if np.mean(window) < -10.0:
+                        is_broken = True
+                if is_broken:
+                    print(f"Sample {i}: Circuit broken (High insertion loss).")
+                    continue
 
             vact_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_tokens(
                 discrete_components,

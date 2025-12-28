@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
-    p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%).")
+    p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%%).")
     p.add_argument(
         "--q-model",
         type=str,
@@ -54,6 +54,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dsl", dest="dsl", action="store_true", help="Emit DSL tokens (macro/repeat).")
     p.add_argument("--no-dsl", dest="dsl", action="store_false", help="Disable DSL token emission.")
     p.set_defaults(dsl=True)
+    p.add_argument(
+        "--il-check",
+        dest="il_check",
+        action="store_true",
+        help="Reject circuits with high insertion loss (default: on).",
+    )
+    p.add_argument(
+        "--no-il-check",
+        dest="il_check",
+        action="store_false",
+        help="Disable insertion loss rejection sanity check.",
+    )
+    p.set_defaults(il_check=True)
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
@@ -78,6 +91,7 @@ def main() -> None:
         q_C=q_c,
         tol_frac=float(args.tol),
         q_model=str(args.q_model),
+        check_insertion_loss=bool(args.il_check),
     )
     print(f"Dataset written to {path}")
 
