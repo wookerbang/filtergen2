@@ -100,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-beams", type=int, default=4, help="Beam size (used when --do-sample is off).")
     p.add_argument("--top-p", type=float, default=0.95, help="Nucleus sampling p (used when --do-sample).")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (used when --do-sample).")
+    p.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty for generation (>1 discourages repeats).")
     p.add_argument("--max-new", type=int, default=256, help="Max new tokens.")
     p.add_argument("--syntax-mask", action="store_true", help="Apply representation grammar mask during decoding.")
     p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL slots.")
@@ -307,6 +308,7 @@ def main() -> None:
             pad_token_id=tokenizer.pad_token_id,
             prefix_allowed_tokens_fn=prefix_allowed,
             num_return_sequences=int(args.kmax),
+            repetition_penalty=float(args.repetition_penalty),
         )
         if args.do_sample:
             gen_kwargs.update(

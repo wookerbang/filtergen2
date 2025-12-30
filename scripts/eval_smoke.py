@@ -90,6 +90,12 @@ def main() -> None:
     ap.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
     ap.add_argument("--num", type=int, default=20, help="Number of samples to eval.")
     ap.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
+    ap.add_argument(
+        "--target-wave",
+        default="auto",
+        choices=["auto", "ideal", "real"],
+        help="Target S21 selection: auto (prefer real if present), ideal, or real.",
+    )
     ap.add_argument("--beam", type=int, default=4, help="Beam size for generation.")
     ap.add_argument("--min-new", type=int, default=0, help="Min new tokens to force generation length.")
     ap.add_argument("--use-ngspice", action="store_true", help="Use ngspice for simulation (requires ngspice installed).")
@@ -255,7 +261,12 @@ def main() -> None:
         fc_hz = scalars[1:2].to(args.device)
         freq = np.array(raw.get("freq_hz", []))
         # choose target S21: prefer real, fallback to ideal
-        target_s21 = np.array(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [])
+        if args.target_wave == "ideal":
+            target_s21 = np.array(raw.get("ideal_s21_db") or raw.get("real_s21_db") or [])
+        elif args.target_wave == "real":
+            target_s21 = np.array(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [])
+        else:
+            target_s21 = np.array(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [])
 
         with torch.no_grad():
             gen_ids = model.generate(

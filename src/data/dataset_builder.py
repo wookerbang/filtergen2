@@ -20,7 +20,7 @@ from .spice_runner import simulate_real_waveform
 from .vact_struct import components_to_vact_struct_tokens
 from .node_canonicalizer import canonicalize_nodes
 from .action_codec import components_to_action_tokens
-from .dsl import MACRO_CELL_BS_PAR_SER_LC, MACRO_CELL_CS_LS, components_to_dsl_tokens
+from .dsl import VAL_NONE, components_to_dsl_segments, components_to_dsl_tokens
 from .scenarios import apply_scenario_postprocess, build_freq_grid, build_spec_masks, sample_scenario_spec
 from src.physics import FastTrackEngine
 
@@ -65,6 +65,9 @@ def build_dataset(
     emit_vact_struct: bool = True,
     emit_actions: bool = True,
     emit_dsl: bool = True,
+    dsl_include_order: bool = True,
+    dsl_use_cell_indices: bool = False,
+    dsl_strict: bool = False,
     max_nodes: int = 32,
     q_L: float | None = 50.0,
     q_C: float | None = 50.0,
@@ -204,16 +207,26 @@ def build_dataset(
             dsl_slot_values = None
             if emit_dsl:
                 ftype = str(spec.get("filter_type") or "lowpass")
-                if ftype == "bandstop":
-                    macro_name = MACRO_CELL_BS_PAR_SER_LC
-                elif ftype == "highpass":
-                    macro_name = MACRO_CELL_CS_LS
-                else:
-                    macro_name = None
-                if macro_name:
-                    dsl_tokens, dsl_slot_values = components_to_dsl_tokens(discrete_components, macro_name=macro_name)
-                else:
-                    dsl_tokens, dsl_slot_values = components_to_dsl_tokens(discrete_components)
+                try:
+                    segments = components_to_dsl_segments(
+                        discrete_components,
+                        filter_type=ftype,
+                        topology_type=str(spec.get("topology_type") or "t"),
+                    )
+                    dsl_tokens, dsl_slot_values = components_to_dsl_tokens(
+                        [],
+                        segments=segments,
+                        include_order=dsl_include_order,
+                        order=spec.get("order"),
+                        use_cell_indices=dsl_use_cell_indices,
+                        allow_incomplete=not dsl_strict,
+                    )
+                except ValueError as exc:
+                    print(f"Sample {i}: DSL encode failed ({exc}).")
+                    continue
+                if dsl_strict and dsl_tokens and VAL_NONE in dsl_tokens:
+                    print(f"Sample {i}: DSL contains <VAL_NONE>; skipping due to --dsl-strict.")
+                    continue
             sfci_tokens = components_to_sfci_net_tokens(discrete_components)
             action_tokens = components_to_action_tokens(discrete_components) if emit_actions else None
             sample = FilterSample(

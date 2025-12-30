@@ -95,7 +95,7 @@ def main() -> None:
     build_wordlevel_tokenizer(vact_struct_vocab, out_dir / "vact_struct_tokenizer")
 
     # DSL vocab (macro/repeat/slots)
-    dsl_vocab = SPECIAL_TOKENS + build_dsl_vocab()
+    dsl_vocab = SPECIAL_TOKENS + build_dsl_vocab(order_range=order_range)
     build_wordlevel_tokenizer(dsl_vocab, out_dir / "dsl_tokenizer")
 
     # SFCI net-centric vocab

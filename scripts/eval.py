@@ -99,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-id", type=str, help="Evaluate a single sample_id (overrides --num).")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
+    p.add_argument(
+        "--target-wave",
+        default="auto",
+        choices=["auto", "ideal", "real"],
+        help="Target S21 selection: auto (prefer real if present), ideal, or real.",
+    )
     p.add_argument("--wave-norm", action="store_true", help="Normalize waveforms (must match training if enabled).")
     p.add_argument(
         "--freq-mode",
@@ -151,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-beams", type=int, default=4, help="Beam size (used when --do-sample is off).")
     p.add_argument("--top-p", type=float, default=0.95, help="Nucleus sampling p (used when --do-sample).")
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (used when --do-sample).")
+    p.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty for generation (>1 discourages repeats).")
     p.add_argument("--max-new", type=int, default=256, help="Max new tokens.")
     p.add_argument("--syntax-mask", action="store_true", help="Apply representation grammar mask during decoding.")
     p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL slots.")
@@ -317,7 +324,12 @@ def main() -> None:
         sample = ds[idx]
         raw = ds.samples[idx]
         freq = np.asarray(raw.get("freq_hz", []), dtype=float)
-        target_s21 = np.asarray(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [], dtype=float)
+        if args.target_wave == "ideal":
+            target_s21 = np.asarray(raw.get("ideal_s21_db") or raw.get("real_s21_db") or [], dtype=float)
+        elif args.target_wave == "real":
+            target_s21 = np.asarray(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [], dtype=float)
+        else:
+            target_s21 = np.asarray(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [], dtype=float)
         if freq.size == 0 or target_s21.size == 0:
             continue
         if args.debug_nan:
@@ -353,6 +365,7 @@ def main() -> None:
             pad_token_id=tokenizer.pad_token_id,
             prefix_allowed_tokens_fn=prefix_allowed,
             num_return_sequences=kmax,
+            repetition_penalty=float(args.repetition_penalty),
         )
         if args.do_sample:
             gen_kwargs.update(

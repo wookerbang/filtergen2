@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -31,6 +32,11 @@ def parse_args() -> argparse.Namespace:
         default="random",
         help="Scenario template (general/anti_jamming/coexistence/wideband_rejection/random_basic) or 'random'.",
     )
+    p.add_argument(
+        "--scenario-weights",
+        type=str,
+        help='Optional JSON mapping of scenario -> weight, e.g. \'{"general":0.3,"wideband_rejection":0.3}\'',
+    )
     p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
@@ -54,6 +60,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dsl", dest="dsl", action="store_true", help="Emit DSL tokens (macro/repeat).")
     p.add_argument("--no-dsl", dest="dsl", action="store_false", help="Disable DSL token emission.")
     p.set_defaults(dsl=True)
+    p.add_argument("--dsl-order", dest="dsl_order", action="store_true", help="Prepend <ORDER_k> in DSL tokens.")
+    p.add_argument("--no-dsl-order", dest="dsl_order", action="store_false", help="Disable <ORDER_k> in DSL tokens.")
+    p.set_defaults(dsl_order=True)
+    p.add_argument("--dsl-cell-indices", dest="dsl_cell_indices", action="store_true", help="Emit <CELL_IDX_i> in DSL.")
+    p.add_argument("--no-dsl-cell-indices", dest="dsl_cell_indices", action="store_false", help="Disable <CELL_IDX_i> in DSL.")
+    p.set_defaults(dsl_cell_indices=False)
+    p.add_argument("--dsl-strict", dest="dsl_strict", action="store_true", help="Drop samples with <VAL_NONE> or DSL parse failures.")
+    p.add_argument("--no-dsl-strict", dest="dsl_strict", action="store_false", help="Allow <VAL_NONE> in DSL tokens.")
+    p.set_defaults(dsl_strict=False)
     p.add_argument(
         "--il-check",
         dest="il_check",
@@ -75,6 +90,12 @@ def main() -> None:
     args = parse_args()
     q_l = args.q if args.q_l is None else args.q_l
     q_c = args.q if args.q_c is None else args.q_c
+    scenario_weights = None
+    if args.scenario_weights:
+        try:
+            scenario_weights = json.loads(args.scenario_weights)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid --scenario-weights JSON: {exc}") from exc
     path = build_dataset(
         num_samples=args.num_samples,
         output_dir=str(args.output_dir),
@@ -82,10 +103,14 @@ def main() -> None:
         use_ngspice=bool(args.use_ngspice),
         seed=args.seed,
         scenario=str(args.scenario),
+        scenario_weights=scenario_weights,
         emit_vact_cells=bool(args.vact_cell),
         emit_vact_struct=bool(args.vact_struct),
         emit_actions=bool(args.actions),
         emit_dsl=bool(args.dsl),
+        dsl_include_order=bool(args.dsl_order),
+        dsl_use_cell_indices=bool(args.dsl_cell_indices),
+        dsl_strict=bool(args.dsl_strict),
         max_nodes=int(args.max_nodes),
         q_L=q_l,
         q_C=q_c,

@@ -1,0 +1,13 @@
+Samples evaluated: 200
+Validity@Kmax:    200/200
+Simulated@Kmax:   200/200
+success@0.01 best-of-1: 24/200 = 0.120
+success@0.02 best-of-1: 41/200 = 0.205
+success@0.05 best-of-1: 66/200 = 0.330
+success@0.01 best-of-4: 24/200 = 0.120
+success@0.02 best-of-4: 41/200 = 0.205
+success@0.05 best-of-4: 66/200 = 0.330
+success@0.01 best-of-16: 24/200 = 0.120
+success@0.02 best-of-16: 41/200 = 0.205
+success@0.05 best-of-16: 66/200 = 0.330
+Dumped to outputs/eval_100k_t5base_sample.jsonl

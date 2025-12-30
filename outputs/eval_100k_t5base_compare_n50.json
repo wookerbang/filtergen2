@@ -1,0 +1,378 @@
+{
+  "beam_n50": {
+    "metrics": {
+      "samples": 50,
+      "validity": {
+        "num": 47,
+        "den": 50
+      },
+      "simulated": {
+        "num": 47,
+        "den": 50
+      },
+      "success": {
+        "0.01": {
+          "1": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "4": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "16": {
+            "num": 6,
+            "den": 50,
+            "rate": 0.12
+          }
+        },
+        "0.02": {
+          "1": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "4": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "16": {
+            "num": 7,
+            "den": 50,
+            "rate": 0.14
+          }
+        },
+        "0.05": {
+          "1": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "4": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "16": {
+            "num": 14,
+            "den": 50,
+            "rate": 0.28
+          }
+        }
+      }
+    },
+    "dump_stats": {
+      "rows": 50,
+      "finite": 41,
+      "nonfinite": 9,
+      "nonfinite_empty_tokens": 3,
+      "nonfinite_zero_components": 3,
+      "best_error": {
+        "count": 41,
+        "min": 0.0002984024368322352,
+        "median": 0.40738489536906203,
+        "mean": 0.35731874667277225,
+        "max": 0.9999924815981251
+      },
+      "num_components": {
+        "count": 41,
+        "min": 4.0,
+        "median": 40.0,
+        "mean": 41.170731707317074,
+        "max": 140.0
+      },
+      "gen_tokens_len": {
+        "count": 41,
+        "min": 17.0,
+        "median": 83.0,
+        "mean": 84.39024390243902,
+        "max": 200.0
+      }
+    }
+  },
+  "beam_refine_n50": {
+    "metrics": {
+      "samples": 50,
+      "validity": {
+        "num": 47,
+        "den": 50
+      },
+      "simulated": {
+        "num": 47,
+        "den": 50
+      },
+      "success": {
+        "0.01": {
+          "1": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "4": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "16": {
+            "num": 6,
+            "den": 50,
+            "rate": 0.12
+          }
+        },
+        "0.02": {
+          "1": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "4": {
+            "num": 4,
+            "den": 50,
+            "rate": 0.08
+          },
+          "16": {
+            "num": 7,
+            "den": 50,
+            "rate": 0.14
+          }
+        },
+        "0.05": {
+          "1": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "4": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "16": {
+            "num": 14,
+            "den": 50,
+            "rate": 0.28
+          }
+        }
+      }
+    },
+    "dump_stats": {
+      "rows": 50,
+      "finite": 41,
+      "nonfinite": 9,
+      "nonfinite_empty_tokens": 3,
+      "nonfinite_zero_components": 3,
+      "best_error": {
+        "count": 41,
+        "min": 0.0002984024368322352,
+        "median": 0.40739446309457106,
+        "mean": 0.35578729518613855,
+        "max": 0.9999924781115251
+      },
+      "num_components": {
+        "count": 41,
+        "min": 4.0,
+        "median": 40.0,
+        "mean": 41.46341463414634,
+        "max": 140.0
+      },
+      "gen_tokens_len": {
+        "count": 41,
+        "min": 17.0,
+        "median": 83.0,
+        "mean": 84.92682926829268,
+        "max": 200.0
+      }
+    }
+  },
+  "sample_n50": {
+    "metrics": {
+      "samples": 50,
+      "validity": {
+        "num": 50,
+        "den": 50
+      },
+      "simulated": {
+        "num": 50,
+        "den": 50
+      },
+      "success": {
+        "0.01": {
+          "1": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "4": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "16": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          }
+        },
+        "0.02": {
+          "1": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          },
+          "4": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          },
+          "16": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          }
+        },
+        "0.05": {
+          "1": {
+            "num": 18,
+            "den": 50,
+            "rate": 0.36
+          },
+          "4": {
+            "num": 18,
+            "den": 50,
+            "rate": 0.36
+          },
+          "16": {
+            "num": 18,
+            "den": 50,
+            "rate": 0.36
+          }
+        }
+      }
+    },
+    "dump_stats": {
+      "rows": 50,
+      "finite": 50,
+      "nonfinite": 0,
+      "nonfinite_empty_tokens": 0,
+      "nonfinite_zero_components": 0,
+      "best_error": {
+        "count": 50,
+        "min": 0.0001275667503301719,
+        "median": 0.31539565637646083,
+        "mean": 0.33006512640324426,
+        "max": 0.9999924846524417
+      },
+      "num_components": {
+        "count": 50,
+        "min": 2.0,
+        "median": 8.0,
+        "mean": 9.24,
+        "max": 20.0
+      },
+      "gen_tokens_len": {
+        "count": 50,
+        "min": 15.0,
+        "median": 24.0,
+        "mean": 25.44,
+        "max": 42.0
+      }
+    }
+  },
+  "sample_refine_n50": {
+    "metrics": {
+      "samples": 50,
+      "validity": {
+        "num": 50,
+        "den": 50
+      },
+      "simulated": {
+        "num": 50,
+        "den": 50
+      },
+      "success": {
+        "0.01": {
+          "1": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "4": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          },
+          "16": {
+            "num": 9,
+            "den": 50,
+            "rate": 0.18
+          }
+        },
+        "0.02": {
+          "1": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          },
+          "4": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          },
+          "16": {
+            "num": 10,
+            "den": 50,
+            "rate": 0.2
+          }
+        },
+        "0.05": {
+          "1": {
+            "num": 18,
+            "den": 50,
+            "rate": 0.36
+          },
+          "4": {
+            "num": 19,
+            "den": 50,
+            "rate": 0.38
+          },
+          "16": {
+            "num": 19,
+            "den": 50,
+            "rate": 0.38
+          }
+        }
+      }
+    },
+    "dump_stats": {
+      "rows": 50,
+      "finite": 50,
+      "nonfinite": 0,
+      "nonfinite_empty_tokens": 0,
+      "nonfinite_zero_components": 0,
+      "best_error": {
+        "count": 50,
+        "min": 0.0001275667503301719,
+        "median": 0.31146412120779,
+        "mean": 0.3295398855760425,
+        "max": 0.9999924841544118
+      },
+      "num_components": {
+        "count": 50,
+        "min": 2.0,
+        "median": 8.0,
+        "mean": 9.16,
+        "max": 20.0
+      },
+      "gen_tokens_len": {
+        "count": 50,
+        "min": 15.0,
+        "median": 24.0,
+        "mean": 25.34,
+        "max": 42.0
+      }
+    }
+  }
+}

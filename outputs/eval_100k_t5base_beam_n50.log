@@ -1,0 +1,13 @@
+Samples evaluated: 50
+Validity@Kmax:    47/50
+Simulated@Kmax:   47/50
+success@0.01 best-of-1: 4/50 = 0.080
+success@0.02 best-of-1: 4/50 = 0.080
+success@0.05 best-of-1: 9/50 = 0.180
+success@0.01 best-of-4: 4/50 = 0.080
+success@0.02 best-of-4: 4/50 = 0.080
+success@0.05 best-of-4: 9/50 = 0.180
+success@0.01 best-of-16: 6/50 = 0.120
+success@0.02 best-of-16: 7/50 = 0.140
+success@0.05 best-of-16: 14/50 = 0.280
+Dumped to outputs/eval_100k_t5base_beam_n50.jsonl
