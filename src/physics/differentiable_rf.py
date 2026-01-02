@@ -7,6 +7,7 @@ from typing import Iterable, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.data.schema import ComponentSpec
 
@@ -1030,3 +1031,38 @@ class InferenceTimeOptimizer:
             final_s21_db=final_pred.detach().cpu(),
             snapped_s21_db=snapped_s21_db,
         )
+
+
+def unroll_refine_slots(
+    slot_raw: torch.Tensor,
+    slot_mask: torch.Tensor,
+    slot_indices: torch.Tensor,
+    circuit: CascadedABCDCircuit,
+    freq_hz: torch.Tensor,
+    target_s21_db: torch.Tensor,
+    *,
+    steps: int = 5,
+    lr: float = 5e-2,
+    eps: float = 1e-30,
+) -> torch.Tensor:
+    """
+    Differentiable unrolled refinement over per-cell slot values.
+    """
+    raw = slot_raw
+    mask = slot_mask
+    raw_flat = raw.reshape(-1)
+    mask_flat = mask.reshape(-1)
+    idx = slot_indices.to(device=raw.device, dtype=torch.long)
+
+    loss = None
+    for _ in range(int(steps)):
+        values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
+        values_vec = values_flat.index_select(0, idx)
+        pred = circuit(freq_hz, values=values_vec, output="s21_db")
+        loss = F.mse_loss(pred, target_s21_db)
+        grad = torch.autograd.grad(loss, raw_flat, create_graph=True)[0]
+        raw_flat = raw_flat - float(lr) * grad * mask_flat
+
+    if loss is None:
+        raise ValueError("unroll_refine_slots requires steps >= 1.")
+    return loss

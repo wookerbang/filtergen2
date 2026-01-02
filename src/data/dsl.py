@@ -1289,6 +1289,169 @@ def dsl_tokens_to_components(
     return comps
 
 
+# ---- Macro parsing helpers ----
+
+
+def dsl_tokens_to_macro_sequence(tokens: Sequence[str], *, strict: bool = True) -> List[str]:
+    """
+    Parse DSL tokens into an expanded macro sequence (one macro per cell).
+    Raises on malformed sequences when strict=True.
+    """
+    toks = list(tokens)
+    idx = 0
+
+    def _peek() -> str | None:
+        return toks[idx] if idx < len(toks) else None
+
+    def _next() -> str | None:
+        nonlocal idx
+        tok = toks[idx] if idx < len(toks) else None
+        idx += 1
+        return tok
+
+    def _expect(expected: str) -> bool:
+        tok = _next()
+        if tok != expected:
+            if strict:
+                raise ValueError(f"DSL parse error: expected {expected}, got {tok}")
+            return False
+        return True
+
+    def _parse_k() -> int:
+        tok_k = _next()
+        if tok_k is None:
+            if strict:
+                raise ValueError("DSL parse error: missing K token in REPEAT.")
+            return 1
+        if tok_k == K_VAR_START:
+            digits: List[str] = []
+            while True:
+                tok_digit = _next()
+                if tok_digit is None:
+                    if strict:
+                        raise ValueError("DSL parse error: unterminated <K>...</K>.")
+                    return 1
+                if tok_digit == K_VAR_END:
+                    break
+                if tok_digit not in DIGIT_TOKENS:
+                    if strict:
+                        raise ValueError(f"DSL parse error: invalid digit token {tok_digit}.")
+                    return 1
+                digits.append(tok_digit.removeprefix("<D_").removesuffix(">"))
+            if not digits:
+                return 1
+            try:
+                return max(1, int("".join(digits)))
+            except Exception:
+                if strict:
+                    raise ValueError("DSL parse error: invalid K varint.")
+                return 1
+        if tok_k in K_TOKENS:
+            try:
+                return max(1, int(tok_k.removeprefix("<K_").removesuffix(">")))
+            except Exception:
+                if strict:
+                    raise ValueError(f"DSL parse error: invalid K token {tok_k}.")
+                return 1
+        if strict:
+            raise ValueError(f"DSL parse error: invalid K token {tok_k}.")
+        return 1
+
+    # Skip BOS / ORDER tokens if present.
+    tok = _peek()
+    if tok == BOS:
+        _next()
+        tok = _peek()
+    while tok is not None and tok.startswith("<ORDER_"):
+        _next()
+        tok = _peek()
+
+    if not _expect(MAIN_START):
+        return []
+    for expected in (PORT_IN, PORT_OUT, PORT_GND):
+        if not _expect(expected):
+            return []
+
+    macros: List[str] = []
+    while True:
+        tok = _peek()
+        if tok is None:
+            if strict:
+                raise ValueError("DSL parse error: missing </MAIN>.")
+            break
+        if tok == MAIN_END:
+            _next()
+            break
+        tok = _next()
+        if tok == REPEAT_START:
+            k_val = _parse_k()
+            if not _expect(CASCADE):
+                return []
+            if not _expect(CALL):
+                return []
+            macro = _next()
+            if macro not in MACRO_LIBRARY:
+                if strict:
+                    raise ValueError(f"DSL parse error: unknown macro {macro}.")
+                return []
+            macro_def = MACRO_LIBRARY[macro]
+            slot_types = macro_def.slot_types
+            # Detect canonical <CELL> boundaries if present.
+            use_cell_tokens = _peek() == CELL
+            for _ in range(k_val):
+                if use_cell_tokens:
+                    if not _expect(CELL):
+                        return []
+                    while _peek() in CELL_INDEX_TOKENS:
+                        _next()
+                for slot_type in slot_types:
+                    tok_slot = _next()
+                    while tok_slot in CELL_INDEX_TOKENS:
+                        tok_slot = _next()
+                    expected = SLOT_TYPE_TO_TOKEN.get(slot_type)
+                    if tok_slot == VAL_NONE:
+                        pass
+                    elif expected is None or tok_slot != expected:
+                        if strict:
+                            raise ValueError(f"DSL parse error: expected {expected}, got {tok_slot}.")
+                        return []
+                macros.append(macro)
+            if not _expect(REPEAT_END):
+                return []
+        elif tok == CALL:
+            macro = _next()
+            if macro not in MACRO_LIBRARY:
+                if strict:
+                    raise ValueError(f"DSL parse error: unknown macro {macro}.")
+                return []
+            macro_def = MACRO_LIBRARY[macro]
+            for slot_type in macro_def.slot_types:
+                tok_slot = _next()
+                while tok_slot in CELL_INDEX_TOKENS:
+                    tok_slot = _next()
+                expected = SLOT_TYPE_TO_TOKEN.get(slot_type)
+                if tok_slot == VAL_NONE:
+                    pass
+                elif expected is None or tok_slot != expected:
+                    if strict:
+                        raise ValueError(f"DSL parse error: expected {expected}, got {tok_slot}.")
+                    return []
+            macros.append(macro)
+        else:
+            if strict:
+                raise ValueError(f"DSL parse error: unexpected token {tok}.")
+            return []
+
+    return macros
+
+
+def count_cells_from_dsl_tokens(tokens: Sequence[str], *, strict: bool = True) -> int:
+    """
+    Count total cells in a DSL program by expanding macro repeats.
+    """
+    return len(dsl_tokens_to_macro_sequence(tokens, strict=strict))
+
+
 # ---- Grammar mask ----
 
 

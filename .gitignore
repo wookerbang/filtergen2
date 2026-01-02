@@ -2,16 +2,25 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
 
 # Virtual envs
 venv/
 env/
+.venv/
+
+# Local env files
+.env
+.env.*
 
 # OS files
 .DS_Store
 
-# VSCode
+# IDEs
 .vscode/
+.idea/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -19,6 +28,13 @@ env/
 # Build / distribution
 dist/
 build/
+*.egg-info/
+
+# Test / coverage
+.coverage
+coverage.xml
+htmlcov/
+.tox/
 
 # Large data, models and artifacts (skip upload)
 /checkpoints/
@@ -33,9 +49,10 @@ build/
 # Tokenizers and large binaries
 *.jsonl
 
-# Ignore generated plots and temp files
+# Logs and generated assets
+*.log
 *.png
-__pycache__/
-*.pyc
+wandb/
+runs/
 data/processed/v1/
 data/cache/
