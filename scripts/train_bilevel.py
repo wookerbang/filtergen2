@@ -278,22 +278,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--save-total-limit", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--amp-bf16", action="store_true", help="Enable BF16 autocast (model forward only).")
+    p.add_argument("--clip-grad", type=float, default=5.0, help="Clip gradient norm (<=0 disables).")
+    p.add_argument("--skip-nonfinite", dest="skip_nonfinite", action="store_true", help="Skip updates on non-finite batches.")
+    p.add_argument("--no-skip-nonfinite", dest="skip_nonfinite", action="store_false")
+    p.set_defaults(skip_nonfinite=False)
 
     # input config
     p.add_argument("--use-wave", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"], default="ideal")
     p.add_argument("--wave-norm", action="store_true")
-    p.add_argument("--freq-mode", choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"], default="log_fc")
-    p.add_argument("--freq-scale", choices=["none", "log_fc", "log_f_mean"], default="none")
+    p.add_argument("--freq-mode", choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"], default="log_f_centered")
+    p.add_argument("--freq-scale", choices=["none", "log_fc", "log_f_mean"], default="log_f_mean")
     p.add_argument("--spec-mode", choices=["none", "type_fc"], default="type_fc")
     p.add_argument("--no-s11", dest="include_s11", action="store_false")
     p.set_defaults(include_s11=True)
+    p.add_argument("--d-model", type=int, default=768)
+    p.add_argument("--hidden-mult", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.1)
 
     # bilevel config
     p.add_argument("--k-percentile", type=float, default=95.0)
     p.add_argument("--k-cap", type=int, default=12)
     p.add_argument("--k-min", type=int, default=4)
     p.add_argument("--unroll-steps", type=int, default=5)
-    p.add_argument("--inner-lr", type=float, default=5e-2)
+    p.add_argument("--inner-lr", type=float, default=1e-2)
+    p.add_argument("--inner-max-step", type=float, default=0.5)
+    p.add_argument("--inner-raw-min", type=float, default=-32.0)
+    p.add_argument("--inner-raw-max", type=float, default=-12.0)
+    p.add_argument("--inner-nan-backoff", type=float, default=0.5)
+    p.add_argument("--inner-nan-tries", type=int, default=3)
+    p.add_argument("--phys-weight", type=float, default=1e-4)
     p.add_argument("--len-weight", type=float, default=1e-3)
     p.add_argument("--gumbel-tau", type=float, default=1.0)
     p.add_argument("--alpha-start", type=float, default=1.0)
@@ -349,12 +363,24 @@ def main() -> None:
         "freq_scale": args.freq_scale,
         "include_s11": bool(args.include_s11),
         "spec_mode": args.spec_mode,
+        "d_model": args.d_model,
+        "hidden_mult": args.hidden_mult,
+        "dropout": args.dropout,
+        "amp_bf16": bool(args.amp_bf16),
+        "clip_grad": args.clip_grad,
+        "skip_nonfinite": bool(args.skip_nonfinite),
         "alpha_start": args.alpha_start,
         "alpha_min": args.alpha_min,
         "alpha_decay_frac": args.alpha_decay_frac,
         "len_weight": args.len_weight,
         "unroll_steps": args.unroll_steps,
         "inner_lr": args.inner_lr,
+        "inner_max_step": args.inner_max_step,
+        "inner_raw_min": args.inner_raw_min,
+        "inner_raw_max": args.inner_raw_max,
+        "inner_nan_backoff": args.inner_nan_backoff,
+        "inner_nan_tries": args.inner_nan_tries,
+        "phys_weight": args.phys_weight,
         "gumbel_tau": args.gumbel_tau,
     }
     with (args.output / "input_config.json").open("w") as f:
@@ -382,6 +408,9 @@ def main() -> None:
         macro_vocab_size=len(macro_vocab),
         slot_count=slot_count,
         waveform_in_channels=in_channels,
+        d_model=args.d_model,
+        hidden_mult=args.hidden_mult,
+        dropout=args.dropout,
         spec_mode=args.spec_mode,
     ).to(device=args.device)
     macro_slot_mask = macro_slot_mask.to(device=args.device)
@@ -390,6 +419,10 @@ def main() -> None:
         raise ValueError("--use-token-loss is reserved; bilevel model has no decoder.")
 
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
+    device = torch.device(args.device)
+    amp_enabled = bool(args.amp_bf16 and device.type == "cuda" and dtype == torch.float32)
+    if args.amp_bf16 and not amp_enabled:
+        print("[warn] BF16 autocast disabled (requires CUDA + float32 dtype).")
     assembler = DynamicCircuitAssembler(z0=50.0)
 
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
@@ -397,18 +430,32 @@ def main() -> None:
     total_steps = int(args.epochs) * max(1, math.ceil(len(dataset) / max(1, args.batch_size)))
 
     model.train()
+    skipped_nonfinite = 0
     for epoch in range(int(args.epochs)):
         for batch in loader:
             step += 1
-            wave = batch["wave"].to(args.device, dtype=dtype)
-            filter_type = batch["filter_type"].to(args.device)
-            fc_hz = batch["fc_hz"].to(args.device, dtype=dtype)
-            freq = batch["freq"].to(args.device, dtype=dtype)
-            target = batch["target_s21_db"].to(args.device, dtype=dtype)
-            macro_targets = batch["macro_ids"].to(args.device)
+            wave = batch["wave"].to(device, dtype=dtype)
+            filter_type = batch["filter_type"].to(device)
+            fc_hz = batch["fc_hz"].to(device, dtype=dtype)
+            freq = batch["freq"].to(device, dtype=dtype)
+            target = batch["target_s21_db"].to(device, dtype=dtype)
+            macro_targets = batch["macro_ids"].to(device)
+            if args.skip_nonfinite:
+                if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
+                    skipped_nonfinite += 1
+                    opt.zero_grad(set_to_none=True)
+                    continue
 
-            g_logits, slot_raw = model(wave, filter_type=filter_type, fc_hz=fc_hz)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                g_logits, slot_raw = model(wave, filter_type=filter_type, fc_hz=fc_hz)
+            if amp_enabled:
+                g_logits = g_logits.float()
+                slot_raw = slot_raw.float()
             slot_raw = slot_raw.to(dtype)
+            if args.skip_nonfinite and not (torch.isfinite(g_logits).all() and torch.isfinite(slot_raw).all()):
+                skipped_nonfinite += 1
+                opt.zero_grad(set_to_none=True)
+                continue
 
             g_soft = F.gumbel_softmax(g_logits, tau=float(args.gumbel_tau), hard=False, dim=-1)
             g_hard = F.gumbel_softmax(g_logits, tau=float(args.gumbel_tau), hard=True, dim=-1)
@@ -445,22 +492,36 @@ def main() -> None:
                     target[b],
                     steps=args.unroll_steps,
                     lr=args.inner_lr,
+                    max_step=args.inner_max_step,
+                    raw_min=args.inner_raw_min,
+                    raw_max=args.inner_raw_max,
+                    nan_backoff=args.inner_nan_backoff,
+                    max_backoff=args.inner_nan_tries,
                 )
                 physics_losses.append(loss_b)
             physics_loss = torch.stack(physics_losses).mean()
 
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
-            loss = physics_loss + float(alpha) * macro_ce + float(args.len_weight) * len_loss
+            phys_weight = float(args.phys_weight)
+            loss = phys_weight * physics_loss + float(alpha) * macro_ce + float(args.len_weight) * len_loss
+            if args.skip_nonfinite and not torch.isfinite(loss):
+                skipped_nonfinite += 1
+                opt.zero_grad(set_to_none=True)
+                continue
             loss.backward()
 
             if step % int(args.grad_accum) == 0:
+                if float(args.clip_grad) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.clip_grad))
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
             if step % int(args.log_steps) == 0:
                 print(
                     f"[epoch {epoch+1}] step={step} loss={loss.item():.4f} "
-                    f"phys={physics_loss.item():.4f} macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f}"
+                    f"phys={physics_loss.item():.4f} phys_w={phys_weight:.1e} "
+                    f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f}"
+                    + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
                 )
 
             if int(args.save_steps) > 0 and step % int(args.save_steps) == 0:

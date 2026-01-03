@@ -51,6 +51,7 @@ class Wave2StructureModel(nn.Module):
         )
         self.gate_head = nn.Linear(hidden, self.k_max * (self.macro_vocab_size + 1))
         self.value_head = nn.Linear(hidden, self.k_max * self.slot_count)
+        nn.init.constant_(self.value_head.bias, -22.0)
 
     def forward(
         self,

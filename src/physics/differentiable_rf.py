@@ -1044,9 +1044,14 @@ def unroll_refine_slots(
     steps: int = 5,
     lr: float = 5e-2,
     eps: float = 1e-30,
+    max_step: float | None = 0.5,
+    raw_min: float = -32.0,
+    raw_max: float = -12.0,
+    nan_backoff: float = 0.5,
+    max_backoff: int = 3,
 ) -> torch.Tensor:
     """
-    Differentiable unrolled refinement over per-cell slot values.
+    Differentiable unrolled refinement over per-cell slot values with stability guards.
     """
     raw = slot_raw
     mask = slot_mask
@@ -1055,13 +1060,39 @@ def unroll_refine_slots(
     idx = slot_indices.to(device=raw.device, dtype=torch.long)
 
     loss = None
+    base_lr = float(lr)
+    backoff_tries = max(0, int(max_backoff))
+    max_step_val = float(max_step) if max_step is not None else None
     for _ in range(int(steps)):
-        values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
-        values_vec = values_flat.index_select(0, idx)
-        pred = circuit(freq_hz, values=values_vec, output="s21_db")
-        loss = F.mse_loss(pred, target_s21_db)
-        grad = torch.autograd.grad(loss, raw_flat, create_graph=True)[0]
-        raw_flat = raw_flat - float(lr) * grad * mask_flat
+        raw_flat = raw_flat.clamp(min=float(raw_min), max=float(raw_max))
+        step_lr = base_lr
+        updated = False
+        for _ in range(backoff_tries + 1):
+            values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
+            values_vec = values_flat.index_select(0, idx)
+            pred = circuit(freq_hz, values=values_vec, output="s21_db")
+            loss = F.mse_loss(pred, target_s21_db)
+            if not torch.isfinite(loss):
+                step_lr *= float(nan_backoff)
+                continue
+            grad = torch.autograd.grad(loss, raw_flat, create_graph=True)[0]
+            if not torch.isfinite(grad).all():
+                step_lr *= float(nan_backoff)
+                continue
+            step_delta = step_lr * grad
+            if max_step_val is not None and max_step_val > 0.0:
+                step_delta = step_delta.clamp(-max_step_val, max_step_val)
+            raw_next = raw_flat - step_delta * mask_flat
+            if not torch.isfinite(raw_next).all():
+                step_lr *= float(nan_backoff)
+                continue
+            raw_flat = raw_next
+            updated = True
+            break
+        if not updated:
+            if loss is not None and torch.isfinite(loss):
+                return loss
+            return torch.zeros((), device=raw.device, dtype=raw.dtype)
 
     if loss is None:
         raise ValueError("unroll_refine_slots requires steps >= 1.")
