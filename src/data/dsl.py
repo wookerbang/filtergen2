@@ -97,30 +97,45 @@ MACRO_CELL_BP_SER_PAR_LC_A = "<MAC_CELL_BP_SER_PAR_LC_A>"
 MACRO_CELL_BP_SER_PAR_LC_AB = "<MAC_CELL_BP_SER_PAR_LC_AB>"
 MACRO_CELL_BP_SER_LC = "<MAC_CELL_BP_SER_LC>"
 
+# Motif macros (atomic / branch-level)
+MACRO_SER_L = "<MAC_SER_L>"
+MACRO_SER_C = "<MAC_SER_C>"
+MACRO_SHUNT_L = "<MAC_SHUNT_L>"
+MACRO_SHUNT_C = "<MAC_SHUNT_C>"
+MACRO_SER_RESO = "<MAC_SER_RESO>"
+MACRO_SER_TANK = "<MAC_SER_TANK>"
+MACRO_SHUNT_RESO = "<MAC_SHUNT_RESO>"
+MACRO_SHUNT_NOTCH = "<MAC_SHUNT_NOTCH>"
+MACRO_SER_R = "<MAC_SER_R>"
+MACRO_SHUNT_R = "<MAC_SHUNT_R>"
+
 MACRO_IDS = [
-    MACRO_CELL_LS_CS,
-    MACRO_CELL_LS_CS_A,
-    MACRO_CELL_LS_CS_AB,
-    MACRO_CELL_CS_LS,
-    MACRO_CELL_CS_LS_A,
-    MACRO_CELL_CS_LS_AB,
-    MACRO_NOTCH_SHUNT_LC_SER,
-    MACRO_CELL_LS,
-    MACRO_CELL_CS,
-    MACRO_PI_CLC,
-    MACRO_T_LCL,
-    MACRO_DOUBLE_SERIES_LC,
-    MACRO_DOUBLE_SHUNT_LC,
-    MACRO_BRIDGE_C,
-    MACRO_CELL_BS_PAR_SER_LC,
-    MACRO_CELL_BS_PAR_SER_LC_A,
-    MACRO_CELL_BS_PAR_SER_LC_AB,
-    MACRO_CELL_BS_PAR_LC,
-    MACRO_CELL_BP_SER_PAR_LC,
-    MACRO_CELL_BP_SER_PAR_LC_A,
-    MACRO_CELL_BP_SER_PAR_LC_AB,
-    MACRO_CELL_BP_SER_LC,
+    MACRO_SER_L,
+    MACRO_SER_C,
+    MACRO_SHUNT_L,
+    MACRO_SHUNT_C,
+    MACRO_SER_RESO,
+    MACRO_SER_TANK,
+    MACRO_SHUNT_RESO,
+    MACRO_SHUNT_NOTCH,
+    MACRO_SER_R,
+    MACRO_SHUNT_R,
 ]
+
+SERIES_MACROS = {
+    MACRO_SER_L,
+    MACRO_SER_C,
+    MACRO_SER_RESO,
+    MACRO_SER_TANK,
+    MACRO_SER_R,
+}
+SHUNT_MACROS = {
+    MACRO_SHUNT_L,
+    MACRO_SHUNT_C,
+    MACRO_SHUNT_RESO,
+    MACRO_SHUNT_NOTCH,
+    MACRO_SHUNT_R,
+}
 
 
 # ---- Macro definitions ----
@@ -164,6 +179,82 @@ def _maybe_add_component(
     if fv is None:
         return
     out.append(ComponentSpec(ctype, role, fv, None, node1, node2))
+
+
+def _expand_ser_l(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "series", L_val, a, b)
+    return comps
+
+
+def _expand_ser_c(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    C_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "C", "series", C_val, a, b)
+    return comps
+
+
+def _expand_shunt_l(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "shunt", L_val, a, gnd)
+    return comps
+
+
+def _expand_shunt_c(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    C_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "C", "shunt", C_val, a, gnd)
+    return comps
+
+
+def _expand_ser_reso(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val, C_val = (vals + [0.0, 0.0])[:2]
+    x = f"x{inst_idx}_0"
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "series", L_val, a, x)
+    _maybe_add_component(comps, "C", "series", C_val, x, b)
+    return comps
+
+
+def _expand_ser_tank(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val, C_val = (vals + [0.0, 0.0])[:2]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "series", L_val, a, b)
+    _maybe_add_component(comps, "C", "series", C_val, a, b)
+    return comps
+
+
+def _expand_shunt_reso(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val, C_val = (vals + [0.0, 0.0])[:2]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "shunt", L_val, a, gnd)
+    _maybe_add_component(comps, "C", "shunt", C_val, a, gnd)
+    return comps
+
+
+def _expand_shunt_notch(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    L_val, C_val = (vals + [0.0, 0.0])[:2]
+    x = f"x{inst_idx}_0"
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "L", "series", L_val, a, x)
+    _maybe_add_component(comps, "C", "series", C_val, x, gnd)
+    return comps
+
+
+def _expand_ser_r(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    R_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "R", "series", R_val, a, b)
+    return comps
+
+
+def _expand_shunt_r(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    R_val = (vals + [0.0])[0]
+    comps: List[ComponentSpec] = []
+    _maybe_add_component(comps, "R", "shunt", R_val, a, gnd)
+    return comps
 
 
 def _expand_cell_ls_cs(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
@@ -396,48 +487,16 @@ def _expand_cell_bp_ser_par_lc_ab(a: str, b: str, gnd: str, vals: List[float], i
 
 
 MACRO_LIBRARY: Dict[str, MacroDef] = {
-    MACRO_CELL_LS_CS: MacroDef(MACRO_CELL_LS_CS, ("L", "C"), _expand_cell_ls_cs),
-    MACRO_CELL_LS_CS_A: MacroDef(MACRO_CELL_LS_CS_A, ("L", "C"), _expand_cell_ls_cs_a),
-    MACRO_CELL_LS_CS_AB: MacroDef(MACRO_CELL_LS_CS_AB, ("L", "C", "C"), _expand_cell_ls_cs_ab),
-    MACRO_CELL_CS_LS: MacroDef(MACRO_CELL_CS_LS, ("C", "L"), _expand_cell_cs_ls),
-    MACRO_CELL_CS_LS_A: MacroDef(MACRO_CELL_CS_LS_A, ("C", "L"), _expand_cell_cs_ls_a),
-    MACRO_CELL_CS_LS_AB: MacroDef(MACRO_CELL_CS_LS_AB, ("C", "L", "L"), _expand_cell_cs_ls_ab),
-    MACRO_NOTCH_SHUNT_LC_SER: MacroDef(MACRO_NOTCH_SHUNT_LC_SER, ("L", "C"), _expand_notch_shunt),
-    MACRO_CELL_LS: MacroDef(MACRO_CELL_LS, ("L",), _expand_cell_ls),
-    MACRO_CELL_CS: MacroDef(MACRO_CELL_CS, ("C",), _expand_cell_cs),
-    MACRO_PI_CLC: MacroDef(MACRO_PI_CLC, ("C", "L", "C"), _expand_pi_clc),
-    MACRO_T_LCL: MacroDef(MACRO_T_LCL, ("L", "C", "L"), _expand_t_lcl),
-    MACRO_DOUBLE_SERIES_LC: MacroDef(MACRO_DOUBLE_SERIES_LC, ("L", "C"), _expand_double_series_lc),
-    MACRO_DOUBLE_SHUNT_LC: MacroDef(MACRO_DOUBLE_SHUNT_LC, ("L", "C"), _expand_double_shunt_lc),
-    MACRO_BRIDGE_C: MacroDef(MACRO_BRIDGE_C, ("C",), _expand_bridge_c),
-    MACRO_CELL_BS_PAR_SER_LC: MacroDef(MACRO_CELL_BS_PAR_SER_LC, ("L_PAR", "C_PAR", "L_SER", "C_SER"), _expand_cell_bs_par_ser_lc),
-    MACRO_CELL_BS_PAR_SER_LC_A: MacroDef(
-        MACRO_CELL_BS_PAR_SER_LC_A,
-        ("L_PAR", "C_PAR", "L_SER", "C_SER"),
-        _expand_cell_bs_par_ser_lc_a,
-    ),
-    MACRO_CELL_BS_PAR_SER_LC_AB: MacroDef(
-        MACRO_CELL_BS_PAR_SER_LC_AB,
-        ("L_PAR", "C_PAR", "L_SER", "C_SER", "L_SER", "C_SER"),
-        _expand_cell_bs_par_ser_lc_ab,
-    ),
-    MACRO_CELL_BS_PAR_LC: MacroDef(MACRO_CELL_BS_PAR_LC, ("L_PAR", "C_PAR"), _expand_cell_bs_par_lc),
-    MACRO_CELL_BP_SER_PAR_LC: MacroDef(
-        MACRO_CELL_BP_SER_PAR_LC,
-        ("L_SER", "C_SER", "L_PAR", "C_PAR", "L_NOTCH", "C_NOTCH"),
-        _expand_cell_bp_ser_par_lc,
-    ),
-    MACRO_CELL_BP_SER_PAR_LC_A: MacroDef(
-        MACRO_CELL_BP_SER_PAR_LC_A,
-        ("L_SER", "C_SER", "L_PAR", "C_PAR", "L_NOTCH", "C_NOTCH"),
-        _expand_cell_bp_ser_par_lc_a,
-    ),
-    MACRO_CELL_BP_SER_PAR_LC_AB: MacroDef(
-        MACRO_CELL_BP_SER_PAR_LC_AB,
-        ("L_SER", "C_SER", "L_PAR", "C_PAR", "L_PAR", "C_PAR", "L_NOTCH", "C_NOTCH"),
-        _expand_cell_bp_ser_par_lc_ab,
-    ),
-    MACRO_CELL_BP_SER_LC: MacroDef(MACRO_CELL_BP_SER_LC, ("L_SER", "C_SER"), _expand_cell_bp_ser_lc),
+    MACRO_SER_L: MacroDef(MACRO_SER_L, ("L",), _expand_ser_l),
+    MACRO_SER_C: MacroDef(MACRO_SER_C, ("C",), _expand_ser_c),
+    MACRO_SHUNT_L: MacroDef(MACRO_SHUNT_L, ("L",), _expand_shunt_l),
+    MACRO_SHUNT_C: MacroDef(MACRO_SHUNT_C, ("C",), _expand_shunt_c),
+    MACRO_SER_RESO: MacroDef(MACRO_SER_RESO, ("L", "C"), _expand_ser_reso),
+    MACRO_SER_TANK: MacroDef(MACRO_SER_TANK, ("L", "C"), _expand_ser_tank),
+    MACRO_SHUNT_RESO: MacroDef(MACRO_SHUNT_RESO, ("L", "C"), _expand_shunt_reso),
+    MACRO_SHUNT_NOTCH: MacroDef(MACRO_SHUNT_NOTCH, ("L", "C"), _expand_shunt_notch),
+    MACRO_SER_R: MacroDef(MACRO_SER_R, ("R",), _expand_ser_r),
+    MACRO_SHUNT_R: MacroDef(MACRO_SHUNT_R, ("R",), _expand_shunt_r),
 }
 
 # Slot type -> token mapping (kept centralized to avoid drift across encoder/decoder/mask).
@@ -598,6 +657,195 @@ def _group_cells_by_macro(cells: Sequence[Tuple[str, List[float]]]) -> List[Tupl
     if current_macro is not None:
         segments.append((current_macro, current_vals))
     return segments
+
+
+def _other_node(comp: ComponentSpec, node: str) -> str:
+    return comp.node2 if comp.node1 == node else comp.node1
+
+
+def _collect_shunt_series_lc_branches(
+    comps: Sequence[ComponentSpec],
+) -> Tuple[Dict[str, List[Tuple[float, float]]], Set[int]]:
+    node_to_comps: Dict[str, List[int]] = {}
+    for idx, c in enumerate(comps):
+        for node in (c.node1, c.node2):
+            if node == "gnd":
+                continue
+            node_to_comps.setdefault(node, []).append(idx)
+
+    branches_by_anchor: Dict[str, List[Tuple[float, float]]] = {}
+    branch_ids: Set[int] = set()
+    for node, idxs in node_to_comps.items():
+        if node in ("in", "out"):
+            continue
+        if len(idxs) != 2:
+            continue
+        i1, i2 = idxs
+        c1, c2 = comps[i1], comps[i2]
+        if c1.role != "series" or c2.role != "series":
+            continue
+        o1 = _other_node(c1, node)
+        o2 = _other_node(c2, node)
+        c1_to_gnd = o1 == "gnd"
+        c2_to_gnd = o2 == "gnd"
+        if c1_to_gnd == c2_to_gnd:
+            continue
+        comp_to_gnd = c1 if c1_to_gnd else c2
+        comp_to_anchor = c2 if c1_to_gnd else c1
+        anchor = _other_node(comp_to_anchor, node)
+        if anchor == "gnd":
+            continue
+        types = {comp_to_gnd.ctype, comp_to_anchor.ctype}
+        if types != {"L", "C"}:
+            continue
+        L_val = float(comp_to_gnd.value_si if comp_to_gnd.ctype == "L" else comp_to_anchor.value_si)
+        C_val = float(comp_to_gnd.value_si if comp_to_gnd.ctype == "C" else comp_to_anchor.value_si)
+        branches_by_anchor.setdefault(anchor, []).append((L_val, C_val))
+        branch_ids.update([i1, i2])
+    return branches_by_anchor, branch_ids
+
+
+def _components_to_motif_cells(components: Sequence[ComponentSpec]) -> List[Tuple[str, List[float]]]:
+    comps = list(components)
+    if not comps:
+        return []
+
+    branches_by_anchor, branch_comp_ids = _collect_shunt_series_lc_branches(comps)
+
+    series_pairs: Dict[Tuple[str, str], List[int]] = {}
+    for idx, c in enumerate(comps):
+        if idx in branch_comp_ids:
+            continue
+        if c.role != "series":
+            continue
+        if c.node1 == "gnd" or c.node2 == "gnd":
+            continue
+        key = tuple(sorted((c.node1, c.node2)))
+        series_pairs.setdefault(key, []).append(idx)
+
+    parallel_series: Dict[Tuple[str, str], Tuple[int, int]] = {}
+    parallel_ids: Set[int] = set()
+    for key, idxs in series_pairs.items():
+        if len(idxs) != 2:
+            continue
+        types = {comps[i].ctype for i in idxs}
+        if types != {"L", "C"}:
+            continue
+        l_idx = idxs[0] if comps[idxs[0]].ctype == "L" else idxs[1]
+        c_idx = idxs[0] if comps[idxs[0]].ctype == "C" else idxs[1]
+        parallel_series[key] = (l_idx, c_idx)
+        parallel_ids.update(idxs)
+
+    series_edges: List[Tuple[str, str, str, List[int]]] = []
+    series_adj: Dict[str, List[Tuple[str, int]]] = {}
+
+    def _add_edge(n1: str, n2: str, kind: str, comp_indices: List[int]) -> None:
+        edge_id = len(series_edges)
+        series_edges.append((n1, n2, kind, comp_indices))
+        series_adj.setdefault(n1, []).append((n2, edge_id))
+        series_adj.setdefault(n2, []).append((n1, edge_id))
+
+    for (n1, n2), (l_idx, c_idx) in parallel_series.items():
+        _add_edge(n1, n2, "parallel_lc", [l_idx, c_idx])
+
+    for idx, c in enumerate(comps):
+        if idx in branch_comp_ids or idx in parallel_ids:
+            continue
+        if c.role != "series":
+            continue
+        if c.node1 == "gnd" or c.node2 == "gnd":
+            continue
+        _add_edge(c.node1, c.node2, "single", [idx])
+
+    if "in" not in series_adj or "out" not in series_adj:
+        raise ValueError("Main path parse failed (missing in/out).")
+
+    path_nodes: List[str] = ["in"]
+    path_series: List[int] = []
+    prev = None
+    current = "in"
+    visited_edges: Set[int] = set()
+    while current != "out":
+        neighbors = [item for item in series_adj.get(current, []) if item[0] != prev]
+        if len(neighbors) != 1:
+            raise ValueError("Main path parse failed (ambiguous path).")
+        next_node, edge_id = neighbors[0]
+        if edge_id in visited_edges:
+            raise ValueError("Main path parse failed (cycle detected).")
+        visited_edges.add(edge_id)
+        path_series.append(edge_id)
+        path_nodes.append(next_node)
+        prev, current = current, next_node
+
+    shunt_by_node: Dict[str, Dict[str, float]] = {}
+    for idx, c in enumerate(comps):
+        if idx in branch_comp_ids:
+            continue
+        if c.role != "shunt":
+            continue
+        anchor = c.node2 if c.node1 == "gnd" else c.node1
+        if anchor == "gnd":
+            continue
+        entry = shunt_by_node.setdefault(anchor, {})
+        if c.ctype not in entry:
+            entry[c.ctype] = float(c.value_si)
+
+    cells: List[Tuple[str, List[float]]] = []
+    node_idx = 0
+    while node_idx < len(path_nodes):
+        node = path_nodes[node_idx]
+        shunt_vals = shunt_by_node.get(node, {})
+        has_L = _is_valid_value(shunt_vals.get("L"))
+        has_C = _is_valid_value(shunt_vals.get("C"))
+        if has_L and has_C:
+            cells.append((MACRO_SHUNT_RESO, [shunt_vals["L"], shunt_vals["C"]]))
+        elif has_L:
+            cells.append((MACRO_SHUNT_L, [shunt_vals["L"]]))
+        elif has_C:
+            cells.append((MACRO_SHUNT_C, [shunt_vals["C"]]))
+
+        for L_val, C_val in branches_by_anchor.get(node, []):
+            cells.append((MACRO_SHUNT_NOTCH, [L_val, C_val]))
+
+        if node_idx >= len(path_series):
+            break
+
+        edge_id = path_series[node_idx]
+        _, _, kind, comp_indices = series_edges[edge_id]
+        if kind == "parallel_lc":
+            l_idx, c_idx = comp_indices
+            L_val = float(comps[l_idx].value_si)
+            C_val = float(comps[c_idx].value_si)
+            cells.append((MACRO_SER_TANK, [L_val, C_val]))
+            node_idx += 1
+            continue
+
+        comp = comps[comp_indices[0]]
+        if node_idx + 1 < len(path_series):
+            mid_node = path_nodes[node_idx + 1]
+            next_edge_id = path_series[node_idx + 1]
+            _, _, next_kind, next_indices = series_edges[next_edge_id]
+            if (
+                next_kind == "single"
+                and mid_node not in shunt_by_node
+                and mid_node not in branches_by_anchor
+            ):
+                comp2 = comps[next_indices[0]]
+                types = {comp.ctype, comp2.ctype}
+                if types == {"L", "C"}:
+                    L_val = float(comp.value_si if comp.ctype == "L" else comp2.value_si)
+                    C_val = float(comp.value_si if comp.ctype == "C" else comp2.value_si)
+                    cells.append((MACRO_SER_RESO, [L_val, C_val]))
+                    node_idx += 2
+                    continue
+
+        if comp.ctype == "L":
+            cells.append((MACRO_SER_L, [float(comp.value_si)]))
+        elif comp.ctype == "C":
+            cells.append((MACRO_SER_C, [float(comp.value_si)]))
+        node_idx += 1
+
+    return cells
 
 
 def _extract_lc_pair(vals: Dict[str, float], *, allow_empty: bool = True) -> Tuple[float, float, bool]:
@@ -844,35 +1092,8 @@ def components_to_dsl_segments(
     filter_type: str,
     topology_type: str | None = None,
 ) -> List[Tuple[str, List[List[float]]]]:
-    ftype = str(filter_type or "lowpass")
-    if ftype == "lowpass":
-        cells = _build_ladder_cells(
-            components,
-            topology_type=topology_type,
-            series_type="L",
-            shunt_type="C",
-            macro_a=MACRO_CELL_LS_CS_A,
-            macro_b=MACRO_CELL_LS_CS,
-            macro_ab=MACRO_CELL_LS_CS_AB,
-            macro_series=MACRO_CELL_LS,
-        )
-    elif ftype == "highpass":
-        cells = _build_ladder_cells(
-            components,
-            topology_type=topology_type,
-            series_type="C",
-            shunt_type="L",
-            macro_a=MACRO_CELL_CS_LS_A,
-            macro_b=MACRO_CELL_CS_LS,
-            macro_ab=MACRO_CELL_CS_LS_AB,
-            macro_series=MACRO_CELL_CS,
-        )
-    elif ftype == "bandpass":
-        cells = _build_bandpass_cells(components, topology_type=topology_type)
-    elif ftype == "bandstop":
-        cells = _build_bandstop_cells(components, topology_type=topology_type)
-    else:
-        raise ValueError(f"Unsupported filter_type: {filter_type}")
+    del filter_type, topology_type
+    cells = _components_to_motif_cells(components)
     return _group_cells_by_macro(cells)
 
 # ---- Encoding (components -> tokens) ----
@@ -881,7 +1102,7 @@ def components_to_dsl_segments(
 def components_to_dsl_tokens(
     components: Sequence[ComponentSpec],
     *,
-    macro_name: str = MACRO_CELL_LS_CS,
+    macro_name: str = MACRO_SER_L,
     segments: Sequence[Tuple[str, Sequence[Sequence[float]]]] | None = None,
     use_varint_k: bool = False,
     use_cell_indices: bool = False,
@@ -899,14 +1120,14 @@ def components_to_dsl_tokens(
     - include_order: prepend <ORDER_k> after <BOS> when True (requires order).
     - allow_incomplete: if False, missing slot values raise instead of emitting <VAL_NONE>.
     """
+    del macro_name
+
     def _encode_k(k: int, tokens_out: List[str], slot_out: List[float]) -> None:
-        # Prefer varint when requested or k exceeds frozen set.
         if use_varint_k or k > len(K_TOKENS):
             tokens_out.append(K_VAR_START)
             slot_out.append(float("nan"))
             for d in str(max(0, int(k))):
-                tok = f"<D_{d}>"
-                tokens_out.append(tok)
+                tokens_out.append(f"<D_{d}>")
                 slot_out.append(float("nan"))
             tokens_out.append(K_VAR_END)
             slot_out.append(float("nan"))
@@ -914,228 +1135,77 @@ def components_to_dsl_tokens(
             tokens_out.append(f"<K_{k}>")
             slot_out.append(float("nan"))
 
-    def _build_bs_cells(comps: Sequence[ComponentSpec]) -> List[List[float]]:
-        # Identify series connections (non-gnd) and derive the main path.
-        shunt_series, branch_comp_ids = _detect_shunt_series_lc(comps)
-        series_pairs: Dict[Tuple[str, str], List[ComponentSpec]] = {}
-        for idx, c in enumerate(comps):
-            if idx in branch_comp_ids:
-                continue
-            if c.role != "series":
-                continue
-            if c.node1 == "gnd" or c.node2 == "gnd":
-                continue
-            key = tuple(sorted((c.node1, c.node2)))
-            series_pairs.setdefault(key, []).append(c)
-        series_adj: Dict[str, List[str]] = {}
-        for (n1, n2) in series_pairs.keys():
-            series_adj.setdefault(n1, []).append(n2)
-            series_adj.setdefault(n2, []).append(n1)
-        if "in" not in series_adj or "out" not in series_adj:
-            return []
-        path_nodes = ["in"]
-        prev = None
-        current = "in"
-        while current != "out":
-            neighbors = [n for n in series_adj.get(current, []) if n != prev]
-            if len(neighbors) != 1:
-                return []
-            nxt = neighbors[0]
-            path_nodes.append(nxt)
-            prev, current = current, nxt
+    def _emit_value(slot_type: str, value: float, tokens_out: List[str], slot_out: List[float]) -> None:
+        if not _is_valid_value(value):
+            if allow_incomplete:
+                tokens_out.append(VAL_NONE)
+                slot_out.append(float("nan"))
+                return
+            raise ValueError("Missing slot value while allow_incomplete=False.")
+        tok = SLOT_TYPE_TO_TOKEN.get(slot_type)
+        if tok is None:
+            raise ValueError(f"Unknown slot type: {slot_type}")
+        tokens_out.append(tok)
+        slot_out.append(float(value))
 
-        vals_per_cell: List[List[float]] = []
-        for i in range(len(path_nodes) - 1):
-            a = path_nodes[i]
-            b = path_nodes[i + 1]
-            key = tuple(sorted((a, b)))
-            Lp = float("nan")
-            Cp = float("nan")
-            for c in series_pairs.get(key, []):
-                if c.ctype == "L":
-                    Lp = float(c.value_si)
-                elif c.ctype == "C":
-                    Cp = float(c.value_si)
-            Ls, Cs = shunt_series.get(b, (float("nan"), float("nan")))
-            vals_per_cell.append([Lp, Cp, Ls, Cs])
-        return vals_per_cell
-
-    def _build_bp_cells(comps: Sequence[ComponentSpec]) -> List[List[float]] | None:
-        # Build bandpass cells: series LC between main nodes + parallel LC to gnd at each main node.
-        # Optional notch: series LC to gnd detected via _detect_shunt_series_lc.
-        shunt_series, branch_comp_ids = _detect_shunt_series_lc(comps)
-
-        series_pairs: Dict[Tuple[str, str], List[ComponentSpec]] = {}
-        for idx, c in enumerate(comps):
-            if idx in branch_comp_ids:
-                # exclude shunt-series branches (notch) from main path
-                continue
-            if c.role != "series":
-                continue
-            if c.node1 == "gnd" or c.node2 == "gnd":
-                continue
-            key = tuple(sorted((c.node1, c.node2)))
-            series_pairs.setdefault(key, []).append(c)
-
-        series_adj: Dict[str, List[str]] = {}
-        for (n1, n2) in series_pairs.keys():
-            series_adj.setdefault(n1, []).append(n2)
-            series_adj.setdefault(n2, []).append(n1)
-        if "in" not in series_adj or "out" not in series_adj:
-            return None
-        path_nodes = ["in"]
-        prev = None
-        current = "in"
-        while current != "out":
-            neighbors = [n for n in series_adj.get(current, []) if n != prev]
-            if len(neighbors) != 1:
-                return None
-            nxt = neighbors[0]
-            path_nodes.append(nxt)
-            prev, current = current, nxt
-
-        # Expect two series components per cell (L + C), so edges should be even count.
-        if (len(path_nodes) - 1) % 2 != 0:
-            return None
-
-        # Collect shunt LC pairs to gnd at each node.
-        shunt_map: Dict[str, Dict[str, float]] = {}
-        for c in comps:
-            if c.role != "shunt":
-                continue
-            node = c.node1 if c.node2 == "gnd" else c.node2
-            d = shunt_map.setdefault(node, {})
-            d[c.ctype] = float(c.value_si)
-
-        vals_per_cell: List[List[float]] = []
-        for i in range(0, len(path_nodes) - 2, 2):
-            a = path_nodes[i]
-            mid = path_nodes[i + 1]
-            b = path_nodes[i + 2]
-            key1 = tuple(sorted((a, mid)))
-            key2 = tuple(sorted((mid, b)))
-            comps_pair = series_pairs.get(key1, []) + series_pairs.get(key2, [])
-            Ls = next((float(c.value_si) for c in comps_pair if c.ctype == "L"), float("nan"))
-            Cs = next((float(c.value_si) for c in comps_pair if c.ctype == "C"), float("nan"))
-            if not (_is_valid_value(Ls) and _is_valid_value(Cs)):
-                return None
-
-            sh = shunt_map.get(b, {})
-            Lp = sh.get("L", float("nan"))
-            Cp = sh.get("C", float("nan"))
-
-            Ln, Cn = shunt_series.get(b, (float("nan"), float("nan")))
-            vals_per_cell.append([Ls, Cs, Lp, Cp, Ln, Cn])
-        return vals_per_cell
-
-    def _emit_slot(slot_type: str, val: float):
-        if slot_type not in SLOT_TYPE_TO_TOKEN:
-            raise ValueError(f"Unknown slot type '{slot_type}'")
-        if _is_valid_value(val):
-            tokens.append(SLOT_TYPE_TO_TOKEN[slot_type])
-            slot_values.append(float(val))
-        else:
-            if not allow_incomplete:
-                raise ValueError(f"Missing value for slot '{slot_type}'")
-            tokens.append(VAL_NONE)
-            slot_values.append(float("nan"))
-
-    tokens: List[str] = []
-    if include_bos:
-        tokens.append(BOS)
-    if include_order:
-        if order is None:
-            raise ValueError("include_order=True requires order to be provided.")
-        tokens.append(f"<ORDER_{int(order)}>")
-    tokens.extend([MAIN_START, PORT_IN, PORT_OUT, PORT_GND])
-    slot_values: List[float] = [float("nan")] * len(tokens)
-
-    def _emit_repeat(macro_id: str, cell_vals: Sequence[Sequence[float]]):
+    def _emit_repeat(macro_id: str, vals_per_cell: Sequence[Sequence[float]]) -> None:
         macro = MACRO_LIBRARY[macro_id]
-        k = max(1, len(cell_vals))
         tokens.extend([REPEAT_START])
         slot_values.append(float("nan"))
-        _encode_k(k, tokens, slot_values)
+        _encode_k(len(vals_per_cell), tokens, slot_values)
         tokens.extend([CASCADE, CALL, macro_id])
         slot_values.extend([float("nan")] * 3)
-        for idx_cell in range(k):
-            vals = list(cell_vals[idx_cell]) if idx_cell < len(cell_vals) else [float("nan")] * len(macro.slot_types)
-            vals = (vals + [float("nan")] * len(macro.slot_types))[: len(macro.slot_types)]
+        for idx_cell, vals in enumerate(vals_per_cell):
             tokens.append(CELL)
             slot_values.append(float("nan"))
             if use_cell_indices and idx_cell < len(CELL_INDEX_TOKENS):
                 tokens.append(CELL_INDEX_TOKENS[idx_cell])
                 slot_values.append(float("nan"))
-            for slot_idx, slot_type in enumerate(macro.slot_types):
-                _emit_slot(slot_type, vals[slot_idx])
-        tokens.extend([REPEAT_END])
+            vals_list = list(vals) + [float("nan")] * len(macro.slot_types)
+            vals_list = vals_list[: len(macro.slot_types)]
+            for slot_type, value in zip(macro.slot_types, vals_list):
+                _emit_value(slot_type, value, tokens, slot_values)
+        tokens.append(REPEAT_END)
         slot_values.append(float("nan"))
 
-    def _emit_call(macro_id: str, vals: Sequence[float]):
+    def _emit_call(macro_id: str, vals: Sequence[float]) -> None:
         macro = MACRO_LIBRARY[macro_id]
         tokens.extend([CALL, macro_id])
         slot_values.extend([float("nan")] * 2)
-        vs = list(vals) + [float("nan")] * len(macro.slot_types)
-        vs = vs[: len(macro.slot_types)]
-        for slot_idx, slot_type in enumerate(macro.slot_types):
-            _emit_slot(slot_type, vs[slot_idx])
+        vals_list = list(vals) + [float("nan")] * len(macro.slot_types)
+        vals_list = vals_list[: len(macro.slot_types)]
+        for slot_type, value in zip(macro.slot_types, vals_list):
+            _emit_value(slot_type, value, tokens, slot_values)
 
-    if segments is not None:
-        for macro_id, cell_vals in segments:
-            cell_vals = list(cell_vals)
-            if len(cell_vals) <= 1:
-                _emit_call(macro_id, cell_vals[0] if cell_vals else [])
-            else:
-                _emit_repeat(macro_id, cell_vals)
-    else:
-        if macro_name == MACRO_CELL_BS_PAR_SER_LC:
-            vals_per_cell = _build_bs_cells(components)
-            if not vals_per_cell:
-                raise ValueError("Bandstop structure parse failed.")
-            _emit_repeat(macro_name, vals_per_cell)
-        elif macro_name == MACRO_CELL_BP_SER_PAR_LC:
-            vals_per_cell = _build_bp_cells(components)
-            if not vals_per_cell:
-                raise ValueError("Bandpass structure parse failed.")
-            _emit_repeat(macro_name, vals_per_cell)
+    tokens: List[str] = []
+    slot_values: List[float] = []
+    if include_bos:
+        tokens.append(BOS)
+        slot_values.append(float("nan"))
+    if include_order:
+        if order is None:
+            raise ValueError("include_order=True requires order.")
+        tokens.append(f"<ORDER_{int(order)}>")
+        slot_values.append(float("nan"))
+    tokens.append(MAIN_START)
+    slot_values.append(float("nan"))
+    tokens.extend([PORT_IN, PORT_OUT, PORT_GND])
+    slot_values.extend([float("nan")] * 3)
+
+    if segments is None:
+        cells = _components_to_motif_cells(components)
+        segments = _group_cells_by_macro(cells)
+
+    for macro_id, cell_vals in segments:
+        if macro_id not in MACRO_LIBRARY:
+            raise ValueError(f"Unknown macro: {macro_id}")
+        vals_per_cell = list(cell_vals) if cell_vals else []
+        if not vals_per_cell:
+            vals_per_cell = [[float("nan")] * len(MACRO_LIBRARY[macro_id].slot_types)]
+        if len(vals_per_cell) == 1:
+            _emit_call(macro_id, vals_per_cell[0])
         else:
-            macro = MACRO_LIBRARY[macro_name]
-            # Heuristic: derive K from number of series components along main path (non-gnd).
-            series = [c for c in components if c.role == "series" and c.node1 != "gnd" and c.node2 != "gnd"]
-            K = max(1, len(series))
-            # Collect slot values per cell from components: greedy by series/shunt ordering.
-            vals_per_cell = []
-            shunt_map: Dict[str, Dict[str, float]] = {}
-            for c in components:
-                if c.role != "shunt":
-                    continue
-                node = c.node1 if c.node2 == "gnd" else c.node2
-                d = shunt_map.setdefault(node, {})
-                d[c.ctype] = float(c.value_si)
-            for c in series:
-                vals = []
-                for t in macro.slot_types:
-                    if t == "L":
-                        if c.ctype == "L":
-                            vals.append(float(c.value_si))
-                        else:
-                            sh = shunt_map.get(c.node2, {})
-                            vals.append(float(sh.get("L", float("nan"))))
-                    elif t == "C":
-                        if c.ctype == "C":
-                            vals.append(float(c.value_si))
-                        else:
-                            sh = shunt_map.get(c.node2, {})
-                            vals.append(float(sh.get("C", float("nan"))))
-                    else:
-                        vals.append(float("nan"))
-                vals_per_cell.append(vals)
-
-            while len(vals_per_cell) < K:
-                vals_per_cell.append([float("nan")] * len(macro.slot_types))
-            vals_per_cell = vals_per_cell[:K]
-
-            _emit_repeat(macro_name, vals_per_cell)
+            _emit_repeat(macro_id, vals_per_cell)
 
     tokens.append(MAIN_END)
     slot_values.append(float("nan"))
@@ -1269,23 +1339,24 @@ def dsl_tokens_to_components(
     if not segments:
         return []
 
+    series_indices = [i for i, (macro_name, _) in enumerate(segments) if macro_name in SERIES_MACROS]
+    last_series_idx = series_indices[-1] if series_indices else None
+
     comps: List[ComponentSpec] = []
-    nodes: List[str] = ["in"]
-    last_end = "in"
+    current = "in"
+    node_idx = 0
     for i, (macro_name, vals_for_macro) in enumerate(segments):
-        a = nodes[-1]
-        b = "out" if i == len(segments) - 1 else f"n{i+1}"
-        if b != "out":
-            nodes.append(b)
         macro = MACRO_LIBRARY[macro_name]
-        comps.extend(macro.expand_fn(a, b, "gnd", vals_for_macro, i))
-        last_end = b
-    # ensure last node renamed to out if not already
-    if last_end != "out":
-        for idx_c, c in enumerate(comps):
-            n1 = "out" if c.node1 == last_end else c.node1
-            n2 = "out" if c.node2 == last_end else c.node2
-            comps[idx_c] = ComponentSpec(c.ctype, c.role, c.value_si, c.std_label, n1, n2)
+        if macro_name in SERIES_MACROS:
+            if last_series_idx is not None and i == last_series_idx:
+                next_node = "out"
+            else:
+                node_idx += 1
+                next_node = f"n{node_idx}"
+            comps.extend(macro.expand_fn(current, next_node, "gnd", vals_for_macro, i))
+            current = next_node
+        else:
+            comps.extend(macro.expand_fn(current, current, "gnd", vals_for_macro, i))
     return comps
 
 

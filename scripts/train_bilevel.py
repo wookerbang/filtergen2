@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.dsl import MACRO_IDS, MACRO_LIBRARY, dsl_tokens_to_macro_sequence
+from src.data.dsl import MACRO_IDS, MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
 from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
 
@@ -199,15 +199,26 @@ def _expand_macros_with_placeholders(macro_seq: List[Tuple[int, str]], slot_coun
     comps = []
     slot_indices: List[int] = []
     base = 1_000_000.0
-    nodes = ["in"]
+    series_positions = [i for i, (_, macro) in enumerate(macro_seq) if macro in SERIES_MACROS]
+    last_series_pos = series_positions[-1] if series_positions else None
+    current = "in"
+    node_idx = 0
     for seq_idx, (cell_pos, macro) in enumerate(macro_seq):
-        a = nodes[-1]
-        b = "out" if seq_idx == len(macro_seq) - 1 else f"n{seq_idx + 1}"
-        if b != "out":
-            nodes.append(b)
+        if macro in SERIES_MACROS:
+            if last_series_pos is not None and seq_idx == last_series_pos:
+                a = current
+                b = "out"
+            else:
+                node_idx += 1
+                a = current
+                b = f"n{node_idx}"
+            current = b
+        else:
+            a = current
+            b = current
         macro_def = MACRO_LIBRARY[macro]
         placeholder_vals = [base + cell_pos * slot_count + j for j in range(len(macro_def.slot_types))]
-        macro_comps = macro_def.expand_fn(a, b, "gnd", placeholder_vals, seq_idx)
+        macro_comps = macro_def.expand_fn(a, b, "gnd", placeholder_vals, cell_pos)
         for c in macro_comps:
             slot_global = int(round(float(c.value_si) - base))
             slot_indices.append(slot_global)
@@ -311,7 +322,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--len-weight", type=float, default=1e-3)
     p.add_argument("--gumbel-tau", type=float, default=1.0)
     p.add_argument("--alpha-start", type=float, default=1.0)
-    p.add_argument("--alpha-min", type=float, default=0.2)
+    p.add_argument("--alpha-min", type=float, default=0.1)
     p.add_argument("--alpha-decay-frac", type=float, default=0.3)
     p.add_argument("--use-token-loss", action="store_true", help="(Reserved) include token loss during bilevel.")
 
