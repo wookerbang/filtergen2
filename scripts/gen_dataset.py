@@ -48,18 +48,24 @@ def parse_args() -> argparse.Namespace:
         choices=["freq_dependent", "fixed_ref"],
         help="Q modeling for real waveforms: freq_dependent (Fast Track) or fixed_ref (SPICE-style).",
     )
+    p.add_argument("--vact", dest="vact", action="store_true", help="Emit VACT-Seq tokens.")
+    p.add_argument("--no-vact", dest="vact", action="store_false", help="Disable VACT-Seq token emission.")
+    p.set_defaults(vact=False)
     p.add_argument("--vact-cell", dest="vact_cell", action="store_true", help="Insert <CELL> markers in VACT.")
     p.add_argument("--no-vact-cell", dest="vact_cell", action="store_false", help="Disable <CELL> markers in VACT.")
-    p.set_defaults(vact_cell=True)
-    p.add_argument("--vact-struct", dest="vact_struct", action="store_true", help="Emit VACT-Struct tokens (default: on).")
+    p.set_defaults(vact_cell=False)
+    p.add_argument("--vact-struct", dest="vact_struct", action="store_true", help="Emit VACT-Struct tokens.")
     p.add_argument("--no-vact-struct", dest="vact_struct", action="store_false", help="Disable VACT-Struct token emission.")
-    p.set_defaults(vact_struct=True)
-    p.add_argument("--actions", dest="actions", action="store_true", help="Emit action-construction tokens (default: on).")
+    p.set_defaults(vact_struct=False)
+    p.add_argument("--actions", dest="actions", action="store_true", help="Emit action-construction tokens.")
     p.add_argument("--no-actions", dest="actions", action="store_false", help="Disable action-construction tokens.")
-    p.set_defaults(actions=True)
+    p.set_defaults(actions=False)
     p.add_argument("--dsl", dest="dsl", action="store_true", help="Emit DSL tokens (macro/repeat).")
     p.add_argument("--no-dsl", dest="dsl", action="store_false", help="Disable DSL token emission.")
     p.set_defaults(dsl=True)
+    p.add_argument("--sfci", dest="sfci", action="store_true", help="Emit SFCI tokens.")
+    p.add_argument("--no-sfci", dest="sfci", action="store_false", help="Disable SFCI token emission.")
+    p.set_defaults(sfci=False)
     p.add_argument("--dsl-order", dest="dsl_order", action="store_true", help="Prepend <ORDER_k> in DSL tokens.")
     p.add_argument("--no-dsl-order", dest="dsl_order", action="store_false", help="Disable <ORDER_k> in DSL tokens.")
     p.set_defaults(dsl_order=True)
@@ -73,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--il-check",
         dest="il_check",
         action="store_true",
-        help="Reject circuits with high insertion loss (default: on).",
+        help="Reject circuits with high insertion loss (default: off).",
     )
     p.add_argument(
         "--no-il-check",
@@ -81,7 +87,7 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable insertion loss rejection sanity check.",
     )
-    p.set_defaults(il_check=True)
+    p.set_defaults(il_check=False)
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
@@ -104,10 +110,12 @@ def main() -> None:
         seed=args.seed,
         scenario=str(args.scenario),
         scenario_weights=scenario_weights,
+        emit_vact_tokens=bool(args.vact),
         emit_vact_cells=bool(args.vact_cell),
         emit_vact_struct=bool(args.vact_struct),
         emit_actions=bool(args.actions),
         emit_dsl=bool(args.dsl),
+        emit_sfci=bool(args.sfci),
         dsl_include_order=bool(args.dsl_order),
         dsl_use_cell_indices=bool(args.dsl_cell_indices),
         dsl_strict=bool(args.dsl_strict),

@@ -310,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     # bilevel config
     p.add_argument("--k-percentile", type=float, default=95.0)
     p.add_argument("--k-cap", type=int, default=12)
-    p.add_argument("--k-min", type=int, default=4)
+    p.add_argument("--k-min", type=int, default=12)
     p.add_argument("--unroll-steps", type=int, default=5)
     p.add_argument("--inner-lr", type=float, default=1e-2)
     p.add_argument("--inner-max-step", type=float, default=0.5)

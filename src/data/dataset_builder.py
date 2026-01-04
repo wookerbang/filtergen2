@@ -42,14 +42,20 @@ def _serialize_sample(sample: FilterSample) -> dict:
             "mask_max_db": np.asarray(sample.mask_max_db, dtype=float).tolist() if sample.mask_max_db is not None else None,
             "ideal_components": _serialize_components(sample.ideal_components or []),
             "discrete_components": _serialize_components(sample.discrete_components or []),
-            "vact_tokens": sample.vact_tokens or [],
-            "vact_struct_tokens": sample.vact_struct_tokens or [],
-            "dsl_tokens": sample.dsl_tokens or [],
-            "dsl_slot_values": sample.dsl_slot_values or [],
-            "sfci_tokens": sample.sfci_tokens or [],
-            "action_tokens": sample.action_tokens or [],
         }
     )
+    if sample.vact_tokens is not None:
+        data["vact_tokens"] = sample.vact_tokens
+    if sample.vact_struct_tokens is not None:
+        data["vact_struct_tokens"] = sample.vact_struct_tokens
+    if sample.dsl_tokens is not None:
+        data["dsl_tokens"] = sample.dsl_tokens
+    if sample.dsl_slot_values is not None:
+        data["dsl_slot_values"] = sample.dsl_slot_values
+    if sample.sfci_tokens is not None:
+        data["sfci_tokens"] = sample.sfci_tokens
+    if sample.action_tokens is not None:
+        data["action_tokens"] = sample.action_tokens
     return data
 
 
@@ -61,10 +67,12 @@ def build_dataset(
     seed: int = 42,
     scenario: str | None = None,
     scenario_weights: dict | None = None,
-    emit_vact_cells: bool = True,
-    emit_vact_struct: bool = True,
-    emit_actions: bool = True,
+    emit_vact_tokens: bool = False,
+    emit_vact_cells: bool = False,
+    emit_vact_struct: bool = False,
+    emit_actions: bool = False,
     emit_dsl: bool = True,
+    emit_sfci: bool = False,
     dsl_include_order: bool = True,
     dsl_use_cell_indices: bool = False,
     dsl_strict: bool = False,
@@ -190,11 +198,13 @@ def build_dataset(
                     print(f"Sample {i}: Circuit broken (High insertion loss).")
                     continue
 
-            vact_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_tokens(
-                discrete_components,
-                emit_cell_tokens=emit_vact_cells,
-                normalize_node_order=True,
-            )
+            vact_tokens = None
+            if emit_vact_tokens:
+                vact_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_tokens(
+                    discrete_components,
+                    emit_cell_tokens=emit_vact_cells,
+                    normalize_node_order=True,
+                )
             vact_struct_tokens = None
             if emit_vact_struct:
                 vact_struct_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_struct_tokens(
@@ -227,7 +237,7 @@ def build_dataset(
                 if dsl_strict and dsl_tokens and VAL_NONE in dsl_tokens:
                     print(f"Sample {i}: DSL contains <VAL_NONE>; skipping due to --dsl-strict.")
                     continue
-            sfci_tokens = components_to_sfci_net_tokens(discrete_components)
+            sfci_tokens = components_to_sfci_net_tokens(discrete_components) if emit_sfci else None
             action_tokens = components_to_action_tokens(discrete_components) if emit_actions else None
             sample = FilterSample(
                 spec_id=i,

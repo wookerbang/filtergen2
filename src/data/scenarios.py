@@ -24,11 +24,11 @@ SCENARIO_NAMES: Sequence[ScenarioName] = (
 SCENARIO_ID: Dict[ScenarioName, int] = {name: i for i, name in enumerate(SCENARIO_NAMES)}
 
 DEFAULT_SCENARIO_WEIGHTS: Dict[ScenarioName, float] = {
-    "general": 0.35,
-    "anti_jamming": 0.2,
-    "coexistence": 0.2,
-    "wideband_rejection": 0.15,
-    "random_basic": 0.1,
+    "general": 0.1167,
+    "anti_jamming": 0.0667,
+    "coexistence": 0.0667,
+    "wideband_rejection": 0.05,
+    "random_basic": 0.7,
 }
 
 
