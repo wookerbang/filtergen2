@@ -1,0 +1,14 @@
+name: AI
+channels:
+  - nvidia
+  - pytorch
+  - defaults
+dependencies:
+  - python==3.11.13
+  - pygraphviz
+  - faiss-gpu
+  - nodejs==24.8.0
+  - mysql
+  - transformers[version='>=4.36']
+  - datasets[version='>=2.14']
+prefix: /home/booker/miniconda3/envs/AI

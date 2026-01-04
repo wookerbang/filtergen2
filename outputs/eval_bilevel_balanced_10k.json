@@ -1,0 +1,49 @@
+{
+  "num_samples": 2000,
+  "failed_samples": 0,
+  "mse_pre": NaN,
+  "mse_post": NaN,
+  "yield_total": 2000,
+  "yield_pre": 0.0,
+  "yield_post": 0.0,
+  "per_filter_type": {
+    "lowpass": {
+      "count": 522,
+      "failed": 0,
+      "mse_pre": NaN,
+      "mse_post": NaN,
+      "yield_total": 522,
+      "yield_pre": 0.0,
+      "yield_post": 0.0
+    },
+    "highpass": {
+      "count": 472,
+      "failed": 0,
+      "mse_pre": NaN,
+      "mse_post": NaN,
+      "yield_total": 472,
+      "yield_pre": 0.0,
+      "yield_post": 0.0
+    },
+    "bandpass": {
+      "count": 502,
+      "failed": 0,
+      "mse_pre": NaN,
+      "mse_post": NaN,
+      "yield_total": 502,
+      "yield_pre": 0.0,
+      "yield_post": 0.0
+    },
+    "bandstop": {
+      "count": 504,
+      "failed": 0,
+      "mse_pre": NaN,
+      "mse_post": NaN,
+      "yield_total": 504,
+      "yield_pre": 0.0,
+      "yield_post": 0.0
+    }
+  },
+  "config": "/home/booker/wavefilter-gen/checkpoints/bilevel_balanced_10k/input_config.json",
+  "checkpoint": "checkpoints/bilevel_balanced_10k/epoch_10/pytorch_model.bin"
+}

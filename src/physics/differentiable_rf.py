@@ -1049,7 +1049,9 @@ def unroll_refine_slots(
     raw_max: float = -12.0,
     nan_backoff: float = 0.5,
     max_backoff: int = 3,
-) -> torch.Tensor:
+    create_graph: bool = True,
+    return_raw: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Differentiable unrolled refinement over per-cell slot values with stability guards.
     """
@@ -1075,7 +1077,7 @@ def unroll_refine_slots(
             if not torch.isfinite(loss):
                 step_lr *= float(nan_backoff)
                 continue
-            grad = torch.autograd.grad(loss, raw_flat, create_graph=True)[0]
+            grad = torch.autograd.grad(loss, raw_flat, create_graph=bool(create_graph))[0]
             if not torch.isfinite(grad).all():
                 step_lr *= float(nan_backoff)
                 continue
@@ -1091,9 +1093,15 @@ def unroll_refine_slots(
             break
         if not updated:
             if loss is not None and torch.isfinite(loss):
+                if return_raw:
+                    return loss, raw_flat.view_as(raw)
                 return loss
+            if return_raw:
+                return torch.zeros((), device=raw.device, dtype=raw.dtype), raw_flat.view_as(raw)
             return torch.zeros((), device=raw.device, dtype=raw.dtype)
 
     if loss is None:
         raise ValueError("unroll_refine_slots requires steps >= 1.")
+    if return_raw:
+        return loss, raw_flat.view_as(raw)
     return loss
