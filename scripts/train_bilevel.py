@@ -36,9 +36,20 @@ class BilevelDataset(Dataset):
         include_s11: bool = True,
     ) -> None:
         self.samples = []
+        self.dsl_macros = []
         with open(jsonl_path, "r") as f:
-            for line in f:
-                self.samples.append(json.loads(line))
+            for line_no, line in enumerate(f, start=1):
+                if not line.strip():
+                    continue
+                sample = json.loads(line)
+                tokens = sample.get("dsl_tokens") or []
+                if not tokens:
+                    raise ValueError(f"Missing dsl_tokens at line {line_no} in {jsonl_path}.")
+                macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
+                if not macros:
+                    raise ValueError(f"Empty macro sequence at line {line_no} in {jsonl_path}.")
+                self.samples.append(sample)
+                self.dsl_macros.append(macros)
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
         self.normalize_wave = normalize_wave
@@ -144,6 +155,7 @@ class BilevelDataset(Dataset):
             "scalar": scalar,
             "ideal_s21_db": ideal_s21,
             "dsl_tokens": dsl_tokens,
+            "dsl_macros": self.dsl_macros[idx],
         }
 
 
@@ -256,7 +268,9 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
         for i, b in enumerate(batch):
-            macros = dsl_tokens_to_macro_sequence(b["dsl_tokens"], strict=True)
+            macros = b.get("dsl_macros")
+            if macros is None:
+                macros = dsl_tokens_to_macro_sequence(b["dsl_tokens"], strict=True)
             if len(macros) > k_max:
                 macros = macros[:k_max]
             for j, m in enumerate(macros):
@@ -281,6 +295,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", type=Path, required=True, help="Path to train jsonl.")
     p.add_argument("--eval-data", type=Path, help="Optional eval jsonl.")
     p.add_argument("--output", type=Path, default=Path("checkpoints/bilevel"), help="Checkpoint dir.")
+    p.add_argument("--init-from", type=Path, help="Initialize from checkpoint (pytorch_model.bin or dir).")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--epochs", type=int, default=5)
@@ -290,6 +305,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-total-limit", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--amp-bf16", action="store_true", help="Enable BF16 autocast (model forward only).")
+    p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes.")
+    p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0).")
+    p.add_argument("--pin-memory", action="store_true", help="Enable pin_memory for faster H2D copies.")
+    p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive.")
     p.add_argument("--clip-grad", type=float, default=5.0, help="Clip gradient norm (<=0 disables).")
     p.add_argument("--skip-nonfinite", dest="skip_nonfinite", action="store_true", help="Skip updates on non-finite batches.")
     p.add_argument("--no-skip-nonfinite", dest="skip_nonfinite", action="store_false")
@@ -341,6 +360,31 @@ def _alpha_schedule(step: int, total_steps: int, *, alpha_start: float, alpha_mi
     return float(alpha_min) + (float(alpha_start) - float(alpha_min)) * t
 
 
+def _resolve_ckpt(path: Path) -> Path:
+    if path.is_file():
+        return path
+    direct = path / "pytorch_model.bin"
+    if direct.exists():
+        return direct
+    candidates = []
+    for sub in path.iterdir():
+        if not sub.is_dir():
+            continue
+        name = sub.name
+        if name.startswith("epoch_") or name.startswith("step_"):
+            try:
+                num = int(name.split("_", 1)[1])
+            except Exception:
+                continue
+            ckpt = sub / "pytorch_model.bin"
+            if ckpt.exists():
+                candidates.append((num, ckpt))
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
+    raise FileNotFoundError(f"No checkpoint found under {path}")
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -378,6 +422,10 @@ def main() -> None:
         "hidden_mult": args.hidden_mult,
         "dropout": args.dropout,
         "amp_bf16": bool(args.amp_bf16),
+        "num_workers": int(args.num_workers),
+        "prefetch_factor": int(args.prefetch_factor),
+        "pin_memory": bool(args.pin_memory),
+        "persistent_workers": bool(args.persistent_workers),
         "clip_grad": args.clip_grad,
         "skip_nonfinite": bool(args.skip_nonfinite),
         "alpha_start": args.alpha_start,
@@ -393,6 +441,7 @@ def main() -> None:
         "inner_nan_tries": args.inner_nan_tries,
         "phys_weight": args.phys_weight,
         "gumbel_tau": args.gumbel_tau,
+        "init_from": str(args.init_from) if args.init_from else None,
     }
     with (args.output / "input_config.json").open("w") as f:
         json.dump(cfg, f, indent=2)
@@ -405,13 +454,23 @@ def main() -> None:
         freq_scale=args.freq_scale,
         include_s11=args.include_s11,
     )
+    device = torch.device(args.device)
+    num_workers = max(0, int(args.num_workers))
+    pin_memory = bool(args.pin_memory and device.type == "cuda")
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=make_collate_fn(macro_to_id, skip_id=skip_id, k_max=k_max),
+        **loader_kwargs,
     )
+    non_blocking = bool(pin_memory)
 
     in_channels = dataset[0]["wave"].shape[0]
     model = Wave2StructureModel(
@@ -423,14 +482,17 @@ def main() -> None:
         hidden_mult=args.hidden_mult,
         dropout=args.dropout,
         spec_mode=args.spec_mode,
-    ).to(device=args.device)
+    ).to(device=device)
+    if args.init_from:
+        ckpt_path = _resolve_ckpt(args.init_from)
+        model.load_state_dict(torch.load(ckpt_path, map_location=args.device))
+        print(f"[init] loaded weights from {ckpt_path}")
     macro_slot_mask = macro_slot_mask.to(device=args.device)
 
     if args.use_token_loss:
         raise ValueError("--use-token-loss is reserved; bilevel model has no decoder.")
 
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
-    device = torch.device(args.device)
     amp_enabled = bool(args.amp_bf16 and device.type == "cuda" and dtype == torch.float32)
     if args.amp_bf16 and not amp_enabled:
         print("[warn] BF16 autocast disabled (requires CUDA + float32 dtype).")
@@ -445,12 +507,12 @@ def main() -> None:
     for epoch in range(int(args.epochs)):
         for batch in loader:
             step += 1
-            wave = batch["wave"].to(device, dtype=dtype)
-            filter_type = batch["filter_type"].to(device)
-            fc_hz = batch["fc_hz"].to(device, dtype=dtype)
-            freq = batch["freq"].to(device, dtype=dtype)
-            target = batch["target_s21_db"].to(device, dtype=dtype)
-            macro_targets = batch["macro_ids"].to(device)
+            wave = batch["wave"].to(device, dtype=dtype, non_blocking=non_blocking)
+            filter_type = batch["filter_type"].to(device, non_blocking=non_blocking)
+            fc_hz = batch["fc_hz"].to(device, dtype=dtype, non_blocking=non_blocking)
+            freq = batch["freq"].to(device, dtype=dtype, non_blocking=non_blocking)
+            target = batch["target_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            macro_targets = batch["macro_ids"].to(device, non_blocking=non_blocking)
             if args.skip_nonfinite:
                 if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
                     skipped_nonfinite += 1

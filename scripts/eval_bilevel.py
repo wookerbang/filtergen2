@@ -36,10 +36,20 @@ class BilevelEvalDataset(Dataset):
         include_s11: bool = True,
     ) -> None:
         self.samples = []
+        self.dsl_macros = []
         with open(jsonl_path, "r") as f:
-            for line in f:
-                if line.strip():
-                    self.samples.append(json.loads(line))
+            for line_no, line in enumerate(f, start=1):
+                if not line.strip():
+                    continue
+                sample = json.loads(line)
+                tokens = sample.get("dsl_tokens") or []
+                if not tokens:
+                    raise ValueError(f"Missing dsl_tokens at line {line_no} in {jsonl_path}.")
+                macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
+                if not macros:
+                    raise ValueError(f"Empty macro sequence at line {line_no} in {jsonl_path}.")
+                self.samples.append(sample)
+                self.dsl_macros.append(macros)
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
         self.normalize_wave = normalize_wave
@@ -149,6 +159,7 @@ class BilevelEvalDataset(Dataset):
 
         return {
             "dsl_tokens": s.get("dsl_tokens", []),
+            "dsl_macros": self.dsl_macros[idx],
             "freq": freq,
             "wave": wave,
             "scalar": scalar,
@@ -278,6 +289,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, help="Optional JSON output path.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes.")
+    p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0).")
+    p.add_argument("--pin-memory", action="store_true", help="Enable pin_memory for faster H2D copies.")
+    p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive.")
     p.add_argument("--max-samples", type=int, default=0, help="Limit number of eval samples (0 disables).")
     p.add_argument("--use-wave", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"], default=None)
     p.add_argument("--freq-mode", choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"], default=None)
@@ -307,12 +322,14 @@ def _new_group() -> dict:
         "yield_total": 0,
         "yield_pre": 0,
         "yield_post": 0,
+        "yield_oracle": 0,
         "failed": 0,
         "macro_slot_total": 0,
         "macro_slot_correct": 0,
         "macro_non_skip_total": 0,
         "macro_non_skip_correct": 0,
         "len_abs_sum": 0.0,
+        "len_bias_sum": 0.0,
         "len_exact": 0,
     }
 
@@ -360,7 +377,9 @@ def main() -> None:
         include_s11=include_s11,
     )
     if args.max_samples and args.max_samples > 0:
-        dataset.samples = dataset.samples[: int(args.max_samples)]
+        max_n = int(args.max_samples)
+        dataset.samples = dataset.samples[:max_n]
+        dataset.dsl_macros = dataset.dsl_macros[:max_n]
 
     def collate(batch: List[dict]) -> dict:
         return {
@@ -371,12 +390,28 @@ def main() -> None:
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
             "dsl_tokens": [b["dsl_tokens"] for b in batch],
+            "dsl_macros": [b.get("dsl_macros") for b in batch],
         }
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate)
+    device = torch.device(args.device)
+    num_workers = max(0, int(args.num_workers))
+    pin_memory = bool(args.pin_memory and device.type == "cuda")
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate,
+        **loader_kwargs,
+    )
+    non_blocking = bool(pin_memory)
 
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
-    device = torch.device(args.device)
 
     model = Wave2StructureModel(
         k_max=k_max,
@@ -407,6 +442,7 @@ def main() -> None:
     yield_total = 0
     yield_pre_pass = 0
     yield_post_pass = 0
+    yield_oracle_pass = 0
     failed = 0
     nonfinite_logits = 0
     nonfinite_slot = 0
@@ -418,17 +454,19 @@ def main() -> None:
     macro_non_skip_total = 0
     macro_non_skip_correct = 0
     len_abs_sum = 0.0
+    len_bias_sum = 0.0
     len_exact = 0
     per_type: dict[str, dict] = {name: _new_group() for name in type_names.values()}
 
     for batch in loader:
-        wave = batch["wave"].to(device=device, dtype=dtype)
-        freq = batch["freq"].to(device=device, dtype=dtype)
-        target = batch["target_s21_db"].to(device=device, dtype=dtype)
-        mask_min = batch["mask_min_db"].to(device=device, dtype=dtype)
-        mask_max = batch["mask_max_db"].to(device=device, dtype=dtype)
-        scalar = batch["scalar"].to(device=device, dtype=dtype)
+        wave = batch["wave"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        freq = batch["freq"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        target = batch["target_s21_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        mask_min = batch["mask_min_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        mask_max = batch["mask_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        scalar = batch["scalar"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         dsl_tokens = batch["dsl_tokens"]
+        dsl_macros = batch.get("dsl_macros")
         filter_type = scalar[:, 0].long()
         fc_hz = scalar[:, 1]
 
@@ -544,16 +582,20 @@ def main() -> None:
                     per_type[ft_name]["failed"] += 1
                     continue
 
-                try:
-                    macros = dsl_tokens_to_macro_sequence(dsl_tokens[b], strict=True)
-                except Exception:
-                    failed += 1
-                    ft_id = int(filter_type[b].item())
-                    ft_name = type_names.get(ft_id, "unknown")
-                    if ft_name not in per_type:
-                        per_type[ft_name] = _new_group()
-                    per_type[ft_name]["failed"] += 1
-                    continue
+                macros = None
+                if dsl_macros is not None:
+                    macros = dsl_macros[b]
+                if not macros:
+                    try:
+                        macros = dsl_tokens_to_macro_sequence(dsl_tokens[b], strict=True)
+                    except Exception:
+                        failed += 1
+                        ft_id = int(filter_type[b].item())
+                        ft_name = type_names.get(ft_id, "unknown")
+                        if ft_name not in per_type:
+                            per_type[ft_name] = _new_group()
+                        per_type[ft_name]["failed"] += 1
+                        continue
                 if len(macros) > k_max:
                     macros = macros[:k_max]
                 macro_ids_gt = torch.full((k_max,), skip_id, dtype=torch.long)
@@ -581,6 +623,7 @@ def main() -> None:
                 pred_len = int((pred_ids != skip_id).sum().item())
                 gt_len = int((gt_ids != skip_id).sum().item())
                 len_abs = abs(pred_len - gt_len)
+                len_bias = pred_len - gt_len
                 len_exact_flag = int(pred_len == gt_len)
 
                 pre_mse_sum += pre_mse
@@ -599,21 +642,27 @@ def main() -> None:
                 macro_non_skip_total += non_skip_total
                 macro_non_skip_correct += non_skip_correct
                 len_abs_sum += len_abs
+                len_bias_sum += len_bias
                 len_exact += len_exact_flag
                 group["macro_slot_total"] += slot_total
                 group["macro_slot_correct"] += slot_correct
                 group["macro_non_skip_total"] += non_skip_total
                 group["macro_non_skip_correct"] += non_skip_correct
                 group["len_abs_sum"] += len_abs
+                group["len_bias_sum"] += len_bias
                 group["len_exact"] += len_exact_flag
 
                 if _has_constraints(mask_min[b], mask_max[b]):
                     yield_total += 1
+                    if _mask_satisfied(target[b], mask_min[b], mask_max[b]):
+                        yield_oracle_pass += 1
                     if _mask_satisfied(pred_pre, mask_min[b], mask_max[b]):
                         yield_pre_pass += 1
                     if _mask_satisfied(pred_post, mask_min[b], mask_max[b]):
                         yield_post_pass += 1
                     group["yield_total"] += 1
+                    if _mask_satisfied(target[b], mask_min[b], mask_max[b]):
+                        group["yield_oracle"] += 1
                     if _mask_satisfied(pred_pre, mask_min[b], mask_max[b]):
                         group["yield_pre"] += 1
                     if _mask_satisfied(pred_post, mask_min[b], mask_max[b]):
@@ -641,8 +690,10 @@ def main() -> None:
             "macro_acc": (group["macro_slot_correct"] / slot_total) if slot_total else None,
             "macro_non_skip_acc": (group["macro_non_skip_correct"] / non_skip_total) if non_skip_total else None,
             "len_mae": (group["len_abs_sum"] / max(1, count)),
+            "len_bias": (group["len_bias_sum"] / max(1, count)),
             "len_exact": (group["len_exact"] / max(1, count)),
             "yield_total": ytot,
+            "yield_oracle": (group["yield_oracle"] / ytot) if ytot else None,
             "yield_pre": (group["yield_pre"] / ytot) if ytot else None,
             "yield_post": (group["yield_post"] / ytot) if ytot else None,
         }
@@ -660,8 +711,10 @@ def main() -> None:
         "macro_acc": (macro_slot_correct / macro_slot_total) if macro_slot_total else None,
         "macro_non_skip_acc": (macro_non_skip_correct / macro_non_skip_total) if macro_non_skip_total else None,
         "len_mae": (len_abs_sum / max(1, total)),
+        "len_bias": (len_bias_sum / max(1, total)),
         "len_exact": (len_exact / max(1, total)),
         "yield_total": yield_total,
+        "yield_oracle": (yield_oracle_pass / yield_total) if yield_total else None,
         "yield_pre": (yield_pre_pass / yield_total) if yield_total else None,
         "yield_post": (yield_post_pass / yield_total) if yield_total else None,
         "per_filter_type": per_type_out,
