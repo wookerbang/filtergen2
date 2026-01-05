@@ -35,9 +35,12 @@ class BilevelDataset(Dataset):
         freq_mode: str = "log_fc",
         freq_scale: str = "none",
         include_s11: bool = True,
+        log_every: int = 0,
     ) -> None:
         self.samples = []
         self.dsl_macros = []
+        if log_every:
+            print(f"[load] reading dataset {jsonl_path}", flush=True)
         with open(jsonl_path, "r") as f:
             for line_no, line in enumerate(f, start=1):
                 if not line.strip():
@@ -51,12 +54,16 @@ class BilevelDataset(Dataset):
                     raise ValueError(f"Empty macro sequence at line {line_no} in {jsonl_path}.")
                 self.samples.append(sample)
                 self.dsl_macros.append(macros)
+                if log_every and line_no % int(log_every) == 0:
+                    print(f"[load] parsed {line_no} lines", flush=True)
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
         self.normalize_wave = normalize_wave
         self.freq_mode = freq_mode
         self.freq_scale = freq_scale
         self.include_s11 = include_s11
+        if log_every:
+            print(f"[load] finished: {len(self.samples)} samples", flush=True)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -194,6 +201,32 @@ def _scan_macro_vocab_and_k(
     k_max = min(int(k_cap), max(int(k_min), k_est))
     return macro_vocab, k_max
 
+
+def _scan_macro_vocab_and_k_from_sequences(
+    sequences: List[List[str]],
+    *,
+    k_percentile: float,
+    k_cap: int,
+    k_min: int,
+) -> Tuple[List[str], int]:
+    macro_set = set()
+    cell_counts: List[int] = []
+    for macros in sequences:
+        if not macros:
+            continue
+        macro_set.update(macros)
+        cell_counts.append(len(macros))
+    if not cell_counts:
+        raise ValueError("No valid DSL samples found for macro/vocab scan.")
+
+    macro_vocab = [m for m in MACRO_IDS if m in macro_set]
+    if not macro_vocab:
+        raise ValueError("Macro vocab is empty after scanning dataset.")
+
+    p = float(np.percentile(np.asarray(cell_counts, dtype=float), float(k_percentile)))
+    k_est = int(math.ceil(p))
+    k_max = min(int(k_cap), max(int(k_min), k_est))
+    return macro_vocab, k_max
 
 def _enforce_non_empty(macro_ids: torch.Tensor, g_logits: torch.Tensor, skip_id: int) -> torch.Tensor:
     if bool((macro_ids != skip_id).any()):
@@ -368,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pin-memory", action="store_true", help="Enable pin_memory for faster H2D copies.")
     p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive.")
     p.add_argument("--circuit-cache-size", type=int, default=2048, help="LRU cache size for compiled circuits (0 disables).")
+    p.add_argument("--load-log-steps", type=int, default=10000, help="Log dataset loading progress every N lines (0 disables).")
     p.add_argument("--clip-grad", type=float, default=5.0, help="Clip gradient norm (<=0 disables).")
     p.add_argument("--skip-nonfinite", dest="skip_nonfinite", action="store_true", help="Skip updates on non-finite batches.")
     p.add_argument("--no-skip-nonfinite", dest="skip_nonfinite", action="store_false")
@@ -450,8 +484,20 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    macro_vocab, k_max = _scan_macro_vocab_and_k(
-        str(args.data), k_percentile=args.k_percentile, k_cap=args.k_cap, k_min=args.k_min
+    dataset = BilevelDataset(
+        str(args.data),
+        use_wave=args.use_wave,
+        normalize_wave=args.wave_norm,
+        freq_mode=args.freq_mode,
+        freq_scale=args.freq_scale,
+        include_s11=args.include_s11,
+        log_every=args.load_log_steps,
+    )
+    macro_vocab, k_max = _scan_macro_vocab_and_k_from_sequences(
+        dataset.dsl_macros,
+        k_percentile=args.k_percentile,
+        k_cap=args.k_cap,
+        k_min=args.k_min,
     )
     macro_to_id = {m: i for i, m in enumerate(macro_vocab)}
     id_to_macro = list(macro_vocab)
@@ -505,15 +551,6 @@ def main() -> None:
     }
     with (args.output / "input_config.json").open("w") as f:
         json.dump(cfg, f, indent=2)
-
-    dataset = BilevelDataset(
-        str(args.data),
-        use_wave=args.use_wave,
-        normalize_wave=args.wave_norm,
-        freq_mode=args.freq_mode,
-        freq_scale=args.freq_scale,
-        include_s11=args.include_s11,
-    )
     device = torch.device(args.device)
     num_workers = max(0, int(args.num_workers))
     pin_memory = bool(args.pin_memory and device.type == "cuda")

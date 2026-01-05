@@ -305,10 +305,15 @@ def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
 
 
 def pick_anchor_node(components: Iterable[ComponentSpec]) -> str:
-    nodes: List[str] = []
+    candidates: List[str] = []
+    seen: set[str] = set()
     for c in components:
-        nodes.extend([c.node1, c.node2])
-    candidates = [n for n in set(nodes) if n not in ("gnd", "out")]
+        for node in (c.node1, c.node2):
+            if node in ("gnd", "out"):
+                continue
+            if node not in seen:
+                seen.add(node)
+                candidates.append(node)
     return candidates[0] if candidates else "in"
 
 

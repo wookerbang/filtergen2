@@ -198,16 +198,21 @@ def build_dataset(
                     print(f"Sample {i}: Circuit broken (High insertion loss).")
                     continue
 
+            order_token = spec.get("order_effective", spec.get("order"))
             vact_tokens = None
             if emit_vact_tokens:
-                vact_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_tokens(
+                if order_token is None:
+                    raise ValueError("ORDER token requested but spec missing order.")
+                vact_tokens = [f"<ORDER_{int(order_token)}>", "<SEP>"] + components_to_vact_tokens(
                     discrete_components,
                     emit_cell_tokens=emit_vact_cells,
                     normalize_node_order=True,
                 )
             vact_struct_tokens = None
             if emit_vact_struct:
-                vact_struct_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_struct_tokens(
+                if order_token is None:
+                    raise ValueError("ORDER token requested but spec missing order.")
+                vact_struct_tokens = [f"<ORDER_{int(order_token)}>", "<SEP>"] + components_to_vact_struct_tokens(
                     discrete_components,
                     z0=float(z0),
                     include_ports=True,
@@ -227,7 +232,7 @@ def build_dataset(
                         [],
                         segments=segments,
                         include_order=dsl_include_order,
-                        order=spec.get("order"),
+                        order=int(order_token) if order_token is not None else None,
                         use_cell_indices=dsl_use_cell_indices,
                         allow_incomplete=not dsl_strict,
                     )

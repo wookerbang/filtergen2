@@ -285,4 +285,6 @@ def apply_scenario_postprocess(
         spec["notch_L"] = L_val
         spec["notch_C"] = C_val
         spec["notch_anchor"] = anchor
+        base_order = int(spec.get("order") or 0)
+        spec["order_effective"] = base_order + 1
     return comps
