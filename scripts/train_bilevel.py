@@ -5,6 +5,7 @@ import json
 import math
 import random
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Tuple
 
@@ -259,6 +260,63 @@ def _build_circuit_and_indices(
     return circuit, torch.tensor(slot_idx_order, device=device, dtype=torch.long)
 
 
+class CircuitCache:
+    def __init__(
+        self,
+        *,
+        max_size: int,
+        assembler: DynamicCircuitAssembler,
+        id_to_macro: List[str],
+        skip_id: int,
+        slot_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.max_size = max(0, int(max_size))
+        self.assembler = assembler
+        self.id_to_macro = id_to_macro
+        self.skip_id = skip_id
+        self.slot_count = slot_count
+        self.device = device
+        self.dtype = dtype
+        self._cache: OrderedDict[tuple[int, ...], tuple[object, torch.Tensor]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def get(self, macro_ids: torch.Tensor) -> tuple[object, torch.Tensor]:
+        if self.max_size <= 0:
+            return _build_circuit_and_indices(
+                macro_ids,
+                id_to_macro=self.id_to_macro,
+                skip_id=self.skip_id,
+                slot_count=self.slot_count,
+                assembler=self.assembler,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        key = tuple(int(x) for x in macro_ids.tolist())
+        hit = self._cache.get(key)
+        if hit is not None:
+            self.hits += 1
+            self._cache.move_to_end(key)
+            return hit
+        self.misses += 1
+        circuit, slot_idx = _build_circuit_and_indices(
+            macro_ids,
+            id_to_macro=self.id_to_macro,
+            skip_id=self.skip_id,
+            slot_count=self.slot_count,
+            assembler=self.assembler,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._cache[key] = (circuit, slot_idx)
+        if len(self._cache) > self.max_size:
+            self._cache.popitem(last=False)
+            self.evictions += 1
+        return circuit, slot_idx
+
 def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
     def collate(batch: List[dict]) -> dict:
         waves = torch.stack([b["wave"] for b in batch])
@@ -309,6 +367,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0).")
     p.add_argument("--pin-memory", action="store_true", help="Enable pin_memory for faster H2D copies.")
     p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive.")
+    p.add_argument("--circuit-cache-size", type=int, default=2048, help="LRU cache size for compiled circuits (0 disables).")
     p.add_argument("--clip-grad", type=float, default=5.0, help="Clip gradient norm (<=0 disables).")
     p.add_argument("--skip-nonfinite", dest="skip_nonfinite", action="store_true", help="Skip updates on non-finite batches.")
     p.add_argument("--no-skip-nonfinite", dest="skip_nonfinite", action="store_false")
@@ -426,6 +485,7 @@ def main() -> None:
         "prefetch_factor": int(args.prefetch_factor),
         "pin_memory": bool(args.pin_memory),
         "persistent_workers": bool(args.persistent_workers),
+        "circuit_cache_size": int(args.circuit_cache_size),
         "clip_grad": args.clip_grad,
         "skip_nonfinite": bool(args.skip_nonfinite),
         "alpha_start": args.alpha_start,
@@ -497,6 +557,15 @@ def main() -> None:
     if args.amp_bf16 and not amp_enabled:
         print("[warn] BF16 autocast disabled (requires CUDA + float32 dtype).")
     assembler = DynamicCircuitAssembler(z0=50.0)
+    circuit_cache = CircuitCache(
+        max_size=args.circuit_cache_size,
+        assembler=assembler,
+        id_to_macro=id_to_macro,
+        skip_id=skip_id,
+        slot_count=slot_count,
+        device=device,
+        dtype=dtype,
+    )
 
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
     step = 0
@@ -547,15 +616,7 @@ def main() -> None:
                     hard_mask = macro_slot_mask[macro_ids_hard]
                 soft_mask = torch.matmul(g_soft[b], macro_slot_mask)
                 slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
-                circuit, slot_idx = _build_circuit_and_indices(
-                    macro_ids_hard,
-                    id_to_macro=id_to_macro,
-                    skip_id=skip_id,
-                    slot_count=slot_count,
-                    assembler=assembler,
-                    device=wave.device,
-                    dtype=dtype,
-                )
+                circuit, slot_idx = circuit_cache.get(macro_ids_hard)
                 loss_b = unroll_refine_slots(
                     slot_raw[b],
                     slot_mask,
@@ -590,11 +651,18 @@ def main() -> None:
                 opt.zero_grad(set_to_none=True)
 
             if step % int(args.log_steps) == 0:
+                cache_note = ""
+                if circuit_cache.max_size > 0:
+                    total_cache = circuit_cache.hits + circuit_cache.misses
+                    if total_cache > 0:
+                        hit_rate = float(circuit_cache.hits) / float(total_cache)
+                        cache_note = f" cache_hit={hit_rate:.2f}"
                 print(
                     f"[epoch {epoch+1}] step={step} loss={loss.item():.4f} "
                     f"phys={physics_loss.item():.4f} phys_w={phys_weight:.1e} "
                     f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f}"
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
+                    + cache_note
                 )
 
             if int(args.save_steps) > 0 and step % int(args.save_steps) == 0:
