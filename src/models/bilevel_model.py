@@ -29,6 +29,7 @@ class Wave2StructureModel(nn.Module):
         hidden_mult: int = 2,
         dropout: float = 0.1,
         spec_mode: Literal["type_fc", "none"] = "type_fc",
+        attn_heads: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.k_max = int(k_max)
@@ -43,14 +44,25 @@ class Wave2StructureModel(nn.Module):
         else:
             raise ValueError(f"Unknown spec_mode: {spec_mode}")
 
+        if attn_heads is None:
+            attn_heads = 8 if d_model % 8 == 0 else (4 if d_model % 4 == 0 else 1)
+        if d_model % attn_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by attn_heads ({attn_heads}).")
+
         hidden = int(d_model * max(1, hidden_mult))
+        self.slot_queries = nn.Parameter(torch.zeros(self.k_max, d_model))
+        nn.init.normal_(self.slot_queries, std=0.02)
+        self.cross_attn = nn.MultiheadAttention(d_model, attn_heads, dropout=dropout, batch_first=True)
+        self.cross_ln = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, attn_heads, dropout=dropout, batch_first=True)
+        self.self_ln = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        self.gate_head = nn.Linear(hidden, self.k_max * (self.macro_vocab_size + 1))
-        self.value_head = nn.Linear(hidden, self.k_max * self.slot_count)
+        self.gate_head = nn.Linear(hidden, self.macro_vocab_size + 1)
+        self.value_head = nn.Linear(hidden, self.slot_count)
         nn.init.constant_(self.value_head.bias, -22.0)
 
     def forward(
@@ -60,14 +72,20 @@ class Wave2StructureModel(nn.Module):
         fc_hz: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         wave_feat = self.wave_encoder(wave)  # (B, L, d)
-        pooled = wave_feat.mean(dim=1)
         if self.spec_encoder is not None:
             if filter_type is None or fc_hz is None:
                 raise ValueError("Spec encoder enabled but filter_type/fc_hz not provided.")
             log_fc = torch.log10(fc_hz.clamp_min(1e-6))
-            spec_vec = self.spec_encoder(filter_type, log_fc)
-            pooled = pooled + spec_vec
-        h = self.mlp(pooled)
-        g_logits = self.gate_head(h).view(-1, self.k_max, self.macro_vocab_size + 1)
-        slot_values_raw = self.value_head(h).view(-1, self.k_max, self.slot_count)
+            spec_vec = self.spec_encoder(filter_type, log_fc).to(wave_feat.dtype)
+            wave_feat = torch.cat([spec_vec.unsqueeze(1), wave_feat], dim=1)
+
+        batch = wave_feat.size(0)
+        slot_q = self.slot_queries.unsqueeze(0).expand(batch, -1, -1)
+        cross_out, _ = self.cross_attn(slot_q, wave_feat, wave_feat, need_weights=False)
+        cross_out = self.cross_ln(slot_q + cross_out)
+        self_out, _ = self.self_attn(cross_out, cross_out, cross_out, need_weights=False)
+        self_out = self.self_ln(cross_out + self_out)
+        h = self.mlp(self_out)
+        g_logits = self.gate_head(h)
+        slot_values_raw = self.value_head(h)
         return g_logits, slot_values_raw

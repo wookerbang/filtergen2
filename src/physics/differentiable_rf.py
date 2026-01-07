@@ -791,6 +791,109 @@ class RefinementResult:
     snapped_s21_db: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class MacroBankEntry:
+    op_codes: List[int]
+    op_param_counts: Optional[List[int]]
+    slot_idx: torch.Tensor
+
+
+def _cascade_abcd_cells(
+    A_cells: torch.Tensor,
+    B_cells: torch.Tensor,
+    C_cells: torch.Tensor,
+    D_cells: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if A_cells.ndim != 2:
+        raise ValueError(f"Expected A_cells shape (K, F), got {tuple(A_cells.shape)}")
+    A = torch.ones_like(A_cells[0])
+    B = torch.zeros_like(B_cells[0])
+    C = torch.zeros_like(C_cells[0])
+    D = torch.ones_like(D_cells[0])
+    for k in range(A_cells.shape[0]):
+        A_k = A_cells[k]
+        B_k = B_cells[k]
+        C_k = C_cells[k]
+        D_k = D_cells[k]
+        A_new = A * A_k + B * C_k
+        B_new = A * B_k + B * D_k
+        C_new = C * A_k + D * C_k
+        D_new = C * B_k + D * D_k
+        A, B, C, D = A_new, B_new, C_new, D_new
+    return A, B, C, D
+
+
+def mixed_s21_db(
+    slot_raw: torch.Tensor,
+    g_soft: torch.Tensor,
+    macro_bank: Sequence[MacroBankEntry],
+    freq_hz: torch.Tensor,
+    *,
+    z0: float = 50.0,
+    q_L: float | torch.Tensor | None = 50.0,
+    q_C: float | torch.Tensor | None = 50.0,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
+    ref_freq_hz: float | torch.Tensor | None = None,
+    eps: float = 1e-30,
+    raw_min: float | None = None,
+    raw_max: float | None = None,
+) -> torch.Tensor:
+    if slot_raw.ndim != 2:
+        raise ValueError(f"slot_raw must have shape (K, S), got {tuple(slot_raw.shape)}")
+    if g_soft.ndim != 2:
+        raise ValueError(f"g_soft must have shape (K, M+1), got {tuple(g_soft.shape)}")
+    if freq_hz.ndim != 1:
+        raise ValueError(f"freq_hz must be 1D, got {tuple(freq_hz.shape)}")
+    macro_count = len(macro_bank)
+    if g_soft.shape[1] != macro_count + 1:
+        raise ValueError(f"g_soft last dim must be {macro_count + 1}, got {g_soft.shape[1]}")
+
+    raw = slot_raw
+    if raw_min is not None or raw_max is not None:
+        min_val = float(raw_min) if raw_min is not None else None
+        max_val = float(raw_max) if raw_max is not None else None
+        raw = raw.clamp(min=min_val, max=max_val)
+    values = torch.exp(raw) + float(eps)
+    device = values.device
+    dtype = values.dtype
+    complex_dtype = _complex_dtype_for(dtype)
+
+    K = values.shape[0]
+    F = freq_hz.shape[0]
+    A_mix = torch.zeros((K, F), device=device, dtype=complex_dtype)
+    B_mix = torch.zeros((K, F), device=device, dtype=complex_dtype)
+    C_mix = torch.zeros((K, F), device=device, dtype=complex_dtype)
+    D_mix = torch.zeros((K, F), device=device, dtype=complex_dtype)
+
+    for m, entry in enumerate(macro_bank):
+        idx = entry.slot_idx.to(device=device)
+        vals_m = values.index_select(dim=-1, index=idx)
+        A_m, B_m, C_m, D_m = DifferentiablePhysicsKernel.cascade_abcd(
+            entry.op_codes,
+            vals_m,
+            freq_hz,
+            op_param_counts=entry.op_param_counts,
+            q_L=q_L,
+            q_C=q_C,
+            q_model=q_model,
+            ref_freq_hz=ref_freq_hz,
+            eps=eps,
+        )
+        weight = g_soft[:, m].to(device=device, dtype=dtype).unsqueeze(-1).to(complex_dtype)
+        A_mix = A_mix + weight * A_m
+        B_mix = B_mix + weight * B_m
+        C_mix = C_mix + weight * C_m
+        D_mix = D_mix + weight * D_m
+
+    p_skip = g_soft[:, macro_count].to(device=device, dtype=dtype).unsqueeze(-1).to(complex_dtype)
+    A_mix = A_mix + p_skip
+    D_mix = D_mix + p_skip
+
+    A_tot, B_tot, C_tot, D_tot = _cascade_abcd_cells(A_mix, B_mix, C_mix, D_mix)
+    _, S21, _, _ = DifferentiablePhysicsKernel.abcd_to_sparams(A_tot, B_tot, C_tot, D_tot, z0=z0, eps=eps)
+    return DifferentiablePhysicsKernel.s21_db(S21)
+
+
 class InferenceTimeOptimizer:
     """
     Inference-time gradient-based refinement (topology frozen, values optimized).
@@ -1104,4 +1207,88 @@ def unroll_refine_slots(
         raise ValueError("unroll_refine_slots requires steps >= 1.")
     if return_raw:
         return loss, raw_flat.view_as(raw)
+    return loss
+
+
+def unroll_refine_slots_mixed(
+    slot_raw: torch.Tensor,
+    g_soft: torch.Tensor,
+    macro_bank: Sequence[MacroBankEntry],
+    freq_hz: torch.Tensor,
+    target_s21_db: torch.Tensor,
+    *,
+    steps: int = 5,
+    lr: float = 5e-2,
+    eps: float = 1e-30,
+    max_step: float | None = 0.5,
+    raw_min: float = -32.0,
+    raw_max: float = -12.0,
+    nan_backoff: float = 0.5,
+    max_backoff: int = 3,
+    create_graph: bool = True,
+    return_raw: bool = False,
+    z0: float = 50.0,
+    q_L: float | torch.Tensor | None = 50.0,
+    q_C: float | torch.Tensor | None = 50.0,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
+    ref_freq_hz: float | torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Unrolled refinement where the forward pass uses mixed macro ABCD matrices.
+    """
+    raw = slot_raw
+    loss = None
+    base_lr = float(lr)
+    backoff_tries = max(0, int(max_backoff))
+    max_step_val = float(max_step) if max_step is not None else None
+    for _ in range(int(steps)):
+        raw = raw.clamp(min=float(raw_min), max=float(raw_max))
+        step_lr = base_lr
+        updated = False
+        for _ in range(backoff_tries + 1):
+            pred = mixed_s21_db(
+                raw,
+                g_soft,
+                macro_bank,
+                freq_hz,
+                z0=z0,
+                q_L=q_L,
+                q_C=q_C,
+                q_model=q_model,
+                ref_freq_hz=ref_freq_hz,
+                eps=eps,
+                raw_min=None,
+                raw_max=None,
+            )
+            loss = F.mse_loss(pred, target_s21_db)
+            if not torch.isfinite(loss):
+                step_lr *= float(nan_backoff)
+                continue
+            grad = torch.autograd.grad(loss, raw, create_graph=bool(create_graph))[0]
+            if not torch.isfinite(grad).all():
+                step_lr *= float(nan_backoff)
+                continue
+            step_delta = step_lr * grad
+            if max_step_val is not None and max_step_val > 0.0:
+                step_delta = step_delta.clamp(-max_step_val, max_step_val)
+            raw_next = raw - step_delta
+            if not torch.isfinite(raw_next).all():
+                step_lr *= float(nan_backoff)
+                continue
+            raw = raw_next
+            updated = True
+            break
+        if not updated:
+            if loss is not None and torch.isfinite(loss):
+                if return_raw:
+                    return loss, raw
+                return loss
+            if return_raw:
+                return torch.zeros((), device=slot_raw.device, dtype=slot_raw.dtype), raw
+            return torch.zeros((), device=slot_raw.device, dtype=slot_raw.dtype)
+
+    if loss is None:
+        raise ValueError("unroll_refine_slots_mixed requires steps >= 1.")
+    if return_raw:
+        return loss, raw
     return loss

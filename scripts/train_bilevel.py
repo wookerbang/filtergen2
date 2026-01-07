@@ -19,9 +19,29 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.dsl import MACRO_IDS, MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
+from src.data.dsl import (
+    MACRO_IDS,
+    MACRO_LIBRARY,
+    MACRO_SER_C,
+    MACRO_SER_L,
+    MACRO_SER_RESO,
+    MACRO_SER_TANK,
+    MACRO_SHUNT_C,
+    MACRO_SHUNT_L,
+    MACRO_SHUNT_NOTCH,
+    MACRO_SHUNT_RESO,
+    SERIES_MACROS,
+    dsl_tokens_to_macro_sequence,
+)
 from src.models import Wave2StructureModel
-from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
+from src.physics.differentiable_rf import (
+    DynamicCircuitAssembler,
+    DifferentiablePhysicsKernel,
+    MacroBankEntry,
+    mixed_s21_db,
+    unroll_refine_slots,
+    unroll_refine_slots_mixed,
+)
 
 
 class BilevelDataset(Dataset):
@@ -293,6 +313,62 @@ def _build_circuit_and_indices(
     return circuit, torch.tensor(slot_idx_order, device=device, dtype=torch.long)
 
 
+def _build_macro_bank(
+    *,
+    id_to_macro: List[str],
+    slot_count: int,
+    assembler: DynamicCircuitAssembler,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> List[MacroBankEntry]:
+    entries: List[MacroBankEntry] = []
+    op_map = {
+        MACRO_SER_L: ([DifferentiablePhysicsKernel.OP_SERIES_L], [1]),
+        MACRO_SER_C: ([DifferentiablePhysicsKernel.OP_SERIES_C], [1]),
+        MACRO_SHUNT_L: ([DifferentiablePhysicsKernel.OP_SHUNT_L], [1]),
+        MACRO_SHUNT_C: ([DifferentiablePhysicsKernel.OP_SHUNT_C], [1]),
+        MACRO_SER_RESO: ([DifferentiablePhysicsKernel.OP_SERIES_L, DifferentiablePhysicsKernel.OP_SERIES_C], [1, 1]),
+        MACRO_SER_TANK: ([DifferentiablePhysicsKernel.OP_SERIES_PARALLEL_LC], [2]),
+        MACRO_SHUNT_RESO: ([DifferentiablePhysicsKernel.OP_SHUNT_L, DifferentiablePhysicsKernel.OP_SHUNT_C], [1, 1]),
+        MACRO_SHUNT_NOTCH: ([DifferentiablePhysicsKernel.OP_SHUNT_SERIES_LC], [2]),
+    }
+    base = 1_000_000.0
+    for macro in id_to_macro:
+        if macro not in MACRO_LIBRARY:
+            raise ValueError(f"Macro {macro} missing from MACRO_LIBRARY.")
+        macro_def = MACRO_LIBRARY[macro]
+        if macro in op_map:
+            op_codes, op_param_counts = op_map[macro]
+            slot_idx_order = list(range(len(macro_def.slot_types)))
+        else:
+            placeholder_vals = [base + j for j in range(len(macro_def.slot_types))]
+            if macro in SERIES_MACROS:
+                a, b = "in", "out"
+            else:
+                a, b = "in", "in"
+            comps = macro_def.expand_fn(a, b, "gnd", placeholder_vals, 0)
+            slot_indices: List[int] = []
+            for c in comps:
+                slot_idx = int(round(float(c.value_si) - base))
+                slot_indices.append(slot_idx)
+            circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype)
+            value_comp_indices = getattr(circuit, "value_comp_indices", None)
+            if value_comp_indices is None:
+                slot_idx_order = slot_indices
+            else:
+                slot_idx_order = [slot_indices[int(i)] for i in value_comp_indices]
+            op_codes = [int(x) for x in getattr(circuit, "op_codes").detach().cpu().tolist()]
+            op_param_counts = getattr(circuit, "_op_param_counts", None)
+        entries.append(
+            MacroBankEntry(
+                op_codes=op_codes,
+                op_param_counts=op_param_counts,
+                slot_idx=torch.tensor(slot_idx_order, device=device, dtype=torch.long),
+            )
+        )
+    return entries
+
+
 class CircuitCache:
     def __init__(
         self,
@@ -423,7 +499,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k-percentile", type=float, default=95.0)
     p.add_argument("--k-cap", type=int, default=12)
     p.add_argument("--k-min", type=int, default=12)
+    p.add_argument("--matrix-mix", action="store_true", help="Use mixed ABCD relaxation for structure gradients.")
     p.add_argument("--unroll-steps", type=int, default=5)
+    p.add_argument("--no-unroll", dest="use_unroll", action="store_false", help="Disable inner unroll refinement.")
+    p.set_defaults(use_unroll=True)
     p.add_argument("--inner-lr", type=float, default=1e-2)
     p.add_argument("--inner-max-step", type=float, default=0.5)
     p.add_argument("--inner-raw-min", type=float, default=-32.0)
@@ -515,6 +594,7 @@ def main() -> None:
         "k_cap": args.k_cap,
         "k_percentile": args.k_percentile,
         "k_min": args.k_min,
+        "matrix_mix": bool(args.matrix_mix),
         "macro_vocab": macro_vocab,
         "macro_vocab_size": len(macro_vocab),
         "slot_count": slot_count,
@@ -539,6 +619,7 @@ def main() -> None:
         "alpha_decay_frac": args.alpha_decay_frac,
         "len_weight": args.len_weight,
         "unroll_steps": args.unroll_steps,
+        "use_unroll": bool(args.use_unroll),
         "inner_lr": args.inner_lr,
         "inner_max_step": args.inner_max_step,
         "inner_raw_min": args.inner_raw_min,
@@ -603,6 +684,15 @@ def main() -> None:
         device=device,
         dtype=dtype,
     )
+    macro_bank = None
+    if args.matrix_mix:
+        macro_bank = _build_macro_bank(
+            id_to_macro=id_to_macro,
+            slot_count=slot_count,
+            assembler=assembler,
+            device=device,
+            dtype=dtype,
+        )
 
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
     step = 0
@@ -637,7 +727,7 @@ def main() -> None:
                 continue
 
             g_soft = F.gumbel_softmax(g_logits, tau=float(args.gumbel_tau), hard=False, dim=-1)
-            g_hard = F.gumbel_softmax(g_logits, tau=float(args.gumbel_tau), hard=True, dim=-1)
+            g_soft = g_soft.to(dtype)
 
             macro_ce = F.cross_entropy(g_logits.view(-1, skip_id + 1), macro_targets.view(-1))
             p_skip = g_soft[..., skip_id]
@@ -645,30 +735,67 @@ def main() -> None:
 
             physics_losses = []
             for b in range(wave.shape[0]):
-                macro_ids_raw = torch.argmax(g_hard[b], dim=-1)
-                was_empty = not bool((macro_ids_raw != skip_id).any())
-                macro_ids_hard = _enforce_non_empty(macro_ids_raw, g_logits[b], skip_id)
-                hard_mask = torch.matmul(g_hard[b], macro_slot_mask)
-                if was_empty:
-                    hard_mask = macro_slot_mask[macro_ids_hard]
-                soft_mask = torch.matmul(g_soft[b], macro_slot_mask)
-                slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
-                circuit, slot_idx = circuit_cache.get(macro_ids_hard)
-                loss_b = unroll_refine_slots(
-                    slot_raw[b],
-                    slot_mask,
-                    slot_idx,
-                    circuit,
-                    freq[b],
-                    target[b],
-                    steps=args.unroll_steps,
-                    lr=args.inner_lr,
-                    max_step=args.inner_max_step,
-                    raw_min=args.inner_raw_min,
-                    raw_max=args.inner_raw_max,
-                    nan_backoff=args.inner_nan_backoff,
-                    max_backoff=args.inner_nan_tries,
-                )
+                if args.matrix_mix:
+                    if macro_bank is None:
+                        raise ValueError("matrix_mix enabled but macro_bank not initialized.")
+                    if args.use_unroll:
+                        loss_b = unroll_refine_slots_mixed(
+                            slot_raw[b],
+                            g_soft[b],
+                            macro_bank,
+                            freq[b],
+                            target[b],
+                            steps=args.unroll_steps,
+                            lr=args.inner_lr,
+                            max_step=args.inner_max_step,
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                            nan_backoff=args.inner_nan_backoff,
+                            max_backoff=args.inner_nan_tries,
+                        )
+                    else:
+                        pred = mixed_s21_db(
+                            slot_raw[b],
+                            g_soft[b],
+                            macro_bank,
+                            freq[b],
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                        )
+                        loss_b = F.mse_loss(pred, target[b])
+                else:
+                    g_hard = F.gumbel_softmax(g_logits[b], tau=float(args.gumbel_tau), hard=True, dim=-1)
+                    macro_ids_raw = torch.argmax(g_hard, dim=-1)
+                    was_empty = not bool((macro_ids_raw != skip_id).any())
+                    macro_ids_hard = _enforce_non_empty(macro_ids_raw, g_logits[b], skip_id)
+                    hard_mask = torch.matmul(g_hard, macro_slot_mask)
+                    if was_empty:
+                        hard_mask = macro_slot_mask[macro_ids_hard]
+                    soft_mask = torch.matmul(g_soft[b], macro_slot_mask)
+                    slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
+                    circuit, slot_idx = circuit_cache.get(macro_ids_hard)
+                    if args.use_unroll:
+                        loss_b = unroll_refine_slots(
+                            slot_raw[b],
+                            slot_mask,
+                            slot_idx,
+                            circuit,
+                            freq[b],
+                            target[b],
+                            steps=args.unroll_steps,
+                            lr=args.inner_lr,
+                            max_step=args.inner_max_step,
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                            nan_backoff=args.inner_nan_backoff,
+                            max_backoff=args.inner_nan_tries,
+                        )
+                    else:
+                        raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
+                        values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                        values_vec = values_flat.index_select(0, slot_idx)
+                        pred = circuit(freq[b], values=values_vec, output="s21_db")
+                        loss_b = F.mse_loss(pred, target[b])
                 physics_losses.append(loss_b)
             physics_loss = torch.stack(physics_losses).mean()
 

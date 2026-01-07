@@ -4,7 +4,7 @@ DSL: ML-friendly IR with Macro / Repeat / Typed numeric slots.
 Key ideas:
 - Canonical main program: <MAIN> Ports Body </MAIN>
 - Body supports structured cascade repeat blocks with frozen macro library.
-- Numeric slots are typed (<VAL_L>/<VAL_C>/<VAL_R>/...), paired with continuous heads.
+- Numeric slots are typed (<VAL_L>/<VAL_C>/...), paired with continuous heads.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ PORT_GND = "<P_GND>"
 
 VAL_L = "<VAL_L>"
 VAL_C = "<VAL_C>"
-VAL_R = "<VAL_R>"
 VAL_TL_Z0 = "<VAL_TL_Z0>"
 VAL_TL_LEN = "<VAL_TL_LEN>"
 VAL_L_PAR = "<VAL_L_PAR>"
@@ -54,7 +53,6 @@ VAL_NONE = "<VAL_NONE>"
 VALUE_SLOTS = [
     VAL_L,
     VAL_C,
-    VAL_R,
     VAL_TL_Z0,
     VAL_TL_LEN,
     VAL_L_PAR,
@@ -106,8 +104,6 @@ MACRO_SER_RESO = "<MAC_SER_RESO>"
 MACRO_SER_TANK = "<MAC_SER_TANK>"
 MACRO_SHUNT_RESO = "<MAC_SHUNT_RESO>"
 MACRO_SHUNT_NOTCH = "<MAC_SHUNT_NOTCH>"
-MACRO_SER_R = "<MAC_SER_R>"
-MACRO_SHUNT_R = "<MAC_SHUNT_R>"
 
 MACRO_IDS = [
     MACRO_SER_L,
@@ -118,8 +114,6 @@ MACRO_IDS = [
     MACRO_SER_TANK,
     MACRO_SHUNT_RESO,
     MACRO_SHUNT_NOTCH,
-    MACRO_SER_R,
-    MACRO_SHUNT_R,
 ]
 
 SERIES_MACROS = {
@@ -127,14 +121,12 @@ SERIES_MACROS = {
     MACRO_SER_C,
     MACRO_SER_RESO,
     MACRO_SER_TANK,
-    MACRO_SER_R,
 }
 SHUNT_MACROS = {
     MACRO_SHUNT_L,
     MACRO_SHUNT_C,
     MACRO_SHUNT_RESO,
     MACRO_SHUNT_NOTCH,
-    MACRO_SHUNT_R,
 }
 
 
@@ -240,20 +232,6 @@ def _expand_shunt_notch(a: str, b: str, gnd: str, vals: List[float], inst_idx: i
     comps: List[ComponentSpec] = []
     _maybe_add_component(comps, "L", "series", L_val, a, x)
     _maybe_add_component(comps, "C", "series", C_val, x, gnd)
-    return comps
-
-
-def _expand_ser_r(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
-    R_val = (vals + [0.0])[0]
-    comps: List[ComponentSpec] = []
-    _maybe_add_component(comps, "R", "series", R_val, a, b)
-    return comps
-
-
-def _expand_shunt_r(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
-    R_val = (vals + [0.0])[0]
-    comps: List[ComponentSpec] = []
-    _maybe_add_component(comps, "R", "shunt", R_val, a, gnd)
     return comps
 
 
@@ -495,15 +473,12 @@ MACRO_LIBRARY: Dict[str, MacroDef] = {
     MACRO_SER_TANK: MacroDef(MACRO_SER_TANK, ("L", "C"), _expand_ser_tank),
     MACRO_SHUNT_RESO: MacroDef(MACRO_SHUNT_RESO, ("L", "C"), _expand_shunt_reso),
     MACRO_SHUNT_NOTCH: MacroDef(MACRO_SHUNT_NOTCH, ("L", "C"), _expand_shunt_notch),
-    MACRO_SER_R: MacroDef(MACRO_SER_R, ("R",), _expand_ser_r),
-    MACRO_SHUNT_R: MacroDef(MACRO_SHUNT_R, ("R",), _expand_shunt_r),
 }
 
 # Slot type -> token mapping (kept centralized to avoid drift across encoder/decoder/mask).
 SLOT_TYPE_TO_TOKEN = {
     "L": VAL_L,
     "C": VAL_C,
-    "R": VAL_R,
     "TL_Z0": VAL_TL_Z0,
     "TL_LEN": VAL_TL_LEN,
     "L_PAR": VAL_L_PAR,
