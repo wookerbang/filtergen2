@@ -27,16 +27,17 @@ LR=1e-4
 ALPHA_START_BASE=0.5
 ALPHA_MIN_BASE=0.1
 ALPHA_DECAY=0.5
-PHYS_WEIGHT_BASE=1e-4
-LEN_WEIGHT_BASE=1e-3
+PHYS_WEIGHT_BASE=5e-5
+LEN_WEIGHT_BASE=1e-2
 UNROLL_BASE=5
+K_MIN_BASE=9
+K_CAP_BASE=9
 
 COMMON_ARGS=(
   --data "${DATA_DEBUG}"
   --epochs "${EPOCHS}"
   --batch-size "${BATCH}"
   --lr "${LR}"
-  --k-min 12 --k-cap 12
   --freq-mode log_f_centered
   --spec-mode type_fc
   --no-s11
@@ -57,8 +58,11 @@ append_summary() {
   local phys_weight="$5"
   local len_weight="$6"
   local unroll_steps="$7"
+  local k_min="$8"
+  local k_cap="$9"
   RUN_NAME="${run_name}" ALPHA_START="${alpha_start}" ALPHA_MIN="${alpha_min}" \
     PHYS_WEIGHT="${phys_weight}" LEN_WEIGHT="${len_weight}" UNROLL_STEPS="${unroll_steps}" \
+    K_MIN="${k_min}" K_CAP="${k_cap}" \
     EVAL_JSON="${eval_json}" SUMMARY_CSV="${SUMMARY_CSV}" python - <<'PY'
 import csv
 import json
@@ -76,6 +80,8 @@ row = {
     "phys_weight": os.environ["PHYS_WEIGHT"],
     "len_weight": os.environ["LEN_WEIGHT"],
     "unroll_steps": os.environ["UNROLL_STEPS"],
+    "k_min": os.environ["K_MIN"],
+    "k_cap": os.environ["K_CAP"],
     "macro_acc": data.get("macro_acc"),
     "macro_non_skip_acc": data.get("macro_non_skip_acc"),
     "len_exact": data.get("len_exact"),
@@ -100,6 +106,8 @@ run_one() {
   local phys_weight="$4"
   local len_weight="$5"
   local unroll_steps="$6"
+  local k_min="$7"
+  local k_cap="$8"
 
   local run_dir="${OUT_ROOT}/${run_name}"
   local eval_json="${EVAL_DIR}/${run_name}.json"
@@ -112,6 +120,8 @@ run_one() {
     --phys-weight "${phys_weight}" \
     --len-weight "${len_weight}" \
     --unroll-steps "${unroll_steps}" \
+    --k-min "${k_min}" \
+    --k-cap "${k_cap}" \
     "${COMMON_ARGS[@]}"
 
   python scripts/eval_bilevel.py \
@@ -122,29 +132,24 @@ run_one() {
     --unroll-steps 10 \
     --output "${eval_json}"
 
-  append_summary "${eval_json}" "${run_name}" "${alpha_start}" "${alpha_min}" "${phys_weight}" "${len_weight}" "${unroll_steps}"
+  append_summary "${eval_json}" "${run_name}" "${alpha_start}" "${alpha_min}" "${phys_weight}" "${len_weight}" "${unroll_steps}" "${k_min}" "${k_cap}"
 }
 
-run_one "baseline" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
+run_one "baseline" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
 
-# alpha_start sweep (alpha_min fixed)
-run_one "alpha_start_0.3" "0.3" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
-run_one "alpha_start_0.8" "0.8" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
+# phys_weight sweep (below 1e-4)
+run_one "phys_1e-5" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "1e-5" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
+run_one "phys_3e-5" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "3e-5" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
+run_one "phys_8e-5" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "8e-5" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
+run_one "phys_1e-4" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "1e-4" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
 
-# alpha_min sweep (alpha_start fixed)
-run_one "alpha_min_0.05" "${ALPHA_START_BASE}" "0.05" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
-run_one "alpha_min_0.2" "${ALPHA_START_BASE}" "0.2" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
+# len_weight sweep (larger than 1e-2)
+run_one "len_2e-2" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "2e-2" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
+run_one "len_5e-2" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "5e-2" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
+run_one "len_1e-1" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "1e-1" "${UNROLL_BASE}" "${K_MIN_BASE}" "${K_CAP_BASE}"
 
-# phys_weight sweep
-run_one "phys_5e-4" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "5e-4" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
-run_one "phys_1e-3" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "1e-3" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}"
-
-# len_weight sweep
-run_one "len_0" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "0" "${UNROLL_BASE}"
-run_one "len_1e-2" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "1e-2" "${UNROLL_BASE}"
-
-# unroll_steps sweep
-run_one "unroll_3" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "3"
-run_one "unroll_8" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "8"
+# k_cap sweep (fixed k_min=k_cap)
+run_one "kcap_10" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "10" "10"
+run_one "kcap_11" "${ALPHA_START_BASE}" "${ALPHA_MIN_BASE}" "${PHYS_WEIGHT_BASE}" "${LEN_WEIGHT_BASE}" "${UNROLL_BASE}" "11" "11"
 
 echo "[done] summary -> ${SUMMARY_CSV}"
