@@ -468,6 +468,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--log-steps", type=int, default=50)
+    p.add_argument("--log-train-metrics", action="store_true", help="Log macro/length metrics on training batches.")
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--save-total-limit", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
@@ -512,6 +513,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phys-weight", type=float, default=1e-4)
     p.add_argument("--len-weight", type=float, default=1e-3)
     p.add_argument("--gumbel-tau", type=float, default=1.0)
+    p.add_argument("--gumbel-tau-min", type=float, default=None)
+    p.add_argument("--gumbel-tau-decay-frac", type=float, default=0.5)
     p.add_argument("--alpha-start", type=float, default=1.0)
     p.add_argument("--alpha-min", type=float, default=0.1)
     p.add_argument("--alpha-decay-frac", type=float, default=0.3)
@@ -530,6 +533,16 @@ def _alpha_schedule(step: int, total_steps: int, *, alpha_start: float, alpha_mi
         return float(alpha_min)
     t = 1.0 - float(step) / float(decay_steps)
     return float(alpha_min) + (float(alpha_start) - float(alpha_min)) * t
+
+
+def _gumbel_tau_schedule(step: int, total_steps: int, *, tau_start: float, tau_min: float, decay_frac: float) -> float:
+    if total_steps <= 0:
+        return float(tau_min)
+    decay_steps = max(1, int(total_steps * float(decay_frac)))
+    if step >= decay_steps:
+        return float(tau_min)
+    t = 1.0 - float(step) / float(decay_steps)
+    return float(tau_min) + (float(tau_start) - float(tau_min)) * t
 
 
 def _resolve_ckpt(path: Path) -> Path:
@@ -559,6 +572,10 @@ def _resolve_ckpt(path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.gumbel_tau_min is None:
+        args.gumbel_tau_min = float(args.gumbel_tau)
+    if float(args.gumbel_tau_min) <= 0.0:
+        raise ValueError("gumbel_tau_min must be > 0.")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -611,6 +628,7 @@ def main() -> None:
         "prefetch_factor": int(args.prefetch_factor),
         "pin_memory": bool(args.pin_memory),
         "persistent_workers": bool(args.persistent_workers),
+        "log_train_metrics": bool(args.log_train_metrics),
         "circuit_cache_size": int(args.circuit_cache_size),
         "clip_grad": args.clip_grad,
         "skip_nonfinite": bool(args.skip_nonfinite),
@@ -628,6 +646,8 @@ def main() -> None:
         "inner_nan_tries": args.inner_nan_tries,
         "phys_weight": args.phys_weight,
         "gumbel_tau": args.gumbel_tau,
+        "gumbel_tau_min": args.gumbel_tau_min,
+        "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
         "init_from": str(args.init_from) if args.init_from else None,
     }
     with (args.output / "input_config.json").open("w") as f:
@@ -726,7 +746,14 @@ def main() -> None:
                 opt.zero_grad(set_to_none=True)
                 continue
 
-            g_soft = F.gumbel_softmax(g_logits, tau=float(args.gumbel_tau), hard=False, dim=-1)
+            tau = _gumbel_tau_schedule(
+                step,
+                total_steps,
+                tau_start=float(args.gumbel_tau),
+                tau_min=float(args.gumbel_tau_min),
+                decay_frac=float(args.gumbel_tau_decay_frac),
+            )
+            g_soft = F.gumbel_softmax(g_logits, tau=float(tau), hard=False, dim=-1)
             g_soft = g_soft.to(dtype)
 
             macro_ce = F.cross_entropy(g_logits.view(-1, skip_id + 1), macro_targets.view(-1))
@@ -764,7 +791,7 @@ def main() -> None:
                         )
                         loss_b = F.mse_loss(pred, target[b])
                 else:
-                    g_hard = F.gumbel_softmax(g_logits[b], tau=float(args.gumbel_tau), hard=True, dim=-1)
+                    g_hard = F.gumbel_softmax(g_logits[b], tau=float(tau), hard=True, dim=-1)
                     macro_ids_raw = torch.argmax(g_hard, dim=-1)
                     was_empty = not bool((macro_ids_raw != skip_id).any())
                     macro_ids_hard = _enforce_non_empty(macro_ids_raw, g_logits[b], skip_id)
@@ -815,6 +842,27 @@ def main() -> None:
                 opt.zero_grad(set_to_none=True)
 
             if step % int(args.log_steps) == 0:
+                metric_note = ""
+                if args.log_train_metrics:
+                    with torch.no_grad():
+                        pred_ids = torch.argmax(g_logits, dim=-1)
+                        correct = pred_ids.eq(macro_targets)
+                        macro_acc = correct.float().mean()
+                        non_skip = macro_targets.ne(skip_id)
+                        if bool(non_skip.any()):
+                            macro_non_skip_acc = (correct & non_skip).float().sum() / non_skip.float().sum()
+                        else:
+                            macro_non_skip_acc = torch.tensor(0.0, device=macro_acc.device)
+                        len_pred = pred_ids.ne(skip_id).sum(dim=1)
+                        len_tgt = macro_targets.ne(skip_id).sum(dim=1)
+                        len_mae = (len_pred.float() - len_tgt.float()).abs().mean()
+                        len_exact = len_pred.eq(len_tgt).float().mean()
+                    metric_note = (
+                        f" mac_acc={macro_acc.item():.3f}"
+                        f" mac_ns={macro_non_skip_acc.item():.3f}"
+                        f" len_mae={len_mae.item():.3f}"
+                        f" len_exact={len_exact.item():.3f}"
+                    )
                 cache_note = ""
                 if circuit_cache.max_size > 0:
                     total_cache = circuit_cache.hits + circuit_cache.misses
@@ -824,8 +872,9 @@ def main() -> None:
                 print(
                     f"[epoch {epoch+1}] step={step} loss={loss.item():.4f} "
                     f"phys={physics_loss.item():.4f} phys_w={phys_weight:.1e} "
-                    f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f}"
+                    f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f} tau={tau:.3f}"
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
+                    + metric_note
                     + cache_note
                 )
 
