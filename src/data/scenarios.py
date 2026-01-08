@@ -5,7 +5,7 @@ Scenario templates + shared frequency grid / mask builders.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
 
@@ -19,6 +19,10 @@ SCENARIO_NAMES: Sequence[ScenarioName] = (
     "coexistence",
     "wideband_rejection",
     "random_basic",
+    "lowpass",
+    "highpass",
+    "bandpass",
+    "bandstop",
 )
 
 SCENARIO_ID: Dict[ScenarioName, int] = {name: i for i, name in enumerate(SCENARIO_NAMES)}
@@ -45,12 +49,45 @@ def _normalize_weights(weights: Mapping[ScenarioName, float]) -> Dict[ScenarioNa
     return {k: float(v) / total for k, v in weights.items()}
 
 
-def sample_general_spec(rng: np.random.Generator) -> Dict[str, object]:
+def _resolve_filter_type_override(
+    *,
+    override: Optional[str],
+    allowed: Sequence[str] | str,
+    scenario: str,
+) -> Sequence[str] | str:
+    if override is None:
+        return allowed
+    if isinstance(allowed, str):
+        allowed_set = {allowed}
+    else:
+        allowed_set = set(allowed)
+    if override not in allowed_set:
+        raise ValueError(f"filter_type={override} is incompatible with scenario={scenario}.")
+    return override
+
+
+def _resolve_prototype_types_override(override: Optional[Sequence[str]]) -> Sequence[str] | None:
+    if override is None:
+        return None
+    return list(override)
+
+
+def sample_general_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
-        filter_type=["lowpass", "highpass", "bandpass"],
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed=["lowpass", "highpass", "bandpass"],
+            scenario="general",
+        ),
         order_range=(3, 7),
         ripple_db_range=(0.05, 0.5),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
     )
     spec.update(
         {
@@ -62,12 +99,22 @@ def sample_general_spec(rng: np.random.Generator) -> Dict[str, object]:
     return spec
 
 
-def sample_anti_jamming_spec(rng: np.random.Generator) -> Dict[str, object]:
+def sample_anti_jamming_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
-        filter_type="bandpass",
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="bandpass",
+            scenario="anti_jamming",
+        ),
         order_range=(3, 7),
         bw_frac_range=(0.05, 0.2),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
     )
     fc = float(spec["fc_hz"])
     bw = float(spec.get("bw_frac") or 0.2)
@@ -86,12 +133,22 @@ def sample_anti_jamming_spec(rng: np.random.Generator) -> Dict[str, object]:
     return spec
 
 
-def sample_coexistence_spec(rng: np.random.Generator) -> Dict[str, object]:
+def sample_coexistence_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
-        filter_type="bandpass",
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="bandpass",
+            scenario="coexistence",
+        ),
         order_range=(6, 9),
         bw_frac_range=(0.05, 0.2),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
     )
     spec.update(
         {
@@ -103,12 +160,22 @@ def sample_coexistence_spec(rng: np.random.Generator) -> Dict[str, object]:
     return spec
 
 
-def sample_wideband_rejection_spec(rng: np.random.Generator) -> Dict[str, object]:
+def sample_wideband_rejection_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
-        filter_type="bandstop",
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="bandstop",
+            scenario="wideband_rejection",
+        ),
         order_range=(3, 7),
         bw_frac_range=(0.1, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
     )
     spec.update(
         {
@@ -119,17 +186,131 @@ def sample_wideband_rejection_spec(rng: np.random.Generator) -> Dict[str, object
     return spec
 
 
-def sample_random_basic_spec(rng: np.random.Generator) -> Dict[str, object]:
+def sample_random_basic_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
-        filter_type=["lowpass", "highpass", "bandpass", "bandstop"],
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed=["lowpass", "highpass", "bandpass", "bandstop"],
+            scenario="random_basic",
+        ),
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
     )
     spec.update(
         {
             "scenario": "random_basic",
             "scenario_id": SCENARIO_ID["random_basic"],
+        }
+    )
+    return spec
+
+
+def sample_lowpass_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    spec = sample_base_spec(
+        rng=rng,
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="lowpass",
+            scenario="lowpass",
+        ),
+        order_range=(2, 8),
+        bw_frac_range=(0.05, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+    )
+    spec.update(
+        {
+            "scenario": "lowpass",
+            "scenario_id": SCENARIO_ID["lowpass"],
+        }
+    )
+    return spec
+
+
+def sample_highpass_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    spec = sample_base_spec(
+        rng=rng,
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="highpass",
+            scenario="highpass",
+        ),
+        order_range=(2, 8),
+        bw_frac_range=(0.05, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+    )
+    spec.update(
+        {
+            "scenario": "highpass",
+            "scenario_id": SCENARIO_ID["highpass"],
+        }
+    )
+    return spec
+
+
+def sample_bandpass_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    spec = sample_base_spec(
+        rng=rng,
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="bandpass",
+            scenario="bandpass",
+        ),
+        order_range=(2, 8),
+        bw_frac_range=(0.05, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+    )
+    spec.update(
+        {
+            "scenario": "bandpass",
+            "scenario_id": SCENARIO_ID["bandpass"],
+        }
+    )
+    return spec
+
+
+def sample_bandstop_spec(
+    rng: np.random.Generator,
+    *,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    spec = sample_base_spec(
+        rng=rng,
+        filter_type=_resolve_filter_type_override(
+            override=filter_type_override,
+            allowed="bandstop",
+            scenario="bandstop",
+        ),
+        order_range=(2, 8),
+        bw_frac_range=(0.05, 0.4),
+        prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+    )
+    spec.update(
+        {
+            "scenario": "bandstop",
+            "scenario_id": SCENARIO_ID["bandstop"],
         }
     )
     return spec
@@ -141,6 +322,10 @@ SCENARIO_SAMPLERS = {
     "coexistence": sample_coexistence_spec,
     "wideband_rejection": sample_wideband_rejection_spec,
     "random_basic": sample_random_basic_spec,
+    "lowpass": sample_lowpass_spec,
+    "highpass": sample_highpass_spec,
+    "bandpass": sample_bandpass_spec,
+    "bandstop": sample_bandstop_spec,
 }
 
 
@@ -149,6 +334,8 @@ def sample_scenario_spec(
     rng: np.random.Generator | None = None,
     scenario: ScenarioName | None = None,
     scenario_weights: Mapping[ScenarioName, float] | None = None,
+    filter_type_override: Optional[str] = None,
+    prototype_types_override: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
     rng = rng or np.random.default_rng()
     if scenario is None or str(scenario).lower() == "random":
@@ -159,7 +346,11 @@ def sample_scenario_spec(
     scenario = str(scenario)
     if scenario not in SCENARIO_SAMPLERS:
         raise ValueError(f"Unknown scenario: {scenario}")
-    return SCENARIO_SAMPLERS[scenario](rng)
+    return SCENARIO_SAMPLERS[scenario](
+        rng,
+        filter_type_override=filter_type_override,
+        prototype_types_override=prototype_types_override,
+    )
 
 
 def build_freq_grid(spec: Mapping[str, object], *, num_freqs: int = 256) -> np.ndarray:

@@ -469,6 +469,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--log-steps", type=int, default=50)
     p.add_argument("--log-train-metrics", action="store_true", help="Log macro/length metrics on training batches.")
+    p.add_argument("--log-epoch-metrics", action="store_true", help="Log averaged training metrics at epoch end.")
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--save-total-limit", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
@@ -495,15 +496,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--hidden-mult", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--gate-skip-bias", type=float, default=1.0, help="Initial bias for SKIP gate logit.")
 
     # bilevel config
     p.add_argument("--k-percentile", type=float, default=95.0)
     p.add_argument("--k-cap", type=int, default=12)
     p.add_argument("--k-min", type=int, default=12)
     p.add_argument("--matrix-mix", action="store_true", help="Use mixed ABCD relaxation for structure gradients.")
+    p.add_argument("--mix-topk", type=int, default=0, help="Use top-k sparse mixing for matrix mix (0 disables).")
     p.add_argument("--unroll-steps", type=int, default=5)
     p.add_argument("--no-unroll", dest="use_unroll", action="store_false", help="Disable inner unroll refinement.")
     p.set_defaults(use_unroll=True)
+    p.add_argument(
+        "--unroll-create-graph",
+        dest="unroll_create_graph",
+        action="store_true",
+        help="Retain graph for unroll hypergradient (default: on).",
+    )
+    p.add_argument(
+        "--no-unroll-create-graph",
+        dest="unroll_create_graph",
+        action="store_false",
+        help="Disable second-order unroll gradients for stability.",
+    )
+    p.set_defaults(unroll_create_graph=True)
     p.add_argument("--inner-lr", type=float, default=1e-2)
     p.add_argument("--inner-max-step", type=float, default=0.5)
     p.add_argument("--inner-raw-min", type=float, default=-32.0)
@@ -543,6 +559,17 @@ def _gumbel_tau_schedule(step: int, total_steps: int, *, tau_start: float, tau_m
         return float(tau_min)
     t = 1.0 - float(step) / float(decay_steps)
     return float(tau_min) + (float(tau_start) - float(tau_min)) * t
+
+
+def _sparse_topk_probs(probs: torch.Tensor, k: int) -> torch.Tensor:
+    if k <= 0 or k >= probs.shape[-1]:
+        return probs
+    vals, idx = torch.topk(probs, k=k, dim=-1)
+    mask = torch.zeros_like(probs)
+    mask.scatter_(-1, idx, 1.0)
+    pruned = probs * mask
+    denom = pruned.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return pruned / denom
 
 
 def _resolve_ckpt(path: Path) -> Path:
@@ -623,12 +650,14 @@ def main() -> None:
         "d_model": args.d_model,
         "hidden_mult": args.hidden_mult,
         "dropout": args.dropout,
+        "gate_skip_bias": args.gate_skip_bias,
         "amp_bf16": bool(args.amp_bf16),
         "num_workers": int(args.num_workers),
         "prefetch_factor": int(args.prefetch_factor),
         "pin_memory": bool(args.pin_memory),
         "persistent_workers": bool(args.persistent_workers),
         "log_train_metrics": bool(args.log_train_metrics),
+        "log_epoch_metrics": bool(args.log_epoch_metrics),
         "circuit_cache_size": int(args.circuit_cache_size),
         "clip_grad": args.clip_grad,
         "skip_nonfinite": bool(args.skip_nonfinite),
@@ -638,6 +667,7 @@ def main() -> None:
         "len_weight": args.len_weight,
         "unroll_steps": args.unroll_steps,
         "use_unroll": bool(args.use_unroll),
+        "unroll_create_graph": bool(args.unroll_create_graph),
         "inner_lr": args.inner_lr,
         "inner_max_step": args.inner_max_step,
         "inner_raw_min": args.inner_raw_min,
@@ -648,6 +678,7 @@ def main() -> None:
         "gumbel_tau": args.gumbel_tau,
         "gumbel_tau_min": args.gumbel_tau_min,
         "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
+        "mix_topk": args.mix_topk,
         "init_from": str(args.init_from) if args.init_from else None,
     }
     with (args.output / "input_config.json").open("w") as f:
@@ -680,6 +711,7 @@ def main() -> None:
         hidden_mult=args.hidden_mult,
         dropout=args.dropout,
         spec_mode=args.spec_mode,
+        gate_skip_bias=args.gate_skip_bias,
     ).to(device=device)
     if args.init_from:
         ckpt_path = _resolve_ckpt(args.init_from)
@@ -721,6 +753,19 @@ def main() -> None:
     model.train()
     skipped_nonfinite = 0
     for epoch in range(int(args.epochs)):
+        epoch_samples = 0
+        epoch_tokens = 0
+        epoch_correct = 0
+        epoch_non_skip = 0
+        epoch_non_skip_correct = 0
+        epoch_len_abs = 0.0
+        epoch_len_exact = 0.0
+        epoch_loss = 0.0
+        epoch_phys = 0.0
+        epoch_macro_ce = 0.0
+        epoch_len = 0.0
+        epoch_alpha = 0.0
+        epoch_tau = 0.0
         for batch in loader:
             step += 1
             wave = batch["wave"].to(device, dtype=dtype, non_blocking=non_blocking)
@@ -755,10 +800,39 @@ def main() -> None:
             )
             g_soft = F.gumbel_softmax(g_logits, tau=float(tau), hard=False, dim=-1)
             g_soft = g_soft.to(dtype)
+            g_phys = g_soft
+            if args.matrix_mix and int(args.mix_topk) > 0:
+                g_phys = _sparse_topk_probs(g_soft, int(args.mix_topk))
 
             macro_ce = F.cross_entropy(g_logits.view(-1, skip_id + 1), macro_targets.view(-1))
             p_skip = g_soft[..., skip_id]
             len_loss = (1.0 - p_skip).mean()
+
+            metric_note = ""
+            if args.log_train_metrics or args.log_epoch_metrics:
+                with torch.no_grad():
+                    pred_ids = torch.argmax(g_logits, dim=-1)
+                    correct = pred_ids.eq(macro_targets)
+                    tokens = int(correct.numel())
+                    correct_count = int(correct.sum().item())
+                    non_skip = macro_targets.ne(skip_id)
+                    non_skip_count = int(non_skip.sum().item())
+                    non_skip_correct = int((correct & non_skip).sum().item())
+                    len_pred = pred_ids.ne(skip_id).sum(dim=1)
+                    len_tgt = macro_targets.ne(skip_id).sum(dim=1)
+                    len_abs = float((len_pred.float() - len_tgt.float()).abs().sum().item())
+                    len_exact = float(len_pred.eq(len_tgt).float().sum().item())
+                    if args.log_train_metrics:
+                        macro_acc = correct_count / tokens if tokens else 0.0
+                        macro_non_skip_acc = non_skip_correct / non_skip_count if non_skip_count else 0.0
+                        len_mae = len_abs / float(len_pred.numel())
+                        len_exact_rate = len_exact / float(len_pred.numel())
+                        metric_note = (
+                            f" mac_acc={macro_acc:.3f}"
+                            f" mac_ns={macro_non_skip_acc:.3f}"
+                            f" len_mae={len_mae:.3f}"
+                            f" len_exact={len_exact_rate:.3f}"
+                        )
 
             physics_losses = []
             for b in range(wave.shape[0]):
@@ -768,7 +842,7 @@ def main() -> None:
                     if args.use_unroll:
                         loss_b = unroll_refine_slots_mixed(
                             slot_raw[b],
-                            g_soft[b],
+                            g_phys[b],
                             macro_bank,
                             freq[b],
                             target[b],
@@ -779,11 +853,12 @@ def main() -> None:
                             raw_max=args.inner_raw_max,
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
+                            create_graph=args.unroll_create_graph,
                         )
                     else:
                         pred = mixed_s21_db(
                             slot_raw[b],
-                            g_soft[b],
+                            g_phys[b],
                             macro_bank,
                             freq[b],
                             raw_min=args.inner_raw_min,
@@ -816,6 +891,7 @@ def main() -> None:
                             raw_max=args.inner_raw_max,
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
+                            create_graph=args.unroll_create_graph,
                         )
                     else:
                         raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
@@ -833,6 +909,22 @@ def main() -> None:
                 skipped_nonfinite += 1
                 opt.zero_grad(set_to_none=True)
                 continue
+
+            if args.log_epoch_metrics:
+                batch_size = int(macro_targets.shape[0])
+                epoch_samples += batch_size
+                epoch_tokens += tokens
+                epoch_correct += correct_count
+                epoch_non_skip += non_skip_count
+                epoch_non_skip_correct += non_skip_correct
+                epoch_len_abs += len_abs
+                epoch_len_exact += len_exact
+                epoch_loss += float(loss.item()) * batch_size
+                epoch_phys += float(physics_loss.item()) * batch_size
+                epoch_macro_ce += float(macro_ce.item()) * batch_size
+                epoch_len += float(len_loss.item()) * batch_size
+                epoch_alpha += float(alpha) * batch_size
+                epoch_tau += float(tau) * batch_size
             loss.backward()
 
             if step % int(args.grad_accum) == 0:
@@ -842,27 +934,6 @@ def main() -> None:
                 opt.zero_grad(set_to_none=True)
 
             if step % int(args.log_steps) == 0:
-                metric_note = ""
-                if args.log_train_metrics:
-                    with torch.no_grad():
-                        pred_ids = torch.argmax(g_logits, dim=-1)
-                        correct = pred_ids.eq(macro_targets)
-                        macro_acc = correct.float().mean()
-                        non_skip = macro_targets.ne(skip_id)
-                        if bool(non_skip.any()):
-                            macro_non_skip_acc = (correct & non_skip).float().sum() / non_skip.float().sum()
-                        else:
-                            macro_non_skip_acc = torch.tensor(0.0, device=macro_acc.device)
-                        len_pred = pred_ids.ne(skip_id).sum(dim=1)
-                        len_tgt = macro_targets.ne(skip_id).sum(dim=1)
-                        len_mae = (len_pred.float() - len_tgt.float()).abs().mean()
-                        len_exact = len_pred.eq(len_tgt).float().mean()
-                    metric_note = (
-                        f" mac_acc={macro_acc.item():.3f}"
-                        f" mac_ns={macro_non_skip_acc.item():.3f}"
-                        f" len_mae={len_mae.item():.3f}"
-                        f" len_exact={len_exact.item():.3f}"
-                    )
                 cache_note = ""
                 if circuit_cache.max_size > 0:
                     total_cache = circuit_cache.hits + circuit_cache.misses
@@ -884,6 +955,23 @@ def main() -> None:
                 torch.save(model.state_dict(), ckpt / "pytorch_model.bin")
 
         # epoch checkpoint
+        if args.log_epoch_metrics and epoch_samples > 0:
+            macro_acc = epoch_correct / epoch_tokens if epoch_tokens else 0.0
+            macro_non_skip_acc = epoch_non_skip_correct / epoch_non_skip if epoch_non_skip else 0.0
+            len_mae = epoch_len_abs / float(epoch_samples)
+            len_exact = epoch_len_exact / float(epoch_samples)
+            avg_loss = epoch_loss / float(epoch_samples)
+            avg_phys = epoch_phys / float(epoch_samples)
+            avg_macro_ce = epoch_macro_ce / float(epoch_samples)
+            avg_len = epoch_len / float(epoch_samples)
+            avg_alpha = epoch_alpha / float(epoch_samples)
+            avg_tau = epoch_tau / float(epoch_samples)
+            print(
+                f"[epoch {epoch+1}] avg loss={avg_loss:.4f} phys={avg_phys:.4f} "
+                f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
+                f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
+                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}"
+            )
         ckpt = args.output / f"epoch_{epoch+1}"
         ckpt.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), ckpt / "pytorch_model.bin")

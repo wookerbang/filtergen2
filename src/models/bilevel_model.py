@@ -30,6 +30,7 @@ class Wave2StructureModel(nn.Module):
         dropout: float = 0.1,
         spec_mode: Literal["type_fc", "none"] = "type_fc",
         attn_heads: Optional[int] = None,
+        gate_skip_bias: float = 0.0,
     ) -> None:
         super().__init__()
         self.k_max = int(k_max)
@@ -63,6 +64,9 @@ class Wave2StructureModel(nn.Module):
         )
         self.gate_head = nn.Linear(hidden, self.macro_vocab_size + 1)
         self.value_head = nn.Linear(hidden, self.slot_count)
+        if float(gate_skip_bias) != 0.0:
+            with torch.no_grad():
+                self.gate_head.bias[self.macro_vocab_size] = float(gate_skip_bias)
         nn.init.constant_(self.value_head.bias, -22.0)
 
     def forward(

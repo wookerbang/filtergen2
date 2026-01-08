@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         "--scenario",
         type=str,
         default="random",
-        help="Scenario template (general/anti_jamming/coexistence/wideband_rejection/random_basic) or 'random'.",
+        help="Scenario template (general/anti_jamming/coexistence/wideband_rejection/random_basic/lowpass/highpass/bandpass/bandstop) or 'random'.",
     )
     p.add_argument(
         "--scenario-weights",
@@ -88,6 +88,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable insertion loss rejection sanity check.",
     )
     p.set_defaults(il_check=False)
+    p.add_argument(
+        "--filter-type",
+        choices=["lowpass", "highpass", "bandpass", "bandstop"],
+        help="Fix filter_type for all samples (scenario must be compatible).",
+    )
+    p.add_argument(
+        "--prototype-type",
+        choices=["cheby1", "butter"],
+        help="Fix prototype type for all samples.",
+    )
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
@@ -125,6 +135,8 @@ def main() -> None:
         tol_frac=float(args.tol),
         q_model=str(args.q_model),
         check_insertion_loss=bool(args.il_check),
+        filter_type_override=args.filter_type,
+        prototype_type_override=args.prototype_type,
     )
     print(f"Dataset written to {path}")
 

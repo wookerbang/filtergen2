@@ -82,6 +82,8 @@ def build_dataset(
     tol_frac: float = 0.05,
     q_model: str = "freq_dependent",
     check_insertion_loss: bool = True,
+    filter_type_override: str | None = None,
+    prototype_type_override: str | None = None,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -115,7 +117,16 @@ def build_dataset(
 
     with open(jsonl_path, "w") as f:
         for i in range(num_samples):
-            spec = sample_scenario_spec(rng=rng, scenario=scenario, scenario_weights=scenario_weights)
+            proto_override = None
+            if prototype_type_override is not None:
+                proto_override = (str(prototype_type_override),)
+            spec = sample_scenario_spec(
+                rng=rng,
+                scenario=scenario,
+                scenario_weights=scenario_weights,
+                filter_type_override=str(filter_type_override) if filter_type_override is not None else None,
+                prototype_types_override=proto_override,
+            )
             z0 = spec["z0"]
             if fast_engine is None or float(z0) != float(fast_engine.z0):
                 fast_engine = FastTrackEngine(z0=float(z0), device="cpu", dtype=torch.float64)
