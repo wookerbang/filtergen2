@@ -84,6 +84,7 @@ def build_dataset(
     check_insertion_loss: bool = True,
     filter_type_override: str | None = None,
     prototype_type_override: str | None = None,
+    topology_type_override: str | None = None,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -126,6 +127,7 @@ def build_dataset(
                 scenario_weights=scenario_weights,
                 filter_type_override=str(filter_type_override) if filter_type_override is not None else None,
                 prototype_types_override=proto_override,
+                topology_type_override=str(topology_type_override) if topology_type_override is not None else None,
             )
             z0 = spec["z0"]
             if fast_engine is None or float(z0) != float(fast_engine.z0):

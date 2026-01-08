@@ -72,11 +72,18 @@ def _resolve_prototype_types_override(override: Optional[Sequence[str]]) -> Sequ
     return list(override)
 
 
+def _resolve_topology_types_override(override: Optional[str]) -> Sequence[str] | None:
+    if override is None:
+        return None
+    return [str(override)]
+
+
 def sample_general_spec(
     rng: np.random.Generator,
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -88,6 +95,7 @@ def sample_general_spec(
         order_range=(3, 7),
         ripple_db_range=(0.05, 0.5),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -104,6 +112,7 @@ def sample_anti_jamming_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -115,6 +124,7 @@ def sample_anti_jamming_spec(
         order_range=(3, 7),
         bw_frac_range=(0.05, 0.2),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     fc = float(spec["fc_hz"])
     bw = float(spec.get("bw_frac") or 0.2)
@@ -138,6 +148,7 @@ def sample_coexistence_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -149,6 +160,7 @@ def sample_coexistence_spec(
         order_range=(6, 9),
         bw_frac_range=(0.05, 0.2),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -165,6 +177,7 @@ def sample_wideband_rejection_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -176,6 +189,7 @@ def sample_wideband_rejection_spec(
         order_range=(3, 7),
         bw_frac_range=(0.1, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -191,6 +205,7 @@ def sample_random_basic_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -202,6 +217,7 @@ def sample_random_basic_spec(
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -217,6 +233,7 @@ def sample_lowpass_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -228,6 +245,7 @@ def sample_lowpass_spec(
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -243,6 +261,7 @@ def sample_highpass_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -254,6 +273,7 @@ def sample_highpass_spec(
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -269,6 +289,7 @@ def sample_bandpass_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -280,6 +301,7 @@ def sample_bandpass_spec(
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -295,6 +317,7 @@ def sample_bandstop_spec(
     *,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     spec = sample_base_spec(
         rng=rng,
@@ -306,6 +329,7 @@ def sample_bandstop_spec(
         order_range=(2, 8),
         bw_frac_range=(0.05, 0.4),
         prototype_types=_resolve_prototype_types_override(prototype_types_override) or ("cheby1", "butter"),
+        topology_types=_resolve_topology_types_override(topology_type_override) or ("pi", "t"),
     )
     spec.update(
         {
@@ -336,6 +360,7 @@ def sample_scenario_spec(
     scenario_weights: Mapping[ScenarioName, float] | None = None,
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
+    topology_type_override: Optional[str] = None,
 ) -> Dict[str, object]:
     rng = rng or np.random.default_rng()
     if scenario is None or str(scenario).lower() == "random":
@@ -350,6 +375,7 @@ def sample_scenario_spec(
         rng,
         filter_type_override=filter_type_override,
         prototype_types_override=prototype_types_override,
+        topology_type_override=topology_type_override,
     )
 
 

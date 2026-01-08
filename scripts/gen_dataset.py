@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         choices=["cheby1", "butter"],
         help="Fix prototype type for all samples.",
     )
+    p.add_argument(
+        "--topology-type",
+        choices=["pi", "t"],
+        help="Fix topology type for all samples.",
+    )
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
@@ -137,6 +142,7 @@ def main() -> None:
         check_insertion_loss=bool(args.il_check),
         filter_type_override=args.filter_type,
         prototype_type_override=args.prototype_type,
+        topology_type_override=args.topology_type,
     )
     print(f"Dataset written to {path}")
 
