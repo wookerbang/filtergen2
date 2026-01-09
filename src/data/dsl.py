@@ -1071,6 +1071,14 @@ def components_to_dsl_segments(
     cells = _components_to_motif_cells(components)
     return _group_cells_by_macro(cells)
 
+
+def components_to_macro_ir(components: Sequence[ComponentSpec]) -> List[str]:
+    """
+    Convert components into expanded Macro-IR (one macro per cell).
+    """
+    cells = _components_to_motif_cells(components)
+    return [macro for macro, _ in cells]
+
 # ---- Encoding (components -> tokens) ----
 
 

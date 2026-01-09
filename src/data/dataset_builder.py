@@ -20,7 +20,7 @@ from .spice_runner import simulate_real_waveform
 from .vact_struct import components_to_vact_struct_tokens
 from .node_canonicalizer import canonicalize_nodes
 from .action_codec import components_to_action_tokens
-from .dsl import VAL_NONE, components_to_dsl_segments, components_to_dsl_tokens
+from .dsl import VAL_NONE, components_to_dsl_segments, components_to_dsl_tokens, components_to_macro_ir
 from .scenarios import apply_scenario_postprocess, build_freq_grid, build_spec_masks, sample_scenario_spec
 from src.physics import FastTrackEngine
 
@@ -231,6 +231,14 @@ def build_dataset(
                     include_ports=True,
                     emit_cells=True,
                 )
+            try:
+                macro_ir_macros = components_to_macro_ir(discrete_components)
+            except ValueError as exc:
+                print(f"Sample {i}: Macro-IR parse failed ({exc}).")
+                continue
+            if not macro_ir_macros:
+                print(f"Sample {i}: Macro-IR is empty.")
+                continue
             dsl_tokens = None
             dsl_slot_values = None
             if emit_dsl:
@@ -294,6 +302,7 @@ def build_dataset(
                 vact_struct_tokens=vact_struct_tokens,
                 dsl_tokens=dsl_tokens,
                 dsl_slot_values=dsl_slot_values,
+                macro_ir_macros=macro_ir_macros,
                 sfci_tokens=sfci_tokens,
                 action_tokens=action_tokens,
             )

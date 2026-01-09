@@ -18,7 +18,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.dsl import MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
+from src.data.dsl import (
+    MACRO_LIBRARY,
+    MACRO_SER_C,
+    MACRO_SER_L,
+    MACRO_SHUNT_C,
+    MACRO_SHUNT_L,
+    SERIES_MACROS,
+    dsl_tokens_to_macro_sequence,
+)
+from src.utils.macro_transition import build_transition_matrices, viterbi_decode
 from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
 
@@ -36,20 +45,22 @@ class BilevelEvalDataset(Dataset):
         include_s11: bool = True,
     ) -> None:
         self.samples = []
-        self.dsl_macros = []
+        self.macro_ir_macros = []
         with open(jsonl_path, "r") as f:
             for line_no, line in enumerate(f, start=1):
                 if not line.strip():
                     continue
                 sample = json.loads(line)
-                tokens = sample.get("dsl_tokens") or []
-                if not tokens:
-                    raise ValueError(f"Missing dsl_tokens at line {line_no} in {jsonl_path}.")
-                macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
+                macros = sample.get("macro_ir_macros") or []
+                if not macros:
+                    tokens = sample.get("dsl_tokens") or []
+                    if not tokens:
+                        raise ValueError(f"Missing macro_ir_macros/dsl_tokens at line {line_no} in {jsonl_path}.")
+                    macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
                 if not macros:
                     raise ValueError(f"Empty macro sequence at line {line_no} in {jsonl_path}.")
                 self.samples.append(sample)
-                self.dsl_macros.append(macros)
+                self.macro_ir_macros.append(macros)
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
         self.normalize_wave = normalize_wave
@@ -159,7 +170,7 @@ class BilevelEvalDataset(Dataset):
 
         return {
             "dsl_tokens": s.get("dsl_tokens", []),
-            "dsl_macros": self.dsl_macros[idx],
+            "macro_ir_macros": self.macro_ir_macros[idx],
             "freq": freq,
             "wave": wave,
             "scalar": scalar,
@@ -310,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=None)
     p.add_argument("--inner-nan-backoff", type=float, default=None)
     p.add_argument("--inner-nan-tries", type=int, default=None)
+    p.add_argument("--use-viterbi", action="store_true", help="Decode macros with Viterbi + hard transitions.")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     return p.parse_args()
 
@@ -349,6 +361,9 @@ def main() -> None:
     d_model = int(cfg.get("d_model", 512))
     hidden_mult = int(cfg.get("hidden_mult", 2))
     dropout = float(cfg.get("dropout", 0.1))
+    use_role_queries = bool(cfg.get("use_role_queries", False))
+    role_input_frac = float(cfg.get("role_input_frac", 0.2))
+    role_output_frac = float(cfg.get("role_output_frac", 0.2))
     unroll_steps = int(args.unroll_steps or cfg.get("unroll_steps", 5))
     inner_lr = float(args.inner_lr or cfg.get("inner_lr", 5e-2))
     inner_max_step = float(args.inner_max_step or cfg.get("inner_max_step", 0.5))
@@ -379,7 +394,7 @@ def main() -> None:
     if args.max_samples and args.max_samples > 0:
         max_n = int(args.max_samples)
         dataset.samples = dataset.samples[:max_n]
-        dataset.dsl_macros = dataset.dsl_macros[:max_n]
+        dataset.macro_ir_macros = dataset.macro_ir_macros[:max_n]
 
     def collate(batch: List[dict]) -> dict:
         return {
@@ -390,7 +405,7 @@ def main() -> None:
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
             "dsl_tokens": [b["dsl_tokens"] for b in batch],
-            "dsl_macros": [b.get("dsl_macros") for b in batch],
+            "macro_ir_macros": [b.get("macro_ir_macros") for b in batch],
         }
 
     device = torch.device(args.device)
@@ -422,6 +437,9 @@ def main() -> None:
         hidden_mult=hidden_mult,
         dropout=dropout,
         spec_mode=spec_mode,
+        use_role_queries=use_role_queries,
+        role_input_frac=role_input_frac,
+        role_output_frac=role_output_frac,
     ).to(device=device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
@@ -434,6 +452,20 @@ def main() -> None:
     skip_id = len(macro_vocab)
     id_to_macro = list(macro_vocab)
     assembler = DynamicCircuitAssembler(z0=50.0)
+    use_viterbi = bool(args.use_viterbi)
+    c_skip_penalty = float(cfg.get("c_skip_penalty", 100.0))
+    c_redundant_penalty = float(cfg.get("c_redundant_penalty", 1.0))
+    if use_viterbi:
+        redundant_macros = [MACRO_SER_L, MACRO_SER_C, MACRO_SHUNT_L, MACRO_SHUNT_C]
+        c_hard, _ = build_transition_matrices(
+            id_to_macro=id_to_macro,
+            skip_id=skip_id,
+            soft_skip_penalty=c_skip_penalty,
+            soft_redundant_penalty=c_redundant_penalty,
+            redundant_macros=redundant_macros,
+            hard_ban_skip_to_non_skip=True,
+        )
+        c_hard = c_hard.to(device=device, dtype=dtype)
 
     type_names = {0: "lowpass", 1: "highpass", 2: "bandpass", 3: "bandstop"}
     total = 0
@@ -466,7 +498,7 @@ def main() -> None:
         mask_max = batch["mask_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         scalar = batch["scalar"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         dsl_tokens = batch["dsl_tokens"]
-        dsl_macros = batch.get("dsl_macros")
+        macro_ir_macros = batch.get("macro_ir_macros")
         filter_type = scalar[:, 0].long()
         fc_hz = scalar[:, 1]
 
@@ -475,7 +507,10 @@ def main() -> None:
         g_logits = g_logits.float()
         slot_raw = slot_raw.float()
 
-        macro_ids = torch.argmax(g_logits, dim=-1)
+        if use_viterbi:
+            macro_ids = viterbi_decode(g_logits, c_hard)
+        else:
+            macro_ids = torch.argmax(g_logits, dim=-1)
         for b in range(wave.shape[0]):
             try:
                 if not torch.isfinite(target[b]).all():
@@ -583,8 +618,8 @@ def main() -> None:
                     continue
 
                 macros = None
-                if dsl_macros is not None:
-                    macros = dsl_macros[b]
+                if macro_ir_macros is not None:
+                    macros = macro_ir_macros[b]
                 if not macros:
                     try:
                         macros = dsl_tokens_to_macro_sequence(dsl_tokens[b], strict=True)

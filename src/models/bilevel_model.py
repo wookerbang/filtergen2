@@ -31,11 +31,15 @@ class Wave2StructureModel(nn.Module):
         spec_mode: Literal["type_fc", "none"] = "type_fc",
         attn_heads: Optional[int] = None,
         gate_skip_bias: float = 0.0,
+        use_role_queries: bool = False,
+        role_input_frac: float = 0.2,
+        role_output_frac: float = 0.2,
     ) -> None:
         super().__init__()
         self.k_max = int(k_max)
         self.macro_vocab_size = int(macro_vocab_size)
         self.slot_count = int(slot_count)
+        self.use_role_queries = bool(use_role_queries)
 
         self.wave_encoder = MultiScaleWaveformEncoder(d_model=d_model, in_channels=waveform_in_channels, dropout=dropout)
         if spec_mode == "none":
@@ -53,6 +57,21 @@ class Wave2StructureModel(nn.Module):
         hidden = int(d_model * max(1, hidden_mult))
         self.slot_queries = nn.Parameter(torch.zeros(self.k_max, d_model))
         nn.init.normal_(self.slot_queries, std=0.02)
+        n_in = max(0, int(round(self.k_max * float(role_input_frac))))
+        n_out = max(0, int(round(self.k_max * float(role_output_frac))))
+        if n_in + n_out > self.k_max:
+            n_out = max(0, self.k_max - n_in)
+        role_ids = torch.full((self.k_max,), 1, dtype=torch.long)
+        if n_in > 0:
+            role_ids[:n_in] = 0
+        if n_out > 0:
+            role_ids[-n_out:] = 2
+        self.register_buffer("role_ids", role_ids, persistent=False)
+        if self.use_role_queries:
+            self.role_embed = nn.Embedding(3, d_model)
+            nn.init.zeros_(self.role_embed.weight)
+        else:
+            self.role_embed = None
         self.cross_attn = nn.MultiheadAttention(d_model, attn_heads, dropout=dropout, batch_first=True)
         self.cross_ln = nn.LayerNorm(d_model)
         self.self_attn = nn.MultiheadAttention(d_model, attn_heads, dropout=dropout, batch_first=True)
@@ -84,7 +103,10 @@ class Wave2StructureModel(nn.Module):
             wave_feat = torch.cat([spec_vec.unsqueeze(1), wave_feat], dim=1)
 
         batch = wave_feat.size(0)
-        slot_q = self.slot_queries.unsqueeze(0).expand(batch, -1, -1)
+        slot_q = self.slot_queries
+        if self.role_embed is not None:
+            slot_q = slot_q + self.role_embed(self.role_ids)
+        slot_q = slot_q.unsqueeze(0).expand(batch, -1, -1)
         cross_out, _ = self.cross_attn(slot_q, wave_feat, wave_feat, need_weights=False)
         cross_out = self.cross_ln(slot_q + cross_out)
         self_out, _ = self.self_attn(cross_out, cross_out, cross_out, need_weights=False)
@@ -93,3 +115,19 @@ class Wave2StructureModel(nn.Module):
         g_logits = self.gate_head(h)
         slot_values_raw = self.value_head(h)
         return g_logits, slot_values_raw
+
+    def query_symmetry_loss(self, *, core_only: bool = False) -> torch.Tensor:
+        q = self.slot_queries
+        if self.role_embed is not None:
+            q = q + self.role_embed(self.role_ids)
+        if q.numel() == 0:
+            return torch.tensor(0.0, device=q.device)
+        q_rev = torch.flip(q, dims=[0])
+        diff = q - q_rev
+        if core_only:
+            core_mask = self.role_ids == 1
+            core_mask = core_mask & torch.flip(core_mask, dims=[0])
+            diff = diff[core_mask]
+            if diff.numel() == 0:
+                return torch.tensor(0.0, device=q.device)
+        return (diff.pow(2).sum(dim=-1)).mean()

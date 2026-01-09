@@ -33,6 +33,7 @@ from src.data.dsl import (
     SERIES_MACROS,
     dsl_tokens_to_macro_sequence,
 )
+from src.utils.macro_transition import build_transition_matrices, expected_transition_penalty
 from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import (
     DynamicCircuitAssembler,
@@ -58,7 +59,7 @@ class BilevelDataset(Dataset):
         log_every: int = 0,
     ) -> None:
         self.samples = []
-        self.dsl_macros = []
+        self.macro_ir_macros = []
         if log_every:
             print(f"[load] reading dataset {jsonl_path}", flush=True)
         with open(jsonl_path, "r") as f:
@@ -66,14 +67,16 @@ class BilevelDataset(Dataset):
                 if not line.strip():
                     continue
                 sample = json.loads(line)
-                tokens = sample.get("dsl_tokens") or []
-                if not tokens:
-                    raise ValueError(f"Missing dsl_tokens at line {line_no} in {jsonl_path}.")
-                macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
+                macros = sample.get("macro_ir_macros") or []
+                if not macros:
+                    tokens = sample.get("dsl_tokens") or []
+                    if not tokens:
+                        raise ValueError(f"Missing macro_ir_macros/dsl_tokens at line {line_no} in {jsonl_path}.")
+                    macros = dsl_tokens_to_macro_sequence(tokens, strict=True)
                 if not macros:
                     raise ValueError(f"Empty macro sequence at line {line_no} in {jsonl_path}.")
                 self.samples.append(sample)
-                self.dsl_macros.append(macros)
+                self.macro_ir_macros.append(macros)
                 if log_every and line_no % int(log_every) == 0:
                     print(f"[load] parsed {line_no} lines", flush=True)
         self.use_wave = use_wave
@@ -183,7 +186,7 @@ class BilevelDataset(Dataset):
             "scalar": scalar,
             "ideal_s21_db": ideal_s21,
             "dsl_tokens": dsl_tokens,
-            "dsl_macros": self.dsl_macros[idx],
+            "macro_ir_macros": self.macro_ir_macros[idx],
         }
 
 
@@ -201,12 +204,14 @@ def _scan_macro_vocab_and_k(
             if not line.strip():
                 continue
             sample = json.loads(line)
-            toks = sample.get("dsl_tokens") or []
-            if not toks:
-                raise ValueError("DSL tokens missing in dataset; bilevel training requires dsl_tokens.")
-            macros = dsl_tokens_to_macro_sequence(toks, strict=True)
+            macros = sample.get("macro_ir_macros") or []
             if not macros:
-                raise ValueError("Empty macro sequence parsed from dsl_tokens.")
+                toks = sample.get("dsl_tokens") or []
+                if not toks:
+                    raise ValueError("macro_ir_macros/dsl_tokens missing in dataset; bilevel training requires macros.")
+                macros = dsl_tokens_to_macro_sequence(toks, strict=True)
+            if not macros:
+                raise ValueError("Empty macro sequence parsed from dataset.")
             macro_set.update(macros)
             cell_counts.append(len(macros))
     if not cell_counts:
@@ -237,7 +242,7 @@ def _scan_macro_vocab_and_k_from_sequences(
         macro_set.update(macros)
         cell_counts.append(len(macros))
     if not cell_counts:
-        raise ValueError("No valid DSL samples found for macro/vocab scan.")
+        raise ValueError("No valid macro sequences found for macro/vocab scan.")
 
     macro_vocab = [m for m in MACRO_IDS if m in macro_set]
     if not macro_vocab:
@@ -435,7 +440,7 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
         for i, b in enumerate(batch):
-            macros = b.get("dsl_macros")
+            macros = b.get("macro_ir_macros")
             if macros is None:
                 macros = dsl_tokens_to_macro_sequence(b["dsl_tokens"], strict=True)
             if len(macros) > k_max:
@@ -458,7 +463,7 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Bilevel training with DSL projection.")
+    p = argparse.ArgumentParser(description="Bilevel training with Macro-IR slot filling.")
     p.add_argument("--data", type=Path, required=True, help="Path to train jsonl.")
     p.add_argument("--eval-data", type=Path, help="Optional eval jsonl.")
     p.add_argument("--output", type=Path, default=Path("checkpoints/bilevel"), help="Checkpoint dir.")
@@ -497,6 +502,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-mult", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--gate-skip-bias", type=float, default=1.0, help="Initial bias for SKIP gate logit.")
+    p.add_argument("--use-role-queries", action="store_true", help="Add role-aware embeddings to slot queries.")
+    p.add_argument("--role-input-frac", type=float, default=0.2, help="Fraction of slots tagged as input-match.")
+    p.add_argument("--role-output-frac", type=float, default=0.2, help="Fraction of slots tagged as output-match.")
+    p.add_argument("--sym-weight", type=float, default=0.0, help="Optional symmetry regularizer weight for queries.")
+    p.add_argument("--sym-core-only", action="store_true", help="Apply symmetry regularizer only to core slots.")
 
     # bilevel config
     p.add_argument("--k-percentile", type=float, default=95.0)
@@ -535,6 +545,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-min", type=float, default=0.1)
     p.add_argument("--alpha-decay-frac", type=float, default=0.3)
     p.add_argument("--use-token-loss", action="store_true", help="(Reserved) include token loss during bilevel.")
+    p.add_argument("--c-reg-weight", type=float, default=0.0, help="Weight for transition regularizer (0 disables).")
+    p.add_argument("--c-skip-penalty", type=float, default=100.0, help="Soft penalty for SKIP->nonSKIP transitions.")
+    p.add_argument(
+        "--c-redundant-penalty",
+        type=float,
+        default=1.0,
+        help="Soft penalty for redundant self-transitions (e.g., SER_L->SER_L).",
+    )
 
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
@@ -617,7 +635,7 @@ def main() -> None:
         log_every=args.load_log_steps,
     )
     macro_vocab, k_max = _scan_macro_vocab_and_k_from_sequences(
-        dataset.dsl_macros,
+        dataset.macro_ir_macros,
         k_percentile=args.k_percentile,
         k_cap=args.k_cap,
         k_min=args.k_min,
@@ -651,6 +669,11 @@ def main() -> None:
         "hidden_mult": args.hidden_mult,
         "dropout": args.dropout,
         "gate_skip_bias": args.gate_skip_bias,
+        "use_role_queries": bool(args.use_role_queries),
+        "role_input_frac": args.role_input_frac,
+        "role_output_frac": args.role_output_frac,
+        "sym_weight": args.sym_weight,
+        "sym_core_only": bool(args.sym_core_only),
         "amp_bf16": bool(args.amp_bf16),
         "num_workers": int(args.num_workers),
         "prefetch_factor": int(args.prefetch_factor),
@@ -679,6 +702,9 @@ def main() -> None:
         "gumbel_tau_min": args.gumbel_tau_min,
         "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
         "mix_topk": args.mix_topk,
+        "c_reg_weight": args.c_reg_weight,
+        "c_skip_penalty": args.c_skip_penalty,
+        "c_redundant_penalty": args.c_redundant_penalty,
         "init_from": str(args.init_from) if args.init_from else None,
     }
     with (args.output / "input_config.json").open("w") as f:
@@ -712,6 +738,9 @@ def main() -> None:
         dropout=args.dropout,
         spec_mode=args.spec_mode,
         gate_skip_bias=args.gate_skip_bias,
+        use_role_queries=bool(args.use_role_queries),
+        role_input_frac=float(args.role_input_frac),
+        role_output_frac=float(args.role_output_frac),
     ).to(device=device)
     if args.init_from:
         ckpt_path = _resolve_ckpt(args.init_from)
@@ -726,6 +755,17 @@ def main() -> None:
     amp_enabled = bool(args.amp_bf16 and device.type == "cuda" and dtype == torch.float32)
     if args.amp_bf16 and not amp_enabled:
         print("[warn] BF16 autocast disabled (requires CUDA + float32 dtype).")
+    redundant_macros = [MACRO_SER_L, MACRO_SER_C, MACRO_SHUNT_L, MACRO_SHUNT_C]
+    c_hard, p_soft = build_transition_matrices(
+        id_to_macro=id_to_macro,
+        skip_id=skip_id,
+        soft_skip_penalty=float(args.c_skip_penalty),
+        soft_redundant_penalty=float(args.c_redundant_penalty),
+        redundant_macros=redundant_macros,
+        hard_ban_skip_to_non_skip=True,
+    )
+    c_hard = c_hard.to(device=device, dtype=dtype)
+    p_soft = p_soft.to(device=device, dtype=dtype)
     assembler = DynamicCircuitAssembler(z0=50.0)
     circuit_cache = CircuitCache(
         max_size=args.circuit_cache_size,
@@ -764,6 +804,8 @@ def main() -> None:
         epoch_phys = 0.0
         epoch_macro_ce = 0.0
         epoch_len = 0.0
+        epoch_c_reg = 0.0
+        epoch_sym = 0.0
         epoch_alpha = 0.0
         epoch_tau = 0.0
         for batch in loader:
@@ -807,6 +849,13 @@ def main() -> None:
             macro_ce = F.cross_entropy(g_logits.view(-1, skip_id + 1), macro_targets.view(-1))
             p_skip = g_soft[..., skip_id]
             len_loss = (1.0 - p_skip).mean()
+            c_reg = torch.tensor(0.0, device=device, dtype=dtype)
+            if float(args.c_reg_weight) > 0.0:
+                probs = F.softmax(g_logits, dim=-1).to(dtype)
+                c_reg = expected_transition_penalty(probs, p_soft)
+            sym_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            if float(args.sym_weight) > 0.0:
+                sym_loss = model.query_symmetry_loss(core_only=bool(args.sym_core_only)).to(dtype)
 
             metric_note = ""
             if args.log_train_metrics or args.log_epoch_metrics:
@@ -905,6 +954,10 @@ def main() -> None:
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
             phys_weight = float(args.phys_weight)
             loss = phys_weight * physics_loss + float(alpha) * macro_ce + float(args.len_weight) * len_loss
+            if float(args.c_reg_weight) > 0.0:
+                loss = loss + float(args.c_reg_weight) * c_reg
+            if float(args.sym_weight) > 0.0:
+                loss = loss + float(args.sym_weight) * sym_loss
             if args.skip_nonfinite and not torch.isfinite(loss):
                 skipped_nonfinite += 1
                 opt.zero_grad(set_to_none=True)
@@ -923,6 +976,8 @@ def main() -> None:
                 epoch_phys += float(physics_loss.item()) * batch_size
                 epoch_macro_ce += float(macro_ce.item()) * batch_size
                 epoch_len += float(len_loss.item()) * batch_size
+                epoch_c_reg += float(c_reg.item()) * batch_size
+                epoch_sym += float(sym_loss.item()) * batch_size
                 epoch_alpha += float(alpha) * batch_size
                 epoch_tau += float(tau) * batch_size
             loss.backward()
@@ -935,6 +990,11 @@ def main() -> None:
 
             if step % int(args.log_steps) == 0:
                 cache_note = ""
+                reg_note = ""
+                if float(args.c_reg_weight) > 0.0:
+                    reg_note += f" c_reg={c_reg.item():.4f}"
+                if float(args.sym_weight) > 0.0:
+                    reg_note += f" sym={sym_loss.item():.4f}"
                 if circuit_cache.max_size > 0:
                     total_cache = circuit_cache.hits + circuit_cache.misses
                     if total_cache > 0:
@@ -946,6 +1006,7 @@ def main() -> None:
                     f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f} tau={tau:.3f}"
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
                     + metric_note
+                    + reg_note
                     + cache_note
                 )
 
@@ -964,13 +1025,20 @@ def main() -> None:
             avg_phys = epoch_phys / float(epoch_samples)
             avg_macro_ce = epoch_macro_ce / float(epoch_samples)
             avg_len = epoch_len / float(epoch_samples)
+            avg_c_reg = epoch_c_reg / float(epoch_samples)
+            avg_sym = epoch_sym / float(epoch_samples)
             avg_alpha = epoch_alpha / float(epoch_samples)
             avg_tau = epoch_tau / float(epoch_samples)
+            reg_note = ""
+            if float(args.c_reg_weight) > 0.0:
+                reg_note += f" c_reg={avg_c_reg:.4f}"
+            if float(args.sym_weight) > 0.0:
+                reg_note += f" sym={avg_sym:.4f}"
             print(
                 f"[epoch {epoch+1}] avg loss={avg_loss:.4f} phys={avg_phys:.4f} "
                 f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
                 f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
-                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}"
+                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}" + reg_note
             )
         ckpt = args.output / f"epoch_{epoch+1}"
         ckpt.mkdir(parents=True, exist_ok=True)

@@ -117,6 +117,7 @@ class FilterSample:
     vact_struct_tokens: Optional[List[str]] = None  # structured VACT-Struct tokens
     dsl_tokens: Optional[List[str]] = None  # structured Macro/Repeat DSL tokens
     dsl_slot_values: Optional[List[float]] = None  # numeric slots aligned with dsl_tokens
+    macro_ir_macros: Optional[List[str]] = None  # expanded Macro-IR (one macro per cell)
     sfci_tokens: Optional[List[str]] = None  # net-centric SFCI tokens
     action_tokens: Optional[List[str]] = None  # action-oriented construction tokens
     spec_id: Optional[int] = None
@@ -155,6 +156,7 @@ class FilterSample:
             "vact_struct_tokens": self.vact_struct_tokens or [],
             "dsl_tokens": self.dsl_tokens or [],
             "dsl_slot_values": self.dsl_slot_values or [],
+            "macro_ir_macros": self.macro_ir_macros or [],
             "sfci_tokens": self.sfci_tokens or [],
             "action_tokens": self.action_tokens or [],
         }
