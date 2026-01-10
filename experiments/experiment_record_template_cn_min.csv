@@ -1,0 +1,29 @@
+模块,参数,值,说明
+运行信息,Run ID,,唯一标识
+运行信息,日期,,YYYY-MM-DD
+运行信息,Git 版本,,git rev-parse --short HEAD
+数据与输入,--data,,训练集 jsonl
+数据与输入,--eval-data,,验证集（可空）
+优化与训练,--epochs,,训练轮数
+优化与训练,--batch-size,,批大小
+优化与训练,--lr,,学习率
+优化与训练,--seed,,随机种子
+Bilevel/物理,--use-unroll,,是否启用内环
+Bilevel/物理,--unroll-steps,,内环步数
+Bilevel/物理,--inner-lr,,内环学习率
+Gumbel 与调度,--gumbel-tau,,初始温度
+Gumbel 与调度,--gumbel-tau-min,,最小温度
+Gumbel 与调度,--gumbel-tau-decay-frac,,退火比例
+Gumbel 与调度,--alpha-start,,macro CE 起始
+Gumbel 与调度,--alpha-min,,macro CE 最小
+Gumbel 与调度,--len-weight,,长度损失
+STE（硬前向+软反向）,--ste-phys,,是否启用（覆盖 matrix-mix）
+STE（硬前向+软反向）,--ste-topk,,soft top-k
+STE（硬前向+软反向）,--ste-topk-anneal-frac,,退火到 k=1
+结构先验 C / Viterbi,--c-reg-weight,,转移正则权重
+结构先验 C / Viterbi,Eval --use-viterbi,,评估时是否启用
+结果指标,macro_acc,,宏准确率
+结果指标,macro_non_skip_acc,,非 SKIP 宏准确率
+结果指标,phys_loss,,物理损失
+结果指标,yield_post,,refine 后良率
+命令快照,训练命令,,完整命令行

@@ -1,0 +1,92 @@
+模块,参数,值,说明
+运行信息,Run ID,,用于唯一标识本次实验（例如 ste_k3_tau1_seed0）
+运行信息,日期,,YYYY-MM-DD
+运行信息,Git 版本,,git rev-parse --short HEAD
+运行信息,训练脚本,`scripts/train_bilevel.py`,训练入口
+运行信息,输出目录,,与 --output 一致
+运行信息,实验目标,,一句话说明本次消融/对比目的
+环境,机器/主机名,,服务器或本机标识
+环境,GPU,,型号与显存
+环境,CUDA 版本,,nvidia-smi 显示
+环境,PyTorch 版本,,python -c "import torch; print(torch.__version__)"
+环境,Python 版本,,python --version
+数据与输入,--data,,训练集 jsonl 路径
+数据与输入,--eval-data,,可选验证集
+数据与输入,--use-wave,,ideal/real/both/ideal_s21/real_s21/mix
+数据与输入,--wave-norm,,是否对波形通道标准化
+数据与输入,--freq-mode,,log_fc/linear_fc/log_f/log_f_centered/none
+数据与输入,--freq-scale,,log_fc/log_f_mean/none
+数据与输入,--no-s11,,若启用则仅用 S21
+数据与输入,--seed,,随机种子
+模型与拓扑,k_max,,由数据扫描得出
+模型与拓扑,--k-percentile,,K 的分位数估计
+模型与拓扑,--k-cap,,K 上限
+模型与拓扑,--k-min,,K 下限
+模型与拓扑,macro_vocab_size,,由数据扫描得出
+模型与拓扑,slot_count,,由宏库决定
+模型与拓扑,--d-model,,模型维度
+模型与拓扑,--hidden-mult,,MLP 宽度倍数
+模型与拓扑,--dropout,,dropout 概率
+模型与拓扑,--spec-mode,,type_fc 或 none
+模型与拓扑,--gate-skip-bias,,SKIP logit 初始偏置
+角色与对称,--use-role-queries,,是否启用角色化 queries
+角色与对称,--role-input-frac,,输入端比例
+角色与对称,--role-output-frac,,输出端比例
+角色与对称,--sym-weight,,对称性正则权重
+角色与对称,--sym-core-only,,仅对 core 区域启用对称正则
+优化与训练,--epochs,,训练轮数
+优化与训练,--batch-size,,批大小
+优化与训练,--grad-accum,,梯度累积步数
+优化与训练,--lr,,学习率
+优化与训练,--clip-grad,,梯度裁剪（<=0 关闭）
+优化与训练,--amp-bf16,,是否启用 BF16 autocast
+优化与训练,--num-workers,,DataLoader 进程数
+优化与训练,--prefetch-factor,,预取因子（仅 num_workers>0）
+优化与训练,--pin-memory,,CUDA 加速拷贝
+优化与训练,--persistent-workers,,保持 worker 常驻
+优化与训练,--skip-nonfinite,,跳过非有限 batch
+优化与训练,--device,,cuda 或 cpu
+优化与训练,--dtype,,float32 或 float64
+优化与训练,--circuit-cache-size,,电路缓存大小（0 关闭）
+Bilevel/物理,--phys-weight,,物理损失权重
+Bilevel/物理,--use-unroll,,是否启用内环优化
+Bilevel/物理,--unroll-steps,,内环步数
+Bilevel/物理,--unroll-create-graph,,是否保留高阶图
+Bilevel/物理,--inner-lr,,内环学习率
+Bilevel/物理,--inner-max-step,,内环步长上限
+Bilevel/物理,--inner-raw-min,,raw 最小值
+Bilevel/物理,--inner-raw-max,,raw 最大值
+Bilevel/物理,--inner-nan-backoff,,nan 回退系数
+Bilevel/物理,--inner-nan-tries,,nan 回退次数
+Gumbel 与调度,--gumbel-tau,,初始温度
+Gumbel 与调度,--gumbel-tau-min,,最小温度
+Gumbel 与调度,--gumbel-tau-decay-frac,,温度退火比例
+Gumbel 与调度,--alpha-start,,macro CE 初始权重
+Gumbel 与调度,--alpha-min,,macro CE 最小权重
+Gumbel 与调度,--alpha-decay-frac,,macro CE 退火比例
+Gumbel 与调度,--len-weight,,长度损失权重
+STE（硬前向+软反向）,--ste-phys,,开启 STE；会覆盖 matrix-mix
+STE（硬前向+软反向）,--ste-topk,,soft 稀疏 top-k（默认 3）
+STE（硬前向+软反向）,--ste-topk-anneal-frac,,最后阶段退火到 k=1
+STE（硬前向+软反向）,--ste-phys-weight,,soft 物理损失权重
+Matrix Mix（若 STE 关闭）,--matrix-mix,,软混合模式
+Matrix Mix（若 STE 关闭）,--mix-topk,,mix 的 top-k
+结构先验 C / Viterbi,--c-reg-weight,,转移正则权重
+结构先验 C / Viterbi,--c-skip-penalty,,SKIP->nonSKIP 惩罚
+结构先验 C / Viterbi,--c-redundant-penalty,,冗余自转移惩罚
+结构先验 C / Viterbi,Eval --use-viterbi,,评估时是否启用
+Checkpoint & 日志,--output,,输出目录
+Checkpoint & 日志,--init-from,,初始化/恢复路径
+Checkpoint & 日志,--log-steps,,日志间隔
+Checkpoint & 日志,--save-steps,,保存间隔
+Checkpoint & 日志,--save-total-limit,,最多保存数量
+结果指标,macro_acc,,宏整体准确率
+结果指标,macro_non_skip_acc,,非 SKIP 宏准确率
+结果指标,len_mae,,长度 MAE
+结果指标,len_exact,,长度完全匹配率
+结果指标,phys_loss,,物理损失均值
+结果指标,phys_soft,,STE soft 物理损失
+结果指标,yield_pre,,refine 前良率
+结果指标,yield_post,,refine 后良率
+结果指标,每 epoch 时间,,wall time
+命令快照,训练命令,,粘贴完整训练命令行
