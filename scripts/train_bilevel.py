@@ -553,6 +553,10 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Soft penalty for redundant self-transitions (e.g., SER_L->SER_L).",
     )
+    p.add_argument("--ste-phys", action="store_true", help="Enable STE: hard forward + soft mixed backward.")
+    p.add_argument("--ste-topk", type=int, default=3, help="Top-k sparsity for STE soft mixing.")
+    p.add_argument("--ste-topk-anneal-frac", type=float, default=0.2, help="Anneal top-k to 1 over last fraction.")
+    p.add_argument("--ste-phys-weight", type=float, default=1.0, help="Weight for STE soft physics loss.")
 
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
@@ -577,6 +581,19 @@ def _gumbel_tau_schedule(step: int, total_steps: int, *, tau_start: float, tau_m
         return float(tau_min)
     t = 1.0 - float(step) / float(decay_steps)
     return float(tau_min) + (float(tau_start) - float(tau_min)) * t
+
+
+def _ste_topk_schedule(step: int, total_steps: int, *, k_init: int, anneal_frac: float) -> int:
+    k_init = max(1, int(k_init))
+    if k_init <= 1 or float(anneal_frac) <= 0.0 or total_steps <= 0:
+        return k_init
+    start = int(total_steps * (1.0 - float(anneal_frac)))
+    if step < start:
+        return k_init
+    denom = max(1, total_steps - start)
+    frac = min(1.0, float(step - start) / float(denom))
+    k_val = float(k_init) - (float(k_init) - 1.0) * frac
+    return max(1, int(round(k_val)))
 
 
 def _sparse_topk_probs(probs: torch.Tensor, k: int) -> torch.Tensor:
@@ -621,6 +638,11 @@ def main() -> None:
         args.gumbel_tau_min = float(args.gumbel_tau)
     if float(args.gumbel_tau_min) <= 0.0:
         raise ValueError("gumbel_tau_min must be > 0.")
+    if args.ste_phys and args.matrix_mix:
+        print("[warn] Matrix Mix mode overridden by STE (--ste-phys enabled).")
+    use_matrix_mix = bool(args.matrix_mix and not args.ste_phys)
+    if args.ste_phys and not args.use_unroll:
+        print("[warn] STE enabled with --no-unroll; hard path uses direct physics, soft path still unrolls.")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -656,7 +678,7 @@ def main() -> None:
         "k_cap": args.k_cap,
         "k_percentile": args.k_percentile,
         "k_min": args.k_min,
-        "matrix_mix": bool(args.matrix_mix),
+        "matrix_mix": bool(use_matrix_mix),
         "macro_vocab": macro_vocab,
         "macro_vocab_size": len(macro_vocab),
         "slot_count": slot_count,
@@ -702,6 +724,10 @@ def main() -> None:
         "gumbel_tau_min": args.gumbel_tau_min,
         "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
         "mix_topk": args.mix_topk,
+        "ste_phys": bool(args.ste_phys),
+        "ste_topk": args.ste_topk,
+        "ste_topk_anneal_frac": args.ste_topk_anneal_frac,
+        "ste_phys_weight": args.ste_phys_weight,
         "c_reg_weight": args.c_reg_weight,
         "c_skip_penalty": args.c_skip_penalty,
         "c_redundant_penalty": args.c_redundant_penalty,
@@ -777,7 +803,7 @@ def main() -> None:
         dtype=dtype,
     )
     macro_bank = None
-    if args.matrix_mix:
+    if use_matrix_mix or args.ste_phys:
         macro_bank = _build_macro_bank(
             id_to_macro=id_to_macro,
             slot_count=slot_count,
@@ -802,6 +828,7 @@ def main() -> None:
         epoch_len_exact = 0.0
         epoch_loss = 0.0
         epoch_phys = 0.0
+        epoch_phys_soft = 0.0
         epoch_macro_ce = 0.0
         epoch_len = 0.0
         epoch_c_reg = 0.0
@@ -843,8 +870,19 @@ def main() -> None:
             g_soft = F.gumbel_softmax(g_logits, tau=float(tau), hard=False, dim=-1)
             g_soft = g_soft.to(dtype)
             g_phys = g_soft
-            if args.matrix_mix and int(args.mix_topk) > 0:
+            if use_matrix_mix and int(args.mix_topk) > 0:
                 g_phys = _sparse_topk_probs(g_soft, int(args.mix_topk))
+            ste_k = None
+            g_sparse = None
+            if args.ste_phys:
+                ste_k = _ste_topk_schedule(
+                    step,
+                    total_steps,
+                    k_init=int(args.ste_topk),
+                    anneal_frac=float(args.ste_topk_anneal_frac),
+                )
+                ste_k = min(int(ste_k), int(g_soft.shape[-1]))
+                g_sparse = _sparse_topk_probs(g_soft, int(ste_k))
 
             macro_ce = F.cross_entropy(g_logits.view(-1, skip_id + 1), macro_targets.view(-1))
             p_skip = g_soft[..., skip_id]
@@ -883,38 +921,13 @@ def main() -> None:
                             f" len_exact={len_exact_rate:.3f}"
                         )
 
-            physics_losses = []
-            for b in range(wave.shape[0]):
-                if args.matrix_mix:
-                    if macro_bank is None:
-                        raise ValueError("matrix_mix enabled but macro_bank not initialized.")
-                    if args.use_unroll:
-                        loss_b = unroll_refine_slots_mixed(
-                            slot_raw[b],
-                            g_phys[b],
-                            macro_bank,
-                            freq[b],
-                            target[b],
-                            steps=args.unroll_steps,
-                            lr=args.inner_lr,
-                            max_step=args.inner_max_step,
-                            raw_min=args.inner_raw_min,
-                            raw_max=args.inner_raw_max,
-                            nan_backoff=args.inner_nan_backoff,
-                            max_backoff=args.inner_nan_tries,
-                            create_graph=args.unroll_create_graph,
-                        )
-                    else:
-                        pred = mixed_s21_db(
-                            slot_raw[b],
-                            g_phys[b],
-                            macro_bank,
-                            freq[b],
-                            raw_min=args.inner_raw_min,
-                            raw_max=args.inner_raw_max,
-                        )
-                        loss_b = F.mse_loss(pred, target[b])
-                else:
+            physics_loss_soft = None
+            if args.ste_phys:
+                if macro_bank is None or g_sparse is None:
+                    raise ValueError("STE enabled but macro_bank/g_sparse not initialized.")
+                physics_losses_hard = []
+                physics_losses_soft = []
+                for b in range(wave.shape[0]):
                     g_hard = F.gumbel_softmax(g_logits[b], tau=float(tau), hard=True, dim=-1)
                     macro_ids_raw = torch.argmax(g_hard, dim=-1)
                     was_empty = not bool((macro_ids_raw != skip_id).any())
@@ -926,7 +939,7 @@ def main() -> None:
                     slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
                     circuit, slot_idx = circuit_cache.get(macro_ids_hard)
                     if args.use_unroll:
-                        loss_b = unroll_refine_slots(
+                        loss_hard = unroll_refine_slots(
                             slot_raw[b],
                             slot_mask,
                             slot_idx,
@@ -947,9 +960,95 @@ def main() -> None:
                         values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
                         pred = circuit(freq[b], values=values_vec, output="s21_db")
-                        loss_b = F.mse_loss(pred, target[b])
-                physics_losses.append(loss_b)
-            physics_loss = torch.stack(physics_losses).mean()
+                        loss_hard = F.mse_loss(pred, target[b])
+                    loss_soft = unroll_refine_slots_mixed(
+                        slot_raw[b],
+                        g_sparse[b],
+                        macro_bank,
+                        freq[b],
+                        target[b],
+                        steps=args.unroll_steps,
+                        lr=args.inner_lr,
+                        max_step=args.inner_max_step,
+                        raw_min=args.inner_raw_min,
+                        raw_max=args.inner_raw_max,
+                        nan_backoff=args.inner_nan_backoff,
+                        max_backoff=args.inner_nan_tries,
+                        create_graph=args.unroll_create_graph,
+                    )
+                    physics_losses_hard.append(loss_hard)
+                    physics_losses_soft.append(loss_soft)
+                physics_loss_hard = torch.stack(physics_losses_hard).mean()
+                physics_loss_soft = torch.stack(physics_losses_soft).mean()
+                physics_loss = physics_loss_hard + float(args.ste_phys_weight) * (physics_loss_soft - physics_loss_soft.detach())
+            else:
+                physics_losses = []
+                for b in range(wave.shape[0]):
+                    if use_matrix_mix:
+                        if macro_bank is None:
+                            raise ValueError("matrix_mix enabled but macro_bank not initialized.")
+                        if args.use_unroll:
+                            loss_b = unroll_refine_slots_mixed(
+                                slot_raw[b],
+                                g_phys[b],
+                                macro_bank,
+                                freq[b],
+                                target[b],
+                                steps=args.unroll_steps,
+                                lr=args.inner_lr,
+                                max_step=args.inner_max_step,
+                                raw_min=args.inner_raw_min,
+                                raw_max=args.inner_raw_max,
+                                nan_backoff=args.inner_nan_backoff,
+                                max_backoff=args.inner_nan_tries,
+                                create_graph=args.unroll_create_graph,
+                            )
+                        else:
+                            pred = mixed_s21_db(
+                                slot_raw[b],
+                                g_phys[b],
+                                macro_bank,
+                                freq[b],
+                                raw_min=args.inner_raw_min,
+                                raw_max=args.inner_raw_max,
+                            )
+                            loss_b = F.mse_loss(pred, target[b])
+                    else:
+                        g_hard = F.gumbel_softmax(g_logits[b], tau=float(tau), hard=True, dim=-1)
+                        macro_ids_raw = torch.argmax(g_hard, dim=-1)
+                        was_empty = not bool((macro_ids_raw != skip_id).any())
+                        macro_ids_hard = _enforce_non_empty(macro_ids_raw, g_logits[b], skip_id)
+                        hard_mask = torch.matmul(g_hard, macro_slot_mask)
+                        if was_empty:
+                            hard_mask = macro_slot_mask[macro_ids_hard]
+                        soft_mask = torch.matmul(g_soft[b], macro_slot_mask)
+                        slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
+                        circuit, slot_idx = circuit_cache.get(macro_ids_hard)
+                        if args.use_unroll:
+                            loss_b = unroll_refine_slots(
+                                slot_raw[b],
+                                slot_mask,
+                                slot_idx,
+                                circuit,
+                                freq[b],
+                                target[b],
+                                steps=args.unroll_steps,
+                                lr=args.inner_lr,
+                                max_step=args.inner_max_step,
+                                raw_min=args.inner_raw_min,
+                                raw_max=args.inner_raw_max,
+                                nan_backoff=args.inner_nan_backoff,
+                                max_backoff=args.inner_nan_tries,
+                                create_graph=args.unroll_create_graph,
+                            )
+                        else:
+                            raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
+                            values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                            values_vec = values_flat.index_select(0, slot_idx)
+                            pred = circuit(freq[b], values=values_vec, output="s21_db")
+                            loss_b = F.mse_loss(pred, target[b])
+                    physics_losses.append(loss_b)
+                physics_loss = torch.stack(physics_losses).mean()
 
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
             phys_weight = float(args.phys_weight)
@@ -974,6 +1073,8 @@ def main() -> None:
                 epoch_len_exact += len_exact
                 epoch_loss += float(loss.item()) * batch_size
                 epoch_phys += float(physics_loss.item()) * batch_size
+                if physics_loss_soft is not None:
+                    epoch_phys_soft += float(physics_loss_soft.item()) * batch_size
                 epoch_macro_ce += float(macro_ce.item()) * batch_size
                 epoch_len += float(len_loss.item()) * batch_size
                 epoch_c_reg += float(c_reg.item()) * batch_size
@@ -991,10 +1092,15 @@ def main() -> None:
             if step % int(args.log_steps) == 0:
                 cache_note = ""
                 reg_note = ""
+                ste_note = ""
                 if float(args.c_reg_weight) > 0.0:
                     reg_note += f" c_reg={c_reg.item():.4f}"
                 if float(args.sym_weight) > 0.0:
                     reg_note += f" sym={sym_loss.item():.4f}"
+                if args.ste_phys:
+                    ste_note = f" ste_k={int(ste_k)}"
+                    if physics_loss_soft is not None:
+                        ste_note += f" phys_soft={physics_loss_soft.item():.4f}"
                 if circuit_cache.max_size > 0:
                     total_cache = circuit_cache.hits + circuit_cache.misses
                     if total_cache > 0:
@@ -1007,6 +1113,7 @@ def main() -> None:
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
                     + metric_note
                     + reg_note
+                    + ste_note
                     + cache_note
                 )
 
@@ -1030,15 +1137,19 @@ def main() -> None:
             avg_alpha = epoch_alpha / float(epoch_samples)
             avg_tau = epoch_tau / float(epoch_samples)
             reg_note = ""
+            ste_note = ""
             if float(args.c_reg_weight) > 0.0:
                 reg_note += f" c_reg={avg_c_reg:.4f}"
             if float(args.sym_weight) > 0.0:
                 reg_note += f" sym={avg_sym:.4f}"
+            if args.ste_phys:
+                avg_phys_soft = epoch_phys_soft / float(epoch_samples)
+                ste_note = f" phys_soft={avg_phys_soft:.4f}"
             print(
                 f"[epoch {epoch+1}] avg loss={avg_loss:.4f} phys={avg_phys:.4f} "
                 f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
                 f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
-                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}" + reg_note
+                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}" + reg_note + ste_note
             )
         ckpt = args.output / f"epoch_{epoch+1}"
         ckpt.mkdir(parents=True, exist_ok=True)
