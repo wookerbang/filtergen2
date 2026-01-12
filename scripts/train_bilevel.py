@@ -55,7 +55,7 @@ class BilevelDataset(Dataset):
         normalize_wave: bool = False,
         freq_mode: str = "log_fc",
         freq_scale: str = "none",
-        include_s11: bool = True,
+        include_s11: bool = False,
         log_every: int = 0,
     ) -> None:
         self.samples = []
@@ -542,7 +542,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=-12.0)
     p.add_argument("--inner-nan-backoff", type=float, default=0.5)
     p.add_argument("--inner-nan-tries", type=int, default=3)
-    p.add_argument("--phys-weight", type=float, default=1e-4)
+    p.add_argument("--phys-weight", type=float, default=1e-2)
     p.add_argument("--len-weight", type=float, default=1e-3)
     p.add_argument("--gumbel-tau", type=float, default=1.0)
     p.add_argument("--gumbel-tau-min", type=float, default=None)
@@ -550,6 +550,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-start", type=float, default=1.0)
     p.add_argument("--alpha-min", type=float, default=0.1)
     p.add_argument("--alpha-decay-frac", type=float, default=0.3)
+    p.add_argument("--no-macro-ce", dest="use_macro_ce", action="store_false", help="Disable macro CE loss.")
+    p.set_defaults(use_macro_ce=True)
     p.add_argument("--use-token-loss", action="store_true", help="(Reserved) include token loss during bilevel.")
     p.add_argument("--c-reg-weight", type=float, default=0.0, help="Weight for transition regularizer (0 disables).")
     p.add_argument("--c-skip-penalty", type=float, default=100.0, help="Soft penalty for SKIP->nonSKIP transitions.")
@@ -715,6 +717,7 @@ def main() -> None:
         "alpha_start": args.alpha_start,
         "alpha_min": args.alpha_min,
         "alpha_decay_frac": args.alpha_decay_frac,
+        "use_macro_ce": bool(args.use_macro_ce),
         "len_weight": args.len_weight,
         "unroll_steps": args.unroll_steps,
         "use_unroll": bool(args.use_unroll),
@@ -1057,8 +1060,9 @@ def main() -> None:
                 physics_loss = torch.stack(physics_losses).mean()
 
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
+            alpha_used = float(alpha) if bool(args.use_macro_ce) else 0.0
             phys_weight = float(args.phys_weight)
-            loss = phys_weight * physics_loss + float(alpha) * macro_ce + float(args.len_weight) * len_loss
+            loss = phys_weight * physics_loss + float(alpha_used) * macro_ce + float(args.len_weight) * len_loss
             if float(args.c_reg_weight) > 0.0:
                 loss = loss + float(args.c_reg_weight) * c_reg
             if float(args.sym_weight) > 0.0:
@@ -1085,7 +1089,7 @@ def main() -> None:
                 epoch_len += float(len_loss.item()) * batch_size
                 epoch_c_reg += float(c_reg.item()) * batch_size
                 epoch_sym += float(sym_loss.item()) * batch_size
-                epoch_alpha += float(alpha) * batch_size
+                epoch_alpha += float(alpha_used) * batch_size
                 epoch_tau += float(tau) * batch_size
             loss.backward()
 
@@ -1115,7 +1119,7 @@ def main() -> None:
                 print(
                     f"[epoch {epoch+1}] step={step} loss={loss.item():.4f} "
                     f"phys={physics_loss.item():.4f} phys_w={phys_weight:.1e} "
-                    f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha:.3f} tau={tau:.3f}"
+                    f"macro_ce={macro_ce.item():.4f} len={len_loss.item():.4f} alpha={alpha_used:.3f} tau={tau:.3f}"
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
                     + metric_note
                     + reg_note
