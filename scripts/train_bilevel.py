@@ -472,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--log-steps", type=int, default=50)
+    p.add_argument("--log-steps", type=int, default=100)
     p.add_argument("--log-train-metrics", action="store_true", help="Log macro/length metrics on training batches.")
     p.add_argument("--log-epoch-metrics", action="store_true", help="Log averaged training metrics at epoch end.")
     p.add_argument("--save-steps", type=int, default=500)
@@ -852,11 +852,12 @@ def main() -> None:
             freq = batch["freq"].to(device, dtype=dtype, non_blocking=non_blocking)
             target = batch["target_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             macro_targets = batch["macro_ids"].to(device, non_blocking=non_blocking)
-            if args.skip_nonfinite:
-                if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
-                    skipped_nonfinite += 1
-                    opt.zero_grad(set_to_none=True)
-                    continue
+            if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
+                skipped_nonfinite += 1
+                if not args.skip_nonfinite and skipped_nonfinite <= 3:
+                    print("[warn] non-finite wave/freq/target encountered; skipping batch.")
+                opt.zero_grad(set_to_none=True)
+                continue
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                 g_logits, slot_raw = model(wave, filter_type=filter_type, fc_hz=fc_hz)
@@ -864,8 +865,10 @@ def main() -> None:
                 g_logits = g_logits.float()
                 slot_raw = slot_raw.float()
             slot_raw = slot_raw.to(dtype)
-            if args.skip_nonfinite and not (torch.isfinite(g_logits).all() and torch.isfinite(slot_raw).all()):
+            if not (torch.isfinite(g_logits).all() and torch.isfinite(slot_raw).all()):
                 skipped_nonfinite += 1
+                if not args.skip_nonfinite and skipped_nonfinite <= 3:
+                    print("[warn] non-finite g_logits/slot_raw encountered; skipping batch.")
                 opt.zero_grad(set_to_none=True)
                 continue
 
@@ -1062,13 +1065,20 @@ def main() -> None:
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
             alpha_used = float(alpha) if bool(args.use_macro_ce) else 0.0
             phys_weight = float(args.phys_weight)
-            loss = phys_weight * physics_loss + float(alpha_used) * macro_ce + float(args.len_weight) * len_loss
+            loss = phys_weight * physics_loss
+            if alpha_used != 0.0:
+                loss = loss + float(alpha_used) * macro_ce
+            len_weight = float(args.len_weight)
+            if len_weight != 0.0:
+                loss = loss + len_weight * len_loss
             if float(args.c_reg_weight) > 0.0:
                 loss = loss + float(args.c_reg_weight) * c_reg
             if float(args.sym_weight) > 0.0:
                 loss = loss + float(args.sym_weight) * sym_loss
-            if args.skip_nonfinite and not torch.isfinite(loss):
+            if not torch.isfinite(loss):
                 skipped_nonfinite += 1
+                if not args.skip_nonfinite and skipped_nonfinite <= 3:
+                    print("[warn] non-finite loss encountered; skipping batch.")
                 opt.zero_grad(set_to_none=True)
                 continue
 

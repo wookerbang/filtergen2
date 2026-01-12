@@ -9,7 +9,36 @@
 python scripts/train_bilevel.py ...
 ```
 
-## 1) 运行概览（必填）
+## 1) 数据模块（生成 / 类型）
+
+**数据生成指令（可粘贴脚本或命令）**
+
+```
+python scripts/gen_dataset.py ...
+```
+
+**数据类型（可多选）**
+
+- [ ] 低通（LP）
+- [ ] 高通（HP）
+- [ ] 带通（BP）
+- [ ] 带阻（BS）
+
+**原型（可多选）**
+
+- [ ] BUTTER
+- [ ] CHEV
+
+**拓扑类型（可多选）**
+
+- [ ] PI
+- [ ] T
+
+| 项目 | 默认值 | 值 | 说明 |
+|---|---|---|---|
+| 数据规模 |  |  | 总样本数或 train/val/test 规模 |
+
+## 2) 运行概览（必填）
 
 | 项目 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -20,7 +49,7 @@ python scripts/train_bilevel.py ...
 | 输出目录 | `checkpoints/bilevel` |  | 对应 `--output` |
 | 实验目标 |  |  | 一句话说明这次实验目的 |
 
-## 2) 核心开关摘要（勾选/填写）
+## 3) 核心开关摘要（勾选/填写）
 
 - [ ] STE（`--ste-phys`）
 - [ ] Matrix Mix（`--matrix-mix`，仅在 STE 关闭时生效）
@@ -29,7 +58,7 @@ python scripts/train_bilevel.py ...
 - [ ] Symmetry 正则（`--sym-weight` > 0）
 - [ ] Unroll（`--use-unroll`）
 
-## 3) 数据与输入
+## 4) 数据与输入
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -42,7 +71,7 @@ python scripts/train_bilevel.py ...
 | `--s11` | `false` |  | 启用 S11 通道（默认关闭） |
 | `--seed` | `0` |  | 随机种子 |
 
-## 4) 模型与拓扑
+## 5) 模型与拓扑
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -58,7 +87,7 @@ python scripts/train_bilevel.py ...
 | `--spec-mode` | `type_fc` |  | type_fc / none |
 | `--gate-skip-bias` | `1.0` |  | SKIP 初始偏置 |
 
-## 5) 训练与优化
+## 6) 训练与优化
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -77,7 +106,7 @@ python scripts/train_bilevel.py ...
 | `--dtype` | `float32` |  | float32 / float64 |
 | `--circuit-cache-size` | `2048` |  | 电路缓存大小 |
 
-## 6) Bilevel / 物理内环
+## 7) Bilevel / 物理内环
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -92,7 +121,7 @@ python scripts/train_bilevel.py ...
 | `--inner-nan-backoff` | `0.5` |  | nan 回退系数 |
 | `--inner-nan-tries` | `3` |  | nan 回退次数 |
 
-## 7) Gumbel 与调度
+## 8) Gumbel 与调度
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -105,7 +134,7 @@ python scripts/train_bilevel.py ...
 | `--no-macro-ce` | `false` |  | 关闭宏分类 CE |
 | `--len-weight` | `1e-3` |  | 长度损失权重 |
 
-## 8) STE（硬前向 + 软反向）
+## 9) STE（硬前向 + 软反向）
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -114,14 +143,14 @@ python scripts/train_bilevel.py ...
 | `--ste-topk-anneal-frac` | `0.2` |  | 最后阶段退火到 k=1 |
 | `--ste-phys-weight` | `1.0` |  | soft 物理损失权重 |
 
-## 9) Matrix Mix（仅 STE 关闭时）
+## 10) Matrix Mix（仅 STE 关闭时）
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
 | `--matrix-mix` | `false` |  | 混合物理模式 |
 | `--mix-topk` | `0` |  | mix 的 top-k |
 
-## 10) 结构先验 C / Viterbi
+## 11) 结构先验 C / Viterbi
 
 | 参数 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -130,19 +159,19 @@ python scripts/train_bilevel.py ...
 | `--c-redundant-penalty` | `1.0` |  | 冗余自转移惩罚 |
 | Eval `--use-viterbi` | `false` |  | 评估时是否启用 |
 
-## 11) 训练日志输出（原始）
+## 12) 训练日志输出（原始）
 
 ```
 粘贴训练日志输出
 ```
 
-## 12) 评估结果（原始）
+## 13) 评估结果（原始）
 
 ```
 粘贴评估脚本输出
 ```
 
-## 13) 评估指标（训练/验证完成后填写）
+## 14) 评估指标（训练/验证完成后填写）
 
 | 指标 | 默认值 | 值 | 说明 |
 |---|---|---|---|
@@ -156,6 +185,6 @@ python scripts/train_bilevel.py ...
 | `yield_post` |  |  | refine 后良率 |
 | `runtime/epoch` |  |  | 每轮耗时 |
 
-## 14) 备注与结论
+## 15) 备注与结论
 
 填“观察到的现象 + 下一步计划”，避免只写数值。
