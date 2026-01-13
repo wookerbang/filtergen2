@@ -47,8 +47,8 @@ class FastTrackEngine:
         trainable: bool = False,
         max_ratio: float | None = 2.0,
         min_value: float = 1e-30,
-        q_L: float | None = 50.0,
-        q_C: float | None = 50.0,
+        q_L: float | None = None,
+        q_C: float | None = None,
         eps: float = 1e-30,
     ):
         return self._assembler.assemble(

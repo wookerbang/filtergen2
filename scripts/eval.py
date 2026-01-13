@@ -166,7 +166,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-ngspice", dest="use_ngspice", action="store_true", help="Use ngspice for evaluation (fallback to Fast Track).")
     p.add_argument("--no-ngspice", dest="use_ngspice", action="store_false", help="Disable ngspice; use Fast Track only.")
     p.set_defaults(use_ngspice=True)
-    p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
+    p.add_argument(
+        "--q",
+        type=float,
+        default=None,
+        help="Finite-Q loss model (applied to both L and C unless overridden); None disables loss (ideal).",
+    )
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
     p.add_argument(

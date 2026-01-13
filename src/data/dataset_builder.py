@@ -77,9 +77,9 @@ def build_dataset(
     dsl_use_cell_indices: bool = False,
     dsl_strict: bool = False,
     max_nodes: int = 32,
-    q_L: float | None = 50.0,
-    q_C: float | None = 50.0,
-    tol_frac: float = 0.05,
+    q_L: float | None = None,
+    q_C: float | None = None,
+    tol_frac: float = 0.0,
     q_model: str = "freq_dependent",
     check_insertion_loss: bool = True,
     filter_type_override: str | None = None,
@@ -168,7 +168,7 @@ def build_dataset(
                     q_model="freq_dependent",
                 )
 
-            # Input waveform: tolerance-perturbed + finite-Q loss model.
+            # Input waveform: optionally tolerance-perturbed and/or finite-Q (defaults are ideal/no-tolerance).
             real_components = _apply_tolerance(discrete_components)
             use_spice_real = bool(use_ngspice) and ((q_L is None and q_C is None) or str(q_model) == "fixed_ref")
             if use_spice_real:

@@ -110,7 +110,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refine-steps", type=int, default=50, help="Refinement steps.")
     p.add_argument("--refine-lr", type=float, default=5e-2, help="Refinement learning rate.")
     p.add_argument("--refine-max-ratio", type=float, default=2.0, help="Clamp value range: v in [v0/r, v0*r].")
-    p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
+    p.add_argument(
+        "--q",
+        type=float,
+        default=None,
+        help="Finite-Q loss model (applied to both L and C unless overridden); None disables loss (ideal).",
+    )
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
     p.add_argument(
@@ -135,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yield-ci", type=float, default=0.02, help="Target CI half-width (sequential).")
     p.add_argument("--yield-ci-method", choices=["wilson", "agresti_coull"], default="wilson")
     p.add_argument("--yield-score", choices=["mean", "ci_lower"], default="mean", help="Selection score for yield rerank.")
-    p.add_argument("--yield-tol", type=float, default=0.05, help="Tolerance fraction for yield Monte Carlo.")
+    p.add_argument("--yield-tol", type=float, default=0.0, help="Tolerance fraction for yield Monte Carlo.")
     p.add_argument("--yield-tol-l", type=float, default=None, help="Override L tolerance (None -> --yield-tol).")
     p.add_argument("--yield-tol-c", type=float, default=None, help="Override C tolerance (None -> --yield-tol).")
     p.add_argument("--yield-dist", choices=["uniform", "normal"], default="uniform", help="Tolerance distribution.")

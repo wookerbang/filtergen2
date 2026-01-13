@@ -37,10 +37,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help='Optional JSON mapping of scenario -> weight, e.g. \'{"general":0.3,"wideband_rejection":0.3}\'',
     )
-    p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
+    p.add_argument(
+        "--q",
+        type=float,
+        default=None,
+        help="Finite-Q loss model (applied to both L and C unless overridden); None disables loss (ideal).",
+    )
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
-    p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%%).")
+    p.add_argument("--tol", type=float, default=0.0, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%%).")
     p.add_argument(
         "--q-model",
         type=str,
