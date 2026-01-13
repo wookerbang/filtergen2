@@ -565,6 +565,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ste-topk", type=int, default=3, help="Top-k sparsity for STE soft mixing.")
     p.add_argument("--ste-topk-anneal-frac", type=float, default=0.2, help="Anneal top-k to 1 over last fraction.")
     p.add_argument("--ste-phys-weight", type=float, default=1.0, help="Weight for STE soft physics loss.")
+    p.add_argument(
+        "--oracle-macros",
+        action="store_true",
+        help="Use ground-truth macros for physics loss (diagnostic mode).",
+    )
 
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
@@ -737,6 +742,7 @@ def main() -> None:
         "ste_topk": args.ste_topk,
         "ste_topk_anneal_frac": args.ste_topk_anneal_frac,
         "ste_phys_weight": args.ste_phys_weight,
+        "oracle_macros": bool(args.oracle_macros),
         "c_reg_weight": args.c_reg_weight,
         "c_skip_penalty": args.c_skip_penalty,
         "c_redundant_penalty": args.c_redundant_penalty,
@@ -934,7 +940,40 @@ def main() -> None:
                         )
 
             physics_loss_soft = None
-            if args.ste_phys:
+            if args.oracle_macros:
+                physics_losses = []
+                for b in range(wave.shape[0]):
+                    macro_ids_oracle = macro_targets[b]
+                    if not bool((macro_ids_oracle != skip_id).any()):
+                        macro_ids_oracle = _enforce_non_empty(macro_ids_oracle, g_logits[b], skip_id)
+                    slot_mask = macro_slot_mask[macro_ids_oracle].to(dtype)
+                    circuit, slot_idx = circuit_cache.get(macro_ids_oracle)
+                    if args.use_unroll:
+                        loss_b = unroll_refine_slots(
+                            slot_raw[b],
+                            slot_mask,
+                            slot_idx,
+                            circuit,
+                            freq[b],
+                            target[b],
+                            steps=args.unroll_steps,
+                            lr=args.inner_lr,
+                            max_step=args.inner_max_step,
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                            nan_backoff=args.inner_nan_backoff,
+                            max_backoff=args.inner_nan_tries,
+                            create_graph=args.unroll_create_graph,
+                        )
+                    else:
+                        raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
+                        values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                        values_vec = values_flat.index_select(0, slot_idx)
+                        pred = circuit(freq[b], values=values_vec, output="s21_db")
+                        loss_b = F.mse_loss(pred, target[b])
+                    physics_losses.append(loss_b)
+                physics_loss = torch.stack(physics_losses).mean()
+            elif args.ste_phys:
                 if macro_bank is None or g_sparse is None:
                     raise ValueError("STE enabled but macro_bank/g_sparse not initialized.")
                 physics_losses_hard = []
