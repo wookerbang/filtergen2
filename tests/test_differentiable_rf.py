@@ -6,7 +6,12 @@ import torch
 from src.data.circuits import abcd_to_sparams, components_to_abcd, components_to_sparams_nodal
 from src.data.schema import ComponentSpec
 from src.physics import FastTrackEngine
-from src.physics.differentiable_rf import DifferentiablePhysicsKernel, DynamicCircuitAssembler, InferenceTimeOptimizer
+from src.physics.differentiable_rf import (
+    DifferentiablePhysicsKernel,
+    DynamicCircuitAssembler,
+    InferenceTimeOptimizer,
+    unroll_refine_slots,
+)
 
 
 class DifferentiableRFTests(unittest.TestCase):
@@ -109,6 +114,33 @@ class DifferentiableRFTests(unittest.TestCase):
         circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
         s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
         np.testing.assert_allclose(s21_db_engine, s21_db_t, rtol=0, atol=1e-9)
+
+    def test_unroll_create_graph_false_allows_outer_backward(self):
+        comps = self._ladder_components()
+        z0 = 50.0
+        assembler = DynamicCircuitAssembler(z0=z0)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
+        freq_hz = torch.logspace(6, 9, 32, dtype=torch.float64)
+        target = circuit(freq_hz, output="s21_db").detach()
+
+        # Use a minimal (K,S) slot tensor whose flattened length matches the circuit parameter count.
+        slot_raw = torch.full((len(comps), 1), -20.0, dtype=torch.float64, requires_grad=True)
+        slot_mask = torch.ones_like(slot_raw)
+        slot_idx = torch.arange(slot_raw.numel(), dtype=torch.long)
+        loss = unroll_refine_slots(
+            slot_raw,
+            slot_mask,
+            slot_idx,
+            circuit,
+            freq_hz,
+            target,
+            steps=3,
+            lr=1e-2,
+            create_graph=False,
+        )
+        loss.backward()
+        self.assertIsNotNone(slot_raw.grad)
+        self.assertTrue(torch.isfinite(slot_raw.grad).all().item())
 
     def test_q_model_adds_inductor_series_resistance(self):
         L = torch.tensor([10e-9], dtype=torch.float64).reshape(1, 1)  # (B,N)

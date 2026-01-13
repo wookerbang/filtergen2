@@ -1205,6 +1205,15 @@ def unroll_refine_slots(
 
     if loss is None:
         raise ValueError("unroll_refine_slots requires steps >= 1.")
+    # When create_graph=False, torch.autograd.grad frees the graph used to compute `loss`,
+    # so returning that `loss` and later calling outer `.backward()` will error.
+    # Recompute a fresh final loss without autograd.grad so the outer graph is intact.
+    if not bool(create_graph):
+        raw_flat = raw_flat.clamp(min=float(raw_min), max=float(raw_max))
+        values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
+        values_vec = values_flat.index_select(0, idx)
+        pred = circuit(freq_hz, values=values_vec, output="s21_db")
+        loss = F.mse_loss(pred, target_s21_db)
     if return_raw:
         return loss, raw_flat.view_as(raw)
     return loss
@@ -1289,6 +1298,24 @@ def unroll_refine_slots_mixed(
 
     if loss is None:
         raise ValueError("unroll_refine_slots_mixed requires steps >= 1.")
+    # Same outer-backward issue as unroll_refine_slots when create_graph=False.
+    if not bool(create_graph):
+        raw = raw.clamp(min=float(raw_min), max=float(raw_max))
+        pred = mixed_s21_db(
+            raw,
+            g_soft,
+            macro_bank,
+            freq_hz,
+            z0=z0,
+            q_L=q_L,
+            q_C=q_C,
+            q_model=q_model,
+            ref_freq_hz=ref_freq_hz,
+            eps=eps,
+            raw_min=None,
+            raw_max=None,
+        )
+        loss = F.mse_loss(pred, target_s21_db)
     if return_raw:
         return loss, raw
     return loss
