@@ -803,6 +803,21 @@ def main() -> None:
     target_wave = str(args.target_wave)
     if target_wave == "auto":
         target_wave = "real" if q_active else "ideal"
+    print(
+        f"[cfg] target_wave={target_wave} q_mode={args.q_mode} q_L_used={q_L} q_C_used={q_C} q_model={q_model}",
+        flush=True,
+    )
+    if target_wave == "ideal" and q_active:
+        print(
+            "[warn] target_wave=ideal but simulator Q is enabled; for a lossless fit use --q-mode cli (and leave --q unset), "
+            "or switch target to --target-wave real.",
+            flush=True,
+        )
+    if target_wave == "real" and not q_active:
+        print(
+            "[warn] target_wave=real but simulator Q is disabled; if you intended lossy training, generate/enable Q and use --q-mode data/cli.",
+            flush=True,
+        )
     macro_vocab, k_max = _scan_macro_vocab_and_k_from_sequences(
         dataset.macro_ir_macros,
         k_percentile=args.k_percentile,
