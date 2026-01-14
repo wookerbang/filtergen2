@@ -122,6 +122,10 @@ class FilterSample:
     action_tokens: Optional[List[str]] = None  # action-oriented construction tokens
     spec_id: Optional[int] = None
     circuit_id: Optional[int] = None
+    q_L: Optional[float] = None
+    q_C: Optional[float] = None
+    q_model: Optional[str] = None
+    tol_frac: Optional[float] = None
 
     def to_metadata_dict(self) -> Dict[str, Any]:
         """
@@ -151,6 +155,10 @@ class FilterSample:
             "asymmetry_factor": self.asymmetry_factor,
             "passband_min_db": self.passband_min_db,
             "stopband_max_db": self.stopband_max_db,
+            "q_L": self.q_L,
+            "q_C": self.q_C,
+            "q_model": self.q_model,
+            "tol_frac": self.tol_frac,
             "json_components": self.json_components,
             "vact_tokens": self.vact_tokens or [],
             "vact_struct_tokens": self.vact_struct_tokens or [],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from src.data.torch_dataset import FilterDesignDataset
 from src.data.vact_codec import make_vact_syntax_prefix_allowed_tokens_fn
 from src.data.vact_struct import make_vact_struct_prefix_allowed_tokens_fn
 from src.data.dsl import VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn
+from src.data.schema import ComponentSpec
 from src.data.token_decode import build_label_value_map, decode_components_from_token_ids
 from src.models import VACTT5
 from src.physics import FastTrackEngine
@@ -32,6 +34,44 @@ def _parse_csv_floats(s: str) -> List[float]:
 
 def _parse_csv_ints(s: str) -> List[int]:
     return [int(x) for x in s.split(",") if x.strip()]
+
+
+def _infer_fc_hz(freq_hz: np.ndarray, fc_hz: float | None) -> float:
+    if fc_hz is not None and fc_hz > 0.0 and np.isfinite(fc_hz):
+        return float(fc_hz)
+    if freq_hz.size == 0:
+        return 1.0
+    f_min = float(np.min(freq_hz))
+    f_max = float(np.max(freq_hz))
+    if f_min <= 0.0 or f_max <= 0.0:
+        return 1.0
+    return float(math.sqrt(f_min * f_max))
+
+
+def _phys_init_scale(fc_hz: float, *, base_bias: float, beta: float) -> float:
+    fc_safe = max(float(fc_hz), 1e-6)
+    raw_bias = -math.log(fc_safe * (2.0 * math.pi))
+    delta = raw_bias - float(base_bias)
+    return math.exp(float(beta) * delta)
+
+
+def _apply_phys_init_to_components(components: List[ComponentSpec], scale: float) -> List[ComponentSpec]:
+    out: List[ComponentSpec] = []
+    for c in components:
+        if c.ctype in ("L", "C"):
+            out.append(
+                ComponentSpec(
+                    ctype=c.ctype,
+                    role=c.role,
+                    value_si=float(c.value_si) * float(scale),
+                    std_label=c.std_label,
+                    node1=c.node1,
+                    node2=c.node2,
+                )
+            )
+        else:
+            out.append(c)
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +165,22 @@ def parse_args() -> argparse.Namespace:
         choices=["freq_dependent", "fixed_ref"],
         help="Fast Track Q model: freq_dependent (high fidelity) or fixed_ref (SPICE-like).",
     )
+    p.add_argument("--phys-init", action="store_true", help="Enable physics-aware init bias for BP/BS.")
+    p.add_argument("--phys-init-beta", type=float, default=1.0, help="Strength of physics-aware init bias.")
+    p.add_argument(
+        "--phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_true",
+        help="Apply physics init bias only to bandpass/bandstop samples.",
+    )
+    p.add_argument(
+        "--no-phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_false",
+        help="Apply physics init bias to all filter types.",
+    )
+    p.set_defaults(phys_init_bpbs_only=True)
+    p.add_argument("--phys-init-base-bias", type=float, default=-22.0, help="Baseline raw bias offset.")
     p.add_argument("--passband-min-db", type=float, default=-3.0, help="Passband lower bound for hinge loss.")
     p.add_argument("--stopband-max-db", type=float, default=-40.0, help="Stopband upper bound for hinge loss.")
     p.add_argument("--guide-weight", type=float, default=1e-2, help="MSE guidance weight for hinge loss.")
@@ -365,6 +421,16 @@ def main() -> None:
                     label_to_value=label_map,
                     slot_values=slot_values,
                 )
+                if args.phys_init and comps:
+                    ftype_id = int(filter_type.item())
+                    if (not args.phys_init_bpbs_only) or ftype_id in (2, 3):
+                        fc_val = _infer_fc_hz(freq, float(fc_hz.item()))
+                        scale = _phys_init_scale(
+                            fc_val,
+                            base_bias=float(args.phys_init_base_bias),
+                            beta=float(args.phys_init_beta),
+                        )
+                        comps = _apply_phys_init_to_components(comps, scale)
                 if not comps:
                     cand_records.append((float("inf"), None, None))
                     continue

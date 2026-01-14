@@ -56,3 +56,4 @@ wandb/
 runs/
 data/processed/v1/
 data/cache/
+settings.json

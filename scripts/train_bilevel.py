@@ -45,6 +45,15 @@ from src.physics.differentiable_rf import (
 )
 
 
+def _infer_dataset_field(samples: List[dict], key: str):
+    vals = {s.get(key) for s in samples if s.get(key) is not None}
+    if not vals:
+        return None
+    if len(vals) > 1:
+        print(f"[warn] dataset has multiple {key} values; using an arbitrary one.", flush=True)
+    return next(iter(vals))
+
+
 class BilevelDataset(Dataset):
     def __init__(
         self,
@@ -85,6 +94,10 @@ class BilevelDataset(Dataset):
         self.freq_mode = freq_mode
         self.freq_scale = freq_scale
         self.include_s11 = include_s11
+        self.q_L = _infer_dataset_field(self.samples, "q_L")
+        self.q_C = _infer_dataset_field(self.samples, "q_C")
+        self.q_model = _infer_dataset_field(self.samples, "q_model")
+        self.tol_frac = _infer_dataset_field(self.samples, "tol_frac")
         if log_every:
             print(f"[load] finished: {len(self.samples)} samples", flush=True)
 
@@ -185,6 +198,7 @@ class BilevelDataset(Dataset):
             "wave": wave,
             "scalar": scalar,
             "ideal_s21_db": ideal_s21,
+            "real_s21_db": real_s21,
             "dsl_tokens": dsl_tokens,
             "macro_ir_macros": self.macro_ir_macros[idx],
         }
@@ -306,10 +320,12 @@ def _build_circuit_and_indices(
     assembler: DynamicCircuitAssembler,
     device: torch.device,
     dtype: torch.dtype,
+    q_L: float | None,
+    q_C: float | None,
 ) -> Tuple[object, torch.Tensor]:
     macro_seq = [(i, id_to_macro[int(m)]) for i, m in enumerate(macro_ids.tolist()) if int(m) != skip_id]
     comps, slot_indices = _expand_macros_with_placeholders(macro_seq, slot_count)
-    circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype)
+    circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype, q_L=q_L, q_C=q_C)
     value_comp_indices = getattr(circuit, "value_comp_indices", None)
     if value_comp_indices is None:
         slot_idx_order = slot_indices
@@ -325,6 +341,8 @@ def _build_macro_bank(
     assembler: DynamicCircuitAssembler,
     device: torch.device,
     dtype: torch.dtype,
+    q_L: float | None,
+    q_C: float | None,
 ) -> List[MacroBankEntry]:
     entries: List[MacroBankEntry] = []
     op_map = {
@@ -356,7 +374,7 @@ def _build_macro_bank(
             for c in comps:
                 slot_idx = int(round(float(c.value_si) - base))
                 slot_indices.append(slot_idx)
-            circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype)
+            circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype, q_L=q_L, q_C=q_C)
             value_comp_indices = getattr(circuit, "value_comp_indices", None)
             if value_comp_indices is None:
                 slot_idx_order = slot_indices
@@ -385,6 +403,8 @@ class CircuitCache:
         slot_count: int,
         device: torch.device,
         dtype: torch.dtype,
+        q_L: float | None,
+        q_C: float | None,
     ) -> None:
         self.max_size = max(0, int(max_size))
         self.assembler = assembler
@@ -393,6 +413,8 @@ class CircuitCache:
         self.slot_count = slot_count
         self.device = device
         self.dtype = dtype
+        self.q_L = q_L
+        self.q_C = q_C
         self._cache: OrderedDict[tuple[int, ...], tuple[object, torch.Tensor]] = OrderedDict()
         self.hits = 0
         self.misses = 0
@@ -408,6 +430,8 @@ class CircuitCache:
                 assembler=self.assembler,
                 device=self.device,
                 dtype=self.dtype,
+                q_L=self.q_L,
+                q_C=self.q_C,
             )
         key = tuple(int(x) for x in macro_ids.tolist())
         hit = self._cache.get(key)
@@ -424,6 +448,8 @@ class CircuitCache:
             assembler=self.assembler,
             device=self.device,
             dtype=self.dtype,
+            q_L=self.q_L,
+            q_C=self.q_C,
         )
         self._cache[key] = (circuit, slot_idx)
         if len(self._cache) > self.max_size:
@@ -436,7 +462,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
         waves = torch.stack([b["wave"] for b in batch])
         scalars = torch.stack([b["scalar"] for b in batch])
         freq = torch.stack([b["freq"] for b in batch])
-        target = torch.stack([b["ideal_s21_db"] for b in batch])
+        ideal_target = torch.stack([b["ideal_s21_db"] for b in batch])
+        real_target = torch.stack([b["real_s21_db"] for b in batch])
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
         for i, b in enumerate(batch):
@@ -455,7 +482,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
             "filter_type": scalars[:, 0].long(),
             "fc_hz": scalars[:, 1],
             "freq": freq,
-            "target_s21_db": target,
+            "ideal_s21_db": ideal_target,
+            "real_s21_db": real_target,
             "macro_ids": macro_ids,
         }
 
@@ -504,6 +532,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s11", dest="include_s11", action="store_true", help="Include S11 channels.")
     p.add_argument("--no-s11", dest="include_s11", action="store_false", help="Disable S11 channels (default).")
     p.set_defaults(include_s11=False)
+    p.add_argument(
+        "--target-wave",
+        choices=["auto", "ideal", "real"],
+        default="auto",
+        help="Target S21 for physics loss: ideal_s21_db, real_s21_db, or auto (match Q).",
+    )
+    p.add_argument(
+        "--q-mode",
+        choices=["auto", "data", "cli"],
+        default="auto",
+        help="Select Q source: auto (prefer dataset if present), data (dataset only), cli (args only).",
+    )
+    p.add_argument(
+        "--q",
+        type=float,
+        default=None,
+        help="Finite-Q loss model (applied to both L and C unless overridden); None disables loss.",
+    )
+    p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
+    p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
+    p.add_argument(
+        "--q-model",
+        type=str,
+        default="freq_dependent",
+        choices=["freq_dependent", "fixed_ref"],
+        help="Q modeling for physics loss: freq_dependent or fixed_ref.",
+    )
     p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--hidden-mult", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
@@ -565,6 +620,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ste-topk", type=int, default=3, help="Top-k sparsity for STE soft mixing.")
     p.add_argument("--ste-topk-anneal-frac", type=float, default=0.2, help="Anneal top-k to 1 over last fraction.")
     p.add_argument("--ste-phys-weight", type=float, default=1.0, help="Weight for STE soft physics loss.")
+    p.add_argument("--phys-init", action="store_true", help="Enable physics-aware slot initialization bias.")
+    p.add_argument("--phys-init-beta", type=float, default=1.0, help="Strength of physics-aware init bias.")
+    p.add_argument(
+        "--phys-init-anneal-frac",
+        type=float,
+        default=0.0,
+        help="Anneal physics init bias to 0 over the last fraction of training (0 disables).",
+    )
+    p.add_argument(
+        "--phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_true",
+        help="Apply physics init bias only to bandpass/bandstop samples.",
+    )
+    p.add_argument(
+        "--no-phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_false",
+        help="Apply physics init bias to all filter types.",
+    )
+    p.set_defaults(phys_init_bpbs_only=True)
+    p.add_argument(
+        "--phys-init-base-bias",
+        type=float,
+        default=-22.0,
+        help="Baseline raw bias to offset when applying physics init.",
+    )
     p.add_argument(
         "--oracle-macros",
         action="store_true",
@@ -620,6 +702,53 @@ def _sparse_topk_probs(probs: torch.Tensor, k: int) -> torch.Tensor:
     return pruned / denom
 
 
+def _phys_init_beta_schedule(step: int, total_steps: int, *, beta: float, anneal_frac: float) -> float:
+    base = float(beta)
+    if base == 0.0 or float(anneal_frac) <= 0.0 or total_steps <= 0:
+        return base
+    start = max(0, int(total_steps * (1.0 - float(anneal_frac))))
+    if step <= start:
+        return base
+    denom = max(1, total_steps - start)
+    frac = min(1.0, float(step - start) / float(denom))
+    return base * (1.0 - frac)
+
+
+def _resolve_q(args: argparse.Namespace, dataset: BilevelDataset) -> tuple[float | None, float | None, str]:
+    q_l_cli = args.q if args.q_l is None else args.q_l
+    q_c_cli = args.q if args.q_c is None else args.q_c
+    q_model_cli = str(args.q_model)
+
+    data_q_l = getattr(dataset, "q_L", None)
+    data_q_c = getattr(dataset, "q_C", None)
+    data_q_model = getattr(dataset, "q_model", None)
+
+    mode = str(args.q_mode)
+    if mode == "cli":
+        return q_l_cli, q_c_cli, q_model_cli
+    if mode == "data":
+        if data_q_l is None and data_q_c is None:
+            print("[warn] q_mode=data but dataset has no Q; falling back to CLI values.", flush=True)
+            return q_l_cli, q_c_cli, q_model_cli
+        return data_q_l, data_q_c, str(data_q_model) if data_q_model is not None else q_model_cli
+    # auto: prefer dataset if present
+    if data_q_l is not None or data_q_c is not None:
+        return data_q_l, data_q_c, str(data_q_model) if data_q_model is not None else q_model_cli
+    return q_l_cli, q_c_cli, q_model_cli
+
+
+def _ref_freq_hz(freq_hz: torch.Tensor, fc_hz: torch.Tensor | float) -> torch.Tensor:
+    if isinstance(fc_hz, torch.Tensor):
+        if torch.isfinite(fc_hz).item() and fc_hz.item() > 0.0:
+            return fc_hz
+    else:
+        if math.isfinite(float(fc_hz)) and float(fc_hz) > 0.0:
+            return torch.tensor(float(fc_hz), device=freq_hz.device, dtype=freq_hz.dtype)
+    f_min = torch.min(freq_hz)
+    f_max = torch.max(freq_hz)
+    return torch.sqrt(f_min * f_max)
+
+
 def _resolve_ckpt(path: Path) -> Path:
     if path.is_file():
         return path
@@ -669,6 +798,11 @@ def main() -> None:
         include_s11=args.include_s11,
         log_every=args.load_log_steps,
     )
+    q_L, q_C, q_model = _resolve_q(args, dataset)
+    q_active = q_L is not None or q_C is not None
+    target_wave = str(args.target_wave)
+    if target_wave == "auto":
+        target_wave = "real" if q_active else "ideal"
     macro_vocab, k_max = _scan_macro_vocab_and_k_from_sequences(
         dataset.macro_ir_macros,
         k_percentile=args.k_percentile,
@@ -699,6 +833,14 @@ def main() -> None:
         "freq_mode": args.freq_mode,
         "freq_scale": args.freq_scale,
         "include_s11": bool(args.include_s11),
+        "target_wave": target_wave,
+        "q_mode": str(args.q_mode),
+        "q": args.q,
+        "q_l": args.q_l,
+        "q_c": args.q_c,
+        "q_model": str(q_model),
+        "q_L_used": q_L,
+        "q_C_used": q_C,
         "spec_mode": args.spec_mode,
         "d_model": args.d_model,
         "hidden_mult": args.hidden_mult,
@@ -742,6 +884,11 @@ def main() -> None:
         "ste_topk": args.ste_topk,
         "ste_topk_anneal_frac": args.ste_topk_anneal_frac,
         "ste_phys_weight": args.ste_phys_weight,
+        "phys_init": bool(args.phys_init),
+        "phys_init_beta": args.phys_init_beta,
+        "phys_init_anneal_frac": args.phys_init_anneal_frac,
+        "phys_init_bpbs_only": bool(args.phys_init_bpbs_only),
+        "phys_init_base_bias": args.phys_init_base_bias,
         "oracle_macros": bool(args.oracle_macros),
         "c_reg_weight": args.c_reg_weight,
         "c_skip_penalty": args.c_skip_penalty,
@@ -816,6 +963,8 @@ def main() -> None:
         slot_count=slot_count,
         device=device,
         dtype=dtype,
+        q_L=q_L,
+        q_C=q_C,
     )
     macro_bank = None
     if use_matrix_mix or args.ste_phys:
@@ -825,6 +974,8 @@ def main() -> None:
             assembler=assembler,
             device=device,
             dtype=dtype,
+            q_L=q_L,
+            q_C=q_C,
         )
 
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
@@ -856,7 +1007,10 @@ def main() -> None:
             filter_type = batch["filter_type"].to(device, non_blocking=non_blocking)
             fc_hz = batch["fc_hz"].to(device, dtype=dtype, non_blocking=non_blocking)
             freq = batch["freq"].to(device, dtype=dtype, non_blocking=non_blocking)
-            target = batch["target_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            if target_wave == "real":
+                target = batch["real_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            else:
+                target = batch["ideal_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             macro_targets = batch["macro_ids"].to(device, non_blocking=non_blocking)
             if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
                 skipped_nonfinite += 1
@@ -871,6 +1025,21 @@ def main() -> None:
                 g_logits = g_logits.float()
                 slot_raw = slot_raw.float()
             slot_raw = slot_raw.to(dtype)
+            if args.phys_init and float(args.phys_init_beta) != 0.0:
+                beta = _phys_init_beta_schedule(
+                    step,
+                    total_steps,
+                    beta=float(args.phys_init_beta),
+                    anneal_frac=float(args.phys_init_anneal_frac),
+                )
+                if beta != 0.0:
+                    fc_safe = fc_hz.clamp_min(1e-6)
+                    raw_bias = -torch.log(fc_safe * (2.0 * math.pi))
+                    delta = raw_bias - float(args.phys_init_base_bias)
+                    if bool(args.phys_init_bpbs_only):
+                        bpbs = (filter_type == 2) | (filter_type == 3)
+                        delta = delta * bpbs.to(delta.dtype)
+                    slot_raw = slot_raw + float(beta) * delta.view(-1, 1, 1)
             if not (torch.isfinite(g_logits).all() and torch.isfinite(slot_raw).all()):
                 skipped_nonfinite += 1
                 if not args.skip_nonfinite and skipped_nonfinite <= 3:
@@ -947,6 +1116,9 @@ def main() -> None:
                     if not bool((macro_ids_oracle != skip_id).any()):
                         macro_ids_oracle = _enforce_non_empty(macro_ids_oracle, g_logits[b], skip_id)
                     slot_mask = macro_slot_mask[macro_ids_oracle].to(dtype)
+                    ref_freq = None
+                    if q_active and str(q_model) == "fixed_ref":
+                        ref_freq = _ref_freq_hz(freq[b], fc_hz[b])
                     circuit, slot_idx = circuit_cache.get(macro_ids_oracle)
                     if args.use_unroll:
                         loss_b = unroll_refine_slots(
@@ -964,12 +1136,14 @@ def main() -> None:
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
                             create_graph=args.unroll_create_graph,
+                            q_model=str(q_model),
+                            ref_freq_hz=ref_freq,
                         )
                     else:
                         raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                         values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
-                        pred = circuit(freq[b], values=values_vec, output="s21_db")
+                        pred = circuit(freq[b], values=values_vec, output="s21_db", q_model=str(q_model), ref_freq_hz=ref_freq)
                         loss_b = F.mse_loss(pred, target[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
@@ -988,6 +1162,9 @@ def main() -> None:
                         hard_mask = macro_slot_mask[macro_ids_hard]
                     soft_mask = torch.matmul(g_soft[b], macro_slot_mask)
                     slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
+                    ref_freq = None
+                    if q_active and str(q_model) == "fixed_ref":
+                        ref_freq = _ref_freq_hz(freq[b], fc_hz[b])
                     circuit, slot_idx = circuit_cache.get(macro_ids_hard)
                     if args.use_unroll:
                         loss_hard = unroll_refine_slots(
@@ -1005,12 +1182,14 @@ def main() -> None:
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
                             create_graph=args.unroll_create_graph,
+                            q_model=str(q_model),
+                            ref_freq_hz=ref_freq,
                         )
                     else:
                         raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                         values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
-                        pred = circuit(freq[b], values=values_vec, output="s21_db")
+                        pred = circuit(freq[b], values=values_vec, output="s21_db", q_model=str(q_model), ref_freq_hz=ref_freq)
                         loss_hard = F.mse_loss(pred, target[b])
                     loss_soft = unroll_refine_slots_mixed(
                         slot_raw[b],
@@ -1026,6 +1205,10 @@ def main() -> None:
                         nan_backoff=args.inner_nan_backoff,
                         max_backoff=args.inner_nan_tries,
                         create_graph=args.unroll_create_graph,
+                        q_L=q_L,
+                        q_C=q_C,
+                        q_model=str(q_model),
+                        ref_freq_hz=ref_freq,
                     )
                     physics_losses_hard.append(loss_hard)
                     physics_losses_soft.append(loss_soft)
@@ -1035,6 +1218,9 @@ def main() -> None:
             else:
                 physics_losses = []
                 for b in range(wave.shape[0]):
+                    ref_freq = None
+                    if q_active and str(q_model) == "fixed_ref":
+                        ref_freq = _ref_freq_hz(freq[b], fc_hz[b])
                     if use_matrix_mix:
                         if macro_bank is None:
                             raise ValueError("matrix_mix enabled but macro_bank not initialized.")
@@ -1053,6 +1239,10 @@ def main() -> None:
                                 nan_backoff=args.inner_nan_backoff,
                                 max_backoff=args.inner_nan_tries,
                                 create_graph=args.unroll_create_graph,
+                                q_L=q_L,
+                                q_C=q_C,
+                                q_model=str(q_model),
+                                ref_freq_hz=ref_freq,
                             )
                         else:
                             pred = mixed_s21_db(
@@ -1062,6 +1252,10 @@ def main() -> None:
                                 freq[b],
                                 raw_min=args.inner_raw_min,
                                 raw_max=args.inner_raw_max,
+                                q_L=q_L,
+                                q_C=q_C,
+                                q_model=str(q_model),
+                                ref_freq_hz=ref_freq,
                             )
                             loss_b = F.mse_loss(pred, target[b])
                     else:
@@ -1091,12 +1285,14 @@ def main() -> None:
                                 nan_backoff=args.inner_nan_backoff,
                                 max_backoff=args.inner_nan_tries,
                                 create_graph=args.unroll_create_graph,
+                                q_model=str(q_model),
+                                ref_freq_hz=ref_freq,
                             )
                         else:
                             raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                             values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                             values_vec = values_flat.index_select(0, slot_idx)
-                            pred = circuit(freq[b], values=values_vec, output="s21_db")
+                            pred = circuit(freq[b], values=values_vec, output="s21_db", q_model=str(q_model), ref_freq_hz=ref_freq)
                             loss_b = F.mse_loss(pred, target[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()

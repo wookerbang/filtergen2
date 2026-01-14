@@ -305,6 +305,10 @@ def build_dataset(
                 macro_ir_macros=macro_ir_macros,
                 sfci_tokens=sfci_tokens,
                 action_tokens=action_tokens,
+                q_L=q_L,
+                q_C=q_C,
+                q_model=str(q_model) if q_model is not None else None,
+                tol_frac=float(tol_frac),
             )
 
             f.write(json.dumps(_serialize_sample(sample)) + "\n")

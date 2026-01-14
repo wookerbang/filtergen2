@@ -32,6 +32,15 @@ from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
 
 
+def _infer_dataset_field(samples: List[dict], key: str):
+    vals = {s.get(key) for s in samples if s.get(key) is not None}
+    if not vals:
+        return None
+    if len(vals) > 1:
+        print(f"[warn] dataset has multiple {key} values; using an arbitrary one.", flush=True)
+    return next(iter(vals))
+
+
 class BilevelEvalDataset(Dataset):
     def __init__(
         self,
@@ -67,6 +76,10 @@ class BilevelEvalDataset(Dataset):
         self.freq_mode = freq_mode
         self.freq_scale = freq_scale
         self.include_s11 = include_s11
+        self.q_L = _infer_dataset_field(self.samples, "q_L")
+        self.q_C = _infer_dataset_field(self.samples, "q_C")
+        self.q_model = _infer_dataset_field(self.samples, "q_model")
+        self.tol_frac = _infer_dataset_field(self.samples, "tol_frac")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -175,6 +188,7 @@ class BilevelEvalDataset(Dataset):
             "wave": wave,
             "scalar": scalar,
             "ideal_s21_db": ideal_s21,
+            "real_s21_db": real_s21,
             "mask_min_db": mask_min,
             "mask_max_db": mask_max,
         }
@@ -232,10 +246,12 @@ def _build_circuit_and_indices(
     assembler: DynamicCircuitAssembler,
     device: torch.device,
     dtype: torch.dtype,
+    q_L: float | None,
+    q_C: float | None,
 ) -> Tuple[object, torch.Tensor]:
     macro_seq = [(i, id_to_macro[int(m)]) for i, m in enumerate(macro_ids.tolist()) if int(m) != skip_id]
     comps, slot_indices = _expand_macros_with_placeholders(macro_seq, slot_count)
-    circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype)
+    circuit, _ = assembler.assemble(comps, trainable=False, device=device, dtype=dtype, q_L=q_L, q_C=q_C)
     value_comp_indices = getattr(circuit, "value_comp_indices", None)
     if value_comp_indices is None:
         slot_idx_order = slot_indices
@@ -253,6 +269,45 @@ def _mask_satisfied(pred_db: torch.Tensor, mask_min: torch.Tensor, mask_max: tor
 
 def _has_constraints(mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
     return bool(torch.isfinite(mask_min).any().item() or torch.isfinite(mask_max).any().item())
+
+
+def _resolve_q(args: argparse.Namespace, dataset: BilevelEvalDataset, cfg: dict) -> tuple[float | None, float | None, str]:
+    q_mode = args.q_mode or cfg.get("q_mode", "auto")
+    q_model_cli = str(args.q_model or cfg.get("q_model", "freq_dependent"))
+    q_l_cli = args.q if args.q_l is None else args.q_l
+    if args.q is None and args.q_l is None and args.q_c is None:
+        q_l_cli = cfg.get("q_L_used", cfg.get("q_l", None))
+    q_c_cli = args.q if args.q_c is None else args.q_c
+    if args.q is None and args.q_l is None and args.q_c is None:
+        q_c_cli = cfg.get("q_C_used", cfg.get("q_c", None))
+
+    data_q_l = getattr(dataset, "q_L", None)
+    data_q_c = getattr(dataset, "q_C", None)
+    data_q_model = getattr(dataset, "q_model", None)
+
+    if q_mode == "cli":
+        return q_l_cli, q_c_cli, q_model_cli
+    if q_mode == "data":
+        if data_q_l is None and data_q_c is None:
+            print("[warn] q_mode=data but dataset has no Q; falling back to CLI values.", flush=True)
+            return q_l_cli, q_c_cli, q_model_cli
+        return data_q_l, data_q_c, str(data_q_model) if data_q_model is not None else q_model_cli
+    # auto
+    if data_q_l is not None or data_q_c is not None:
+        return data_q_l, data_q_c, str(data_q_model) if data_q_model is not None else q_model_cli
+    return q_l_cli, q_c_cli, q_model_cli
+
+
+def _ref_freq_hz(freq_hz: torch.Tensor, fc_hz: torch.Tensor | float) -> torch.Tensor:
+    if isinstance(fc_hz, torch.Tensor):
+        if torch.isfinite(fc_hz).item() and fc_hz.item() > 0.0:
+            return fc_hz
+    else:
+        if math.isfinite(float(fc_hz)) and float(fc_hz) > 0.0:
+            return torch.tensor(float(fc_hz), device=freq_hz.device, dtype=freq_hz.dtype)
+    f_min = torch.min(freq_hz)
+    f_max = torch.max(freq_hz)
+    return torch.sqrt(f_min * f_max)
 
 
 def _resolve_ckpt(path: Path) -> Path:
@@ -314,6 +369,47 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wave-norm", dest="wave_norm", action="store_true")
     p.add_argument("--no-wave-norm", dest="wave_norm", action="store_false")
     p.set_defaults(wave_norm=False)
+    p.add_argument(
+        "--target-wave",
+        choices=["auto", "ideal", "real"],
+        default=None,
+        help="Target S21 for evaluation: ideal_s21_db, real_s21_db, or auto (match Q).",
+    )
+    p.add_argument(
+        "--q-mode",
+        choices=["auto", "data", "cli"],
+        default=None,
+        help="Select Q source: auto (prefer dataset if present), data (dataset only), cli (args only).",
+    )
+    p.add_argument("--q", type=float, default=None, help="Finite-Q loss model; None disables loss.")
+    p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
+    p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
+    p.add_argument(
+        "--q-model",
+        type=str,
+        default=None,
+        choices=["freq_dependent", "fixed_ref"],
+        help="Q modeling for eval: freq_dependent or fixed_ref.",
+    )
+    p.add_argument("--phys-init", dest="phys_init", action="store_true", help="Enable physics-aware slot init bias.")
+    p.add_argument("--no-phys-init", dest="phys_init", action="store_false", help="Disable physics-aware slot init bias.")
+    p.set_defaults(phys_init=None)
+    p.add_argument("--phys-init-beta", type=float, default=None, help="Strength of physics-aware init bias.")
+    p.add_argument("--phys-init-anneal-frac", type=float, default=None, help="Training anneal fraction (kept for parity).")
+    p.add_argument(
+        "--phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_true",
+        help="Apply physics init bias only to bandpass/bandstop samples.",
+    )
+    p.add_argument(
+        "--no-phys-init-bpbs-only",
+        dest="phys_init_bpbs_only",
+        action="store_false",
+        help="Apply physics init bias to all filter types.",
+    )
+    p.set_defaults(phys_init_bpbs_only=None)
+    p.add_argument("--phys-init-base-bias", type=float, default=None, help="Baseline raw bias offset.")
     p.add_argument("--unroll-steps", type=int, default=None)
     p.add_argument("--inner-lr", type=float, default=None)
     p.add_argument("--inner-max-step", type=float, default=None)
@@ -396,11 +492,24 @@ def main() -> None:
         dataset.samples = dataset.samples[:max_n]
         dataset.macro_ir_macros = dataset.macro_ir_macros[:max_n]
 
+    q_L, q_C, q_model = _resolve_q(args, dataset, cfg)
+    q_active = q_L is not None or q_C is not None
+    target_wave = args.target_wave or cfg.get("target_wave", "auto")
+    if target_wave == "auto":
+        target_wave = "real" if q_active else "ideal"
+    phys_init = bool(cfg.get("phys_init", False)) if args.phys_init is None else bool(args.phys_init)
+    phys_init_beta = float(cfg.get("phys_init_beta", 1.0)) if args.phys_init_beta is None else float(args.phys_init_beta)
+    phys_init_bpbs_only = (
+        bool(cfg.get("phys_init_bpbs_only", True)) if args.phys_init_bpbs_only is None else bool(args.phys_init_bpbs_only)
+    )
+    phys_init_base_bias = float(cfg.get("phys_init_base_bias", -22.0)) if args.phys_init_base_bias is None else float(args.phys_init_base_bias)
+
     def collate(batch: List[dict]) -> dict:
         return {
             "wave": torch.stack([b["wave"] for b in batch]),
             "freq": torch.stack([b["freq"] for b in batch]),
-            "target_s21_db": torch.stack([b["ideal_s21_db"] for b in batch]),
+            "ideal_s21_db": torch.stack([b["ideal_s21_db"] for b in batch]),
+            "real_s21_db": torch.stack([b["real_s21_db"] for b in batch]),
             "mask_min_db": torch.stack([b["mask_min_db"] for b in batch]),
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
@@ -493,7 +602,10 @@ def main() -> None:
     for batch in loader:
         wave = batch["wave"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         freq = batch["freq"].to(device=device, dtype=dtype, non_blocking=non_blocking)
-        target = batch["target_s21_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        if target_wave == "real":
+            target = batch["real_s21_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        else:
+            target = batch["ideal_s21_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         mask_min = batch["mask_min_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         mask_max = batch["mask_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         scalar = batch["scalar"].to(device=device, dtype=dtype, non_blocking=non_blocking)
@@ -506,6 +618,14 @@ def main() -> None:
             g_logits, slot_raw = model(wave, filter_type=filter_type, fc_hz=fc_hz)
         g_logits = g_logits.float()
         slot_raw = slot_raw.float()
+        if phys_init and phys_init_beta != 0.0:
+            fc_safe = fc_hz.clamp_min(1e-6)
+            raw_bias = -torch.log(fc_safe * (2.0 * math.pi))
+            delta = raw_bias - float(phys_init_base_bias)
+            if phys_init_bpbs_only:
+                bpbs = (filter_type == 2) | (filter_type == 3)
+                delta = delta * bpbs.to(delta.dtype)
+            slot_raw = slot_raw + float(phys_init_beta) * delta.view(-1, 1, 1)
 
         if use_viterbi:
             macro_ids = viterbi_decode(g_logits, c_hard)
@@ -542,6 +662,9 @@ def main() -> None:
                     continue
                 macro_ids_b = _enforce_non_empty(macro_ids[b], g_logits[b], skip_id)
                 slot_mask = macro_slot_mask[macro_ids_b].to(dtype)
+                ref_freq = None
+                if q_active and str(q_model) == "fixed_ref":
+                    ref_freq = _ref_freq_hz(freq[b], fc_hz[b])
                 circuit, slot_idx = _build_circuit_and_indices(
                     macro_ids_b,
                     id_to_macro=id_to_macro,
@@ -550,11 +673,13 @@ def main() -> None:
                     assembler=assembler,
                     device=device,
                     dtype=dtype,
+                    q_L=q_L,
+                    q_C=q_C,
                 )
                 raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
                 values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec = values_flat.index_select(0, slot_idx)
-                pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                pred_pre = circuit(freq[b], values=values_vec, output="s21_db", q_model=str(q_model), ref_freq_hz=ref_freq)
                 if not torch.isfinite(pred_pre).all():
                     nonfinite_pred_pre += 1
                     failed += 1
@@ -592,11 +717,13 @@ def main() -> None:
                     max_backoff=inner_nan_tries,
                     create_graph=False,
                     return_raw=True,
+                    q_model=str(q_model),
+                    ref_freq_hz=ref_freq,
                 )
                 raw_post = raw_post.to(dtype)
                 values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec_post = values_flat_post.index_select(0, slot_idx)
-                pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                pred_post = circuit(freq[b], values=values_vec_post, output="s21_db", q_model=str(q_model), ref_freq_hz=ref_freq)
                 if not torch.isfinite(pred_post).all():
                     nonfinite_pred_post += 1
                     failed += 1

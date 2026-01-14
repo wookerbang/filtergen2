@@ -1154,6 +1154,8 @@ def unroll_refine_slots(
     max_backoff: int = 3,
     create_graph: bool = True,
     return_raw: bool = False,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
+    ref_freq_hz: float | torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Differentiable unrolled refinement over per-cell slot values with stability guards.
@@ -1175,7 +1177,7 @@ def unroll_refine_slots(
         for _ in range(backoff_tries + 1):
             values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
             values_vec = values_flat.index_select(0, idx)
-            pred = circuit(freq_hz, values=values_vec, output="s21_db")
+            pred = circuit(freq_hz, values=values_vec, output="s21_db", q_model=q_model, ref_freq_hz=ref_freq_hz)
             loss = F.mse_loss(pred, target_s21_db)
             if not torch.isfinite(loss):
                 step_lr *= float(nan_backoff)
@@ -1212,7 +1214,7 @@ def unroll_refine_slots(
         raw_flat = raw_flat.clamp(min=float(raw_min), max=float(raw_max))
         values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
         values_vec = values_flat.index_select(0, idx)
-        pred = circuit(freq_hz, values=values_vec, output="s21_db")
+        pred = circuit(freq_hz, values=values_vec, output="s21_db", q_model=q_model, ref_freq_hz=ref_freq_hz)
         loss = F.mse_loss(pred, target_s21_db)
     if return_raw:
         return loss, raw_flat.view_as(raw)
