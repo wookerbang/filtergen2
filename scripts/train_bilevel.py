@@ -185,6 +185,7 @@ class BilevelDataset(Dataset):
             "wave": wave,
             "scalar": scalar,
             "ideal_s21_db": ideal_s21,
+            "real_s21_db": real_s21,
             "dsl_tokens": dsl_tokens,
             "macro_ir_macros": self.macro_ir_macros[idx],
         }
@@ -436,7 +437,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
         waves = torch.stack([b["wave"] for b in batch])
         scalars = torch.stack([b["scalar"] for b in batch])
         freq = torch.stack([b["freq"] for b in batch])
-        target = torch.stack([b["ideal_s21_db"] for b in batch])
+        ideal_target = torch.stack([b["ideal_s21_db"] for b in batch])
+        real_target = torch.stack([b["real_s21_db"] for b in batch])
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
         for i, b in enumerate(batch):
@@ -455,7 +457,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
             "filter_type": scalars[:, 0].long(),
             "fc_hz": scalars[:, 1],
             "freq": freq,
-            "target_s21_db": target,
+            "ideal_s21_db": ideal_target,
+            "real_s21_db": real_target,
             "macro_ids": macro_ids,
         }
 
@@ -497,6 +500,12 @@ def parse_args() -> argparse.Namespace:
 
     # input config
     p.add_argument("--use-wave", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"], default="ideal")
+    p.add_argument(
+        "--target-wave",
+        choices=["ideal", "real"],
+        default="ideal",
+        help="Target S21 for physics loss: ideal_s21_db or real_s21_db.",
+    )
     p.add_argument("--wave-norm", action="store_true")
     p.add_argument("--freq-mode", choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"], default="log_f_centered")
     p.add_argument("--freq-scale", choices=["none", "log_fc", "log_f_mean"], default="log_f_mean")
@@ -696,6 +705,7 @@ def main() -> None:
         "macro_vocab_size": len(macro_vocab),
         "slot_count": slot_count,
         "use_wave": args.use_wave,
+        "target_wave": args.target_wave,
         "freq_mode": args.freq_mode,
         "freq_scale": args.freq_scale,
         "include_s11": bool(args.include_s11),
@@ -830,6 +840,7 @@ def main() -> None:
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
     step = 0
     total_steps = int(args.epochs) * max(1, math.ceil(len(dataset) / max(1, args.batch_size)))
+    target_wave = str(args.target_wave)
 
     model.train()
     skipped_nonfinite = 0
@@ -856,7 +867,10 @@ def main() -> None:
             filter_type = batch["filter_type"].to(device, non_blocking=non_blocking)
             fc_hz = batch["fc_hz"].to(device, dtype=dtype, non_blocking=non_blocking)
             freq = batch["freq"].to(device, dtype=dtype, non_blocking=non_blocking)
-            target = batch["target_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            if target_wave == "real":
+                target = batch["real_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            else:
+                target = batch["ideal_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             macro_targets = batch["macro_ids"].to(device, non_blocking=non_blocking)
             if not (torch.isfinite(wave).all() and torch.isfinite(freq).all() and torch.isfinite(target).all()):
                 skipped_nonfinite += 1
