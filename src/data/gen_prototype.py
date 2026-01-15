@@ -37,6 +37,9 @@ def sample_base_spec(
     else:
         ftype = rng.choice(list(filter_type)).item()
     order_lo, order_hi = (int(order_range[0]), int(order_range[1]))
+    if ftype == "bandpass":
+        order_lo = max(order_lo, 4)
+        order_hi = max(order_hi, order_lo)
     order = int(rng.integers(order_lo, order_hi + 1))
     fc = float(10 ** rng.uniform(np.log10(float(fc_range_hz[0])), np.log10(float(fc_range_hz[1]))))
     ripple_db = float(rng.uniform(float(ripple_db_range[0]), float(ripple_db_range[1])))
@@ -346,12 +349,13 @@ def synthesize_cascade_bandpass(
     proto = str(spec.get("prototype_type") or "cheby1")
     topology = str(spec.get("topology_type") or "pi")
 
-    if order < 4:
-        order_lp = max(1, int(order // 2))
-        order_hp = max(1, int(order - order_lp))
-    else:
-        order_lp = int(rng.integers(2, int(order) - 1))  # [2, order-2]
-        order_hp = int(order - order_lp)
+    base_order = int(order)
+    if base_order < 4:
+        # Cascade needs >=2 sections per side to keep a valid series path.
+        base_order = 4
+        spec["order_effective"] = base_order
+    order_lp = int(rng.integers(2, base_order - 1))  # [2, order-2]
+    order_hp = int(base_order - order_lp)
 
     g_lp = get_g_values(order_lp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
     g_hp = get_g_values(order_hp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
