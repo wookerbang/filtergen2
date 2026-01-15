@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List
+from typing import List, Mapping
 
 import numpy as np
 import torch
@@ -85,6 +85,8 @@ def build_dataset(
     filter_type_override: str | None = None,
     prototype_type_override: str | None = None,
     topology_type_override: str | None = None,
+    spec_fixed: Mapping[str, object] | None = None,
+    spec_ranges: Mapping[str, object] | None = None,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -128,6 +130,8 @@ def build_dataset(
                 filter_type_override=str(filter_type_override) if filter_type_override is not None else None,
                 prototype_types_override=proto_override,
                 topology_type_override=str(topology_type_override) if topology_type_override is not None else None,
+                spec_fixed=spec_fixed,
+                spec_ranges=spec_ranges,
             )
             z0 = spec["z0"]
             if fast_engine is None or float(z0) != float(fast_engine.z0):
@@ -281,6 +285,7 @@ def build_dataset(
                 scenario=spec.get("scenario"),
                 scenario_id=spec.get("scenario_id"),
                 bw_frac=spec.get("bw_frac"),
+                freq_range=spec.get("freq_range"),
                 return_loss_min_db=spec.get("return_loss_min_db"),
                 notch_freq_hz=spec.get("notch_freq_hz"),
                 notch_depth_db=spec.get("notch_depth_db"),

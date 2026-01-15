@@ -28,7 +28,18 @@ class Wave2StructureModel(nn.Module):
         d_model: int = 512,
         hidden_mult: int = 2,
         dropout: float = 0.1,
-        spec_mode: Literal["type_fc", "none"] = "type_fc",
+        spec_mode: Literal[
+            "type_fc",
+            "type_fc_bw",
+            "type_fc_bw_ripple",
+            "type_fc_bw_ripple_stop",
+            "type_fc_bw_ripple_stop_order",
+            "type_fmin_fmax",
+            "type_fmin_fmax_ripple",
+            "type_fmin_fmax_ripple_stop",
+            "type_fmin_fmax_ripple_stop_order",
+            "none",
+        ] = "type_fc",
         attn_heads: Optional[int] = None,
         gate_skip_bias: float = 0.0,
         use_role_queries: bool = False,
@@ -40,12 +51,25 @@ class Wave2StructureModel(nn.Module):
         self.macro_vocab_size = int(macro_vocab_size)
         self.slot_count = int(slot_count)
         self.use_role_queries = bool(use_role_queries)
+        self.spec_mode = str(spec_mode)
 
         self.wave_encoder = MultiScaleWaveformEncoder(d_model=d_model, in_channels=waveform_in_channels, dropout=dropout)
+        spec_mode = str(spec_mode)
+        spec_dims = {
+            "type_fc": 1,
+            "type_fc_bw": 2,
+            "type_fc_bw_ripple": 3,
+            "type_fc_bw_ripple_stop": 4,
+            "type_fc_bw_ripple_stop_order": 5,
+            "type_fmin_fmax": 2,
+            "type_fmin_fmax_ripple": 3,
+            "type_fmin_fmax_ripple_stop": 4,
+            "type_fmin_fmax_ripple_stop_order": 5,
+        }
         if spec_mode == "none":
             self.spec_encoder = None
-        elif spec_mode == "type_fc":
-            self.spec_encoder = SpecEncoder(d_model=d_model, type_vocab_size=4)
+        elif spec_mode in spec_dims:
+            self.spec_encoder = SpecEncoder(d_model=d_model, type_vocab_size=4, spec_dim=spec_dims[spec_mode])
         else:
             raise ValueError(f"Unknown spec_mode: {spec_mode}")
 
@@ -93,13 +117,77 @@ class Wave2StructureModel(nn.Module):
         wave: torch.Tensor,
         filter_type: Optional[torch.Tensor] = None,
         fc_hz: Optional[torch.Tensor] = None,
+        f_min_hz: Optional[torch.Tensor] = None,
+        f_max_hz: Optional[torch.Tensor] = None,
+        bw_frac: Optional[torch.Tensor] = None,
+        ripple_db: Optional[torch.Tensor] = None,
+        stopband_max_db: Optional[torch.Tensor] = None,
+        order: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         wave_feat = self.wave_encoder(wave)  # (B, L, d)
         if self.spec_encoder is not None:
-            if filter_type is None or fc_hz is None:
-                raise ValueError("Spec encoder enabled but filter_type/fc_hz not provided.")
-            log_fc = torch.log10(fc_hz.clamp_min(1e-6))
-            spec_vec = self.spec_encoder(filter_type, log_fc).to(wave_feat.dtype)
+            if filter_type is None:
+                raise ValueError("Spec encoder enabled but filter_type not provided.")
+            eps = 1e-6
+            if fc_hz is None:
+                fc_hz = f_min_hz if f_min_hz is not None else f_max_hz
+            if f_min_hz is None:
+                f_min_hz = fc_hz
+            if f_max_hz is None:
+                f_max_hz = fc_hz
+            log_fc = torch.log10(fc_hz.clamp_min(eps)) if fc_hz is not None else None
+            log_fmin = torch.log10(f_min_hz.clamp_min(eps))
+            log_fmax = torch.log10(f_max_hz.clamp_min(eps))
+
+            if bw_frac is None:
+                bw_frac = (f_max_hz - f_min_hz) / (fc_hz.clamp_min(eps) if fc_hz is not None else f_max_hz)
+            log_bw = torch.log10(bw_frac.clamp_min(1e-4))
+
+            if ripple_db is None:
+                ripple_db = torch.zeros_like(log_fmin)
+            log_ripple = torch.log10(ripple_db.clamp_min(1e-3))
+
+            if stopband_max_db is None:
+                stopband_max_db = torch.zeros_like(log_fmin)
+            stop_depth = (-stopband_max_db).clamp_min(1e-3)
+            log_stop = torch.log10(stop_depth)
+
+            if order is None:
+                order = torch.ones_like(log_fmin)
+            log_order = torch.log10(order.clamp_min(1.0))
+
+            if self.spec_mode == "type_fc":
+                if log_fc is None:
+                    raise ValueError("Spec encoder type_fc requires fc_hz.")
+                spec_vals = log_fc
+            elif self.spec_mode == "type_fc_bw":
+                if log_fc is None:
+                    raise ValueError("Spec encoder type_fc_bw requires fc_hz.")
+                spec_vals = torch.stack([log_fc, log_bw], dim=-1)
+            elif self.spec_mode == "type_fc_bw_ripple":
+                if log_fc is None:
+                    raise ValueError("Spec encoder type_fc_bw_ripple requires fc_hz.")
+                spec_vals = torch.stack([log_fc, log_bw, log_ripple], dim=-1)
+            elif self.spec_mode == "type_fc_bw_ripple_stop":
+                if log_fc is None:
+                    raise ValueError("Spec encoder type_fc_bw_ripple_stop requires fc_hz.")
+                spec_vals = torch.stack([log_fc, log_bw, log_ripple, log_stop], dim=-1)
+            elif self.spec_mode == "type_fc_bw_ripple_stop_order":
+                if log_fc is None:
+                    raise ValueError("Spec encoder type_fc_bw_ripple_stop_order requires fc_hz.")
+                spec_vals = torch.stack([log_fc, log_bw, log_ripple, log_stop, log_order], dim=-1)
+            elif self.spec_mode == "type_fmin_fmax":
+                spec_vals = torch.stack([log_fmin, log_fmax], dim=-1)
+            elif self.spec_mode == "type_fmin_fmax_ripple":
+                spec_vals = torch.stack([log_fmin, log_fmax, log_ripple], dim=-1)
+            elif self.spec_mode == "type_fmin_fmax_ripple_stop":
+                spec_vals = torch.stack([log_fmin, log_fmax, log_ripple, log_stop], dim=-1)
+            elif self.spec_mode == "type_fmin_fmax_ripple_stop_order":
+                spec_vals = torch.stack([log_fmin, log_fmax, log_ripple, log_stop, log_order], dim=-1)
+            else:
+                raise ValueError(f"Unknown spec_mode: {self.spec_mode}")
+
+            spec_vec = self.spec_encoder(filter_type, spec_vals).to(wave_feat.dtype)
             wave_feat = torch.cat([spec_vec.unsqueeze(1), wave_feat], dim=1)
 
         batch = wave_feat.size(0)

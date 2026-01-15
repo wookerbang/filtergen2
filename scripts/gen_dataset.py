@@ -104,6 +104,30 @@ def parse_args() -> argparse.Namespace:
         help="Fix topology type for all samples.",
     )
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
+    p.add_argument("--bp-order-lp", type=int, help="Force LP order for cascade BP (requires bandpass).")
+    p.add_argument("--bp-order-hp", type=int, help="Force HP order for cascade BP (requires bandpass).")
+    p.add_argument(
+        "--bp-cascade-order",
+        type=str,
+        choices=["random", "lp_hp", "hp_lp"],
+        help="Fix cascade order for BP (lp_hp or hp_lp).",
+    )
+    p.add_argument(
+        "--spec-fixed",
+        type=str,
+        help=(
+            "Optional JSON mapping to override spec fields, e.g. "
+            "'{\"order\":4,\"fc_hz\":1e9,\"bw_frac\":0.2,\"ripple_db\":0.1}'."
+        ),
+    )
+    p.add_argument(
+        "--spec-ranges",
+        type=str,
+        help=(
+            "Optional JSON mapping of ranges, e.g. "
+            "'{\"order\":[2,6],\"fc_hz\":[1e8,1e9],\"bw_frac\":[0.05,0.2],\"ripple_db\":[0.1,0.5]}'."
+        ),
+    )
     return p.parse_args()
 
 
@@ -117,6 +141,27 @@ def main() -> None:
             scenario_weights = json.loads(args.scenario_weights)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid --scenario-weights JSON: {exc}") from exc
+    spec_fixed = None
+    if args.spec_fixed:
+        try:
+            spec_fixed = json.loads(args.spec_fixed)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid --spec-fixed JSON: {exc}") from exc
+    spec_ranges = None
+    if args.spec_ranges:
+        try:
+            spec_ranges = json.loads(args.spec_ranges)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid --spec-ranges JSON: {exc}") from exc
+    if args.bp_order_lp is not None or args.bp_order_hp is not None or args.bp_cascade_order is not None:
+        if spec_fixed is None:
+            spec_fixed = {}
+        if args.bp_order_lp is not None:
+            spec_fixed["bp_order_lp"] = int(args.bp_order_lp)
+        if args.bp_order_hp is not None:
+            spec_fixed["bp_order_hp"] = int(args.bp_order_hp)
+        if args.bp_cascade_order is not None:
+            spec_fixed["bp_cascade_order"] = str(args.bp_cascade_order)
     path = build_dataset(
         num_samples=args.num_samples,
         output_dir=str(args.output_dir),
@@ -143,6 +188,8 @@ def main() -> None:
         filter_type_override=args.filter_type,
         prototype_type_override=args.prototype_type,
         topology_type_override=args.topology_type,
+        spec_fixed=spec_fixed,
+        spec_ranges=spec_ranges,
     )
     print(f"Dataset written to {path}")
 

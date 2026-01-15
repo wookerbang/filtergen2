@@ -37,6 +37,9 @@ def sample_base_spec(
     else:
         ftype = rng.choice(list(filter_type)).item()
     order_lo, order_hi = (int(order_range[0]), int(order_range[1]))
+    if ftype == "bandpass":
+        order_lo = max(order_lo, 4)
+        order_hi = max(order_hi, order_lo)
     order = int(rng.integers(order_lo, order_hi + 1))
     fc = float(10 ** rng.uniform(np.log10(float(fc_range_hz[0])), np.log10(float(fc_range_hz[1]))))
     ripple_db = float(rng.uniform(float(ripple_db_range[0]), float(ripple_db_range[1])))
@@ -45,14 +48,21 @@ def sample_base_spec(
     if ftype == "bandstop" and "t" in topology_types:
         topology_type = "t"
     bw_frac = None
+    freq_range = None
     if ftype in ("bandpass", "bandstop"):
         bw_frac = float(rng.uniform(float(bw_frac_range[0]), float(bw_frac_range[1])))
+        f_min = fc * (1.0 - 0.5 * bw_frac)
+        f_max = fc * (1.0 + 0.5 * bw_frac)
+        if f_min <= 0:
+            f_min = fc / 10.0
+        freq_range = [float(f_min), float(f_max)]
     return {
         "filter_type": ftype,
         "prototype_type": prototype_type,
         "order": order,
         "fc_hz": fc,
         "bw_frac": bw_frac,
+        "freq_range": freq_range,
         "z0": float(z0),
         "ripple_db": ripple_db,
         "topology_type": topology_type,
@@ -286,6 +296,123 @@ def denormalize_bandstop_to_LC(
     return comps
 
 
+def _map_node_name(node: str, *, node_map: Dict[str, str], prefix: str | None = None) -> str:
+    if node in node_map:
+        return node_map[node]
+    if node in ("in", "out", "gnd"):
+        return node
+    if prefix:
+        return f"{prefix}_{node}"
+    return node
+
+
+def _remap_components(
+    components: Sequence[ComponentSpec],
+    *,
+    node_map: Dict[str, str],
+    prefix: str | None = None,
+) -> List[ComponentSpec]:
+    remapped: List[ComponentSpec] = []
+    for c in components:
+        n1 = _map_node_name(c.node1, node_map=node_map, prefix=prefix)
+        n2 = _map_node_name(c.node2, node_map=node_map, prefix=prefix)
+        remapped.append(ComponentSpec(c.ctype, c.role, c.value_si, c.std_label, n1, n2))
+    return remapped
+
+
+def synthesize_cascade_bandpass(
+    spec: Dict[str, object],
+    order: int,
+    z0: float,
+    *,
+    rng: np.random.Generator | None = None,
+) -> List[ComponentSpec]:
+    """
+    Wideband BP via LP+HP cascade.
+
+    Requires spec["freq_range"] = [f_min, f_max]. Falls back to fc/bw if missing.
+    """
+    rng = rng or np.random.default_rng()
+    freq_range = spec.get("freq_range")
+    if freq_range is not None:
+        f_min, f_max = float(freq_range[0]), float(freq_range[1])
+    else:
+        fc = float(spec.get("fc_hz") or 1.0)
+        bw = float(spec.get("bw_frac") or 0.2)
+        f_min = fc * (1.0 - 0.5 * bw)
+        f_max = fc * (1.0 + 0.5 * bw)
+    if f_min <= 0 or f_max <= 0:
+        raise ValueError(f"Invalid freq_range for cascade bandpass: [{f_min}, {f_max}]")
+    if f_min >= f_max:
+        f_min, f_max = f_max, f_min
+
+    proto = str(spec.get("prototype_type") or "cheby1")
+    topology = str(spec.get("topology_type") or "pi")
+
+    base_order = int(order)
+    if base_order < 4:
+        # Cascade needs >=2 sections per side to keep a valid series path.
+        base_order = 4
+        spec["order_effective"] = base_order
+    order_lp_override = spec.get("bp_order_lp")
+    order_hp_override = spec.get("bp_order_hp")
+    orders_overridden = order_lp_override is not None or order_hp_override is not None
+    order_lp: int
+    order_hp: int
+    if order_lp_override is None and order_hp_override is None:
+        order_lp = int(rng.integers(2, base_order - 1))  # [2, order-2]
+        order_hp = int(base_order - order_lp)
+    else:
+        if order_lp_override is not None:
+            order_lp = int(order_lp_override)
+        else:
+            order_lp = -1
+        if order_hp_override is not None:
+            order_hp = int(order_hp_override)
+        else:
+            order_hp = -1
+        if order_lp < 0 and order_hp < 0:
+            order_lp = int(rng.integers(2, base_order - 1))
+            order_hp = int(base_order - order_lp)
+        elif order_lp < 0:
+            order_hp = max(0, order_hp)
+            order_lp = int(base_order - order_hp)
+        elif order_hp < 0:
+            order_lp = max(0, order_lp)
+            order_hp = int(base_order - order_lp)
+        if order_lp + order_hp != base_order:
+            base_order = int(order_lp + order_hp)
+            spec["order_effective"] = base_order
+        if orders_overridden:
+            spec["order"] = base_order
+        if order_lp < 2 or order_hp < 2:
+            raise ValueError(
+                f"Invalid BP cascade orders: order_lp={order_lp}, order_hp={order_hp}. Each must be >=2."
+            )
+
+    g_lp = get_g_values(order_lp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
+    g_hp = get_g_values(order_hp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
+
+    comps_lp = denormalize_lowpass_to_LC(g_lp, f_max, z0, topology)
+    comps_hp = denormalize_highpass_to_LC(g_hp, f_min, z0, topology)
+
+    order_mode = str(spec.get("bp_cascade_order") or "random").lower()
+    if order_mode in ("lp_hp", "lp-hp", "lp->hp", "lphp"):
+        first, second = comps_lp, comps_hp
+    elif order_mode in ("hp_lp", "hp-lp", "hp->lp", "hplp"):
+        first, second = comps_hp, comps_lp
+    else:
+        if rng.random() < 0.5:
+            first, second = comps_lp, comps_hp
+        else:
+            first, second = comps_hp, comps_lp
+
+    join_node = "bp_join"
+    first_remap = _remap_components(first, node_map={"out": join_node}, prefix=None)
+    second_remap = _remap_components(second, node_map={"in": join_node, "out": "out"}, prefix="bp2")
+    return first_remap + second_remap
+
+
 def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     """根据 filter_type/prototype_type 将原型 g 值映射到具体 LC 电路。"""
     g = get_g_values(spec["order"], spec["ripple_db"], prototype_type=spec["prototype_type"])
@@ -295,8 +422,7 @@ def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     if ftype == "highpass":
         return denormalize_highpass_to_LC(g, spec["fc_hz"], spec["z0"], spec["topology_type"])
     if ftype == "bandpass":
-        fbw = float(spec.get("bw_frac") or 0.2)
-        return denormalize_bandpass_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])
+        return synthesize_cascade_bandpass(spec, int(spec["order"]), float(spec["z0"]))
     if ftype == "bandstop":
         fbw = float(spec.get("bw_frac") or spec.get("stopband_bw_frac") or 0.2)
         return denormalize_bandstop_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])

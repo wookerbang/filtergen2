@@ -78,6 +78,78 @@ def _resolve_topology_types_override(override: Optional[str]) -> Sequence[str] |
     return [str(override)]
 
 
+def _parse_range(val: object) -> tuple[float, float] | None:
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)) and len(val) >= 2:
+        return float(val[0]), float(val[1])
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return None
+    return fval, fval
+
+
+def _apply_spec_overrides(
+    spec: Dict[str, object],
+    *,
+    spec_fixed: Mapping[str, object] | None,
+    spec_ranges: Mapping[str, object] | None,
+    rng: np.random.Generator,
+) -> Dict[str, object]:
+    if spec_ranges:
+        order_range = _parse_range(spec_ranges.get("order"))
+        if order_range is not None:
+            lo, hi = int(round(order_range[0])), int(round(order_range[1]))
+            lo = max(1, lo)
+            hi = max(lo, hi)
+            spec["order"] = int(rng.integers(lo, hi + 1))
+
+        fc_range = _parse_range(spec_ranges.get("fc_hz"))
+        if fc_range is not None:
+            lo, hi = float(fc_range[0]), float(fc_range[1])
+            lo = max(1e-12, lo)
+            hi = max(lo, hi)
+            spec["fc_hz"] = float(10 ** rng.uniform(np.log10(lo), np.log10(hi)))
+
+        ripple_range = _parse_range(spec_ranges.get("ripple_db"))
+        if ripple_range is not None:
+            lo, hi = float(ripple_range[0]), float(ripple_range[1])
+            lo = max(1e-6, lo)
+            hi = max(lo, hi)
+            spec["ripple_db"] = float(rng.uniform(lo, hi))
+
+        bw_range = _parse_range(spec_ranges.get("bw_frac"))
+        if bw_range is not None:
+            lo, hi = float(bw_range[0]), float(bw_range[1])
+            lo = max(1e-4, lo)
+            hi = max(lo, hi)
+            spec["bw_frac"] = float(rng.uniform(lo, hi))
+
+    if spec_fixed:
+        spec.update(spec_fixed)
+
+    ftype = str(spec.get("filter_type", "lowpass"))
+    if ftype == "bandpass":
+        order = int(spec.get("order") or 0)
+        if order < 4:
+            spec["order"] = 4
+            spec["order_effective"] = 4
+
+    if ftype in ("bandpass", "bandstop") and spec.get("freq_range") is None:
+        fc = float(spec.get("fc_hz", 1.0))
+        bw = spec.get("bw_frac") or spec.get("stopband_bw_frac")
+        if bw is not None and fc > 0.0:
+            bw = float(bw)
+            f_min = fc * (1.0 - 0.5 * bw)
+            f_max = fc * (1.0 + 0.5 * bw)
+            if f_min <= 0:
+                f_min = fc / 10.0
+            spec["freq_range"] = [float(f_min), float(f_max)]
+
+    return spec
+
+
 def sample_general_spec(
     rng: np.random.Generator,
     *,
@@ -361,6 +433,8 @@ def sample_scenario_spec(
     filter_type_override: Optional[str] = None,
     prototype_types_override: Optional[Sequence[str]] = None,
     topology_type_override: Optional[str] = None,
+    spec_fixed: Mapping[str, object] | None = None,
+    spec_ranges: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     rng = rng or np.random.default_rng()
     if scenario is None or str(scenario).lower() == "random":
@@ -371,11 +445,17 @@ def sample_scenario_spec(
     scenario = str(scenario)
     if scenario not in SCENARIO_SAMPLERS:
         raise ValueError(f"Unknown scenario: {scenario}")
-    return SCENARIO_SAMPLERS[scenario](
+    spec = SCENARIO_SAMPLERS[scenario](
         rng,
         filter_type_override=filter_type_override,
         prototype_types_override=prototype_types_override,
         topology_type_override=topology_type_override,
+    )
+    return _apply_spec_overrides(
+        spec,
+        spec_fixed=spec_fixed,
+        spec_ranges=spec_ranges,
+        rng=rng,
     )
 
 
