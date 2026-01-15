@@ -348,11 +348,14 @@ class DifferentiablePhysicsKernel:
         Returns (S11, S21, S12, S22), each shape (...,F) complex.
         """
         denom = A + B / z0 + C * z0 + D
-        denom = denom + eps
-        S11 = (A + B / z0 - C * z0 - D) / denom
-        S21 = 2.0 / denom
-        S12 = 2.0 * (A * D - B * C) / denom
-        S22 = (-A + B / z0 - C * z0 + D) / denom
+        # Safe complex division: num * conj(denom) / (|denom|^2 + eps)
+        denom_mag_sq = denom.real * denom.real + denom.imag * denom.imag
+        denom_mag_sq = denom_mag_sq + eps
+        denom_conj = torch.conj(denom)
+        S11 = (A + B / z0 - C * z0 - D) * denom_conj / denom_mag_sq
+        S21 = 2.0 * denom_conj / denom_mag_sq
+        S12 = 2.0 * (A * D - B * C) * denom_conj / denom_mag_sq
+        S22 = (-A + B / z0 - C * z0 + D) * denom_conj / denom_mag_sq
         return S11, S21, S12, S22
 
     @staticmethod
