@@ -45,14 +45,21 @@ def sample_base_spec(
     if ftype == "bandstop" and "t" in topology_types:
         topology_type = "t"
     bw_frac = None
+    freq_range = None
     if ftype in ("bandpass", "bandstop"):
         bw_frac = float(rng.uniform(float(bw_frac_range[0]), float(bw_frac_range[1])))
+        f_min = fc * (1.0 - 0.5 * bw_frac)
+        f_max = fc * (1.0 + 0.5 * bw_frac)
+        if f_min <= 0:
+            f_min = fc / 10.0
+        freq_range = [float(f_min), float(f_max)]
     return {
         "filter_type": ftype,
         "prototype_type": prototype_type,
         "order": order,
         "fc_hz": fc,
         "bw_frac": bw_frac,
+        "freq_range": freq_range,
         "z0": float(z0),
         "ripple_db": ripple_db,
         "topology_type": topology_type,
@@ -286,6 +293,83 @@ def denormalize_bandstop_to_LC(
     return comps
 
 
+def _map_node_name(node: str, *, node_map: Dict[str, str], prefix: str | None) -> str:
+    if node in node_map:
+        return node_map[node]
+    if node in ("in", "out", "gnd"):
+        return node
+    if prefix:
+        return f"{prefix}_{node}"
+    return node
+
+
+def _remap_components(
+    components: Sequence[ComponentSpec],
+    *,
+    node_map: Dict[str, str],
+    prefix: str | None = None,
+) -> List[ComponentSpec]:
+    remapped: List[ComponentSpec] = []
+    for c in components:
+        n1 = _map_node_name(c.node1, node_map=node_map, prefix=prefix)
+        n2 = _map_node_name(c.node2, node_map=node_map, prefix=prefix)
+        remapped.append(ComponentSpec(c.ctype, c.role, c.value_si, c.std_label, n1, n2))
+    return remapped
+
+
+def synthesize_cascade_bandpass(
+    spec: Dict[str, object],
+    order: int,
+    z0: float,
+    *,
+    rng: np.random.Generator | None = None,
+) -> List[ComponentSpec]:
+    """
+    Wideband BP via LP+HP cascade.
+
+    Requires spec["freq_range"] = [f_min, f_max]. Falls back to fc/bw if missing.
+    """
+    rng = rng or np.random.default_rng()
+    freq_range = spec.get("freq_range")
+    if freq_range is not None:
+        f_min, f_max = float(freq_range[0]), float(freq_range[1])
+    else:
+        fc = float(spec.get("fc_hz") or 1.0)
+        bw = float(spec.get("bw_frac") or 0.2)
+        f_min = fc * (1.0 - 0.5 * bw)
+        f_max = fc * (1.0 + 0.5 * bw)
+    if f_min <= 0 or f_max <= 0:
+        raise ValueError(f"Invalid freq_range for cascade bandpass: [{f_min}, {f_max}]")
+    if f_min >= f_max:
+        f_min, f_max = f_max, f_min
+
+    proto = str(spec.get("prototype_type") or "cheby1")
+    topology = str(spec.get("topology_type") or "pi")
+
+    if order < 4:
+        order_lp = max(1, int(order // 2))
+        order_hp = max(1, int(order - order_lp))
+    else:
+        order_lp = int(rng.integers(2, int(order) - 1))  # [2, order-2]
+        order_hp = int(order - order_lp)
+
+    g_lp = get_g_values(order_lp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
+    g_hp = get_g_values(order_hp, float(spec.get("ripple_db") or 0.5), prototype_type=proto)
+
+    comps_lp = denormalize_lowpass_to_LC(g_lp, f_max, z0, topology)
+    comps_hp = denormalize_highpass_to_LC(g_hp, f_min, z0, topology)
+
+    if rng.random() < 0.5:
+        first, second = comps_lp, comps_hp
+    else:
+        first, second = comps_hp, comps_lp
+
+    join_node = "bp_join"
+    first_remap = _remap_components(first, node_map={"out": join_node}, prefix=None)
+    second_remap = _remap_components(second, node_map={"in": join_node, "out": "out"}, prefix="bp2")
+    return first_remap + second_remap
+
+
 def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     """根据 filter_type/prototype_type 将原型 g 值映射到具体 LC 电路。"""
     g = get_g_values(spec["order"], spec["ripple_db"], prototype_type=spec["prototype_type"])
@@ -295,8 +379,7 @@ def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     if ftype == "highpass":
         return denormalize_highpass_to_LC(g, spec["fc_hz"], spec["z0"], spec["topology_type"])
     if ftype == "bandpass":
-        fbw = float(spec.get("bw_frac") or 0.2)
-        return denormalize_bandpass_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])
+        return synthesize_cascade_bandpass(spec, int(spec["order"]), float(spec["z0"]))
     if ftype == "bandstop":
         fbw = float(spec.get("bw_frac") or spec.get("stopband_bw_frac") or 0.2)
         return denormalize_bandstop_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])

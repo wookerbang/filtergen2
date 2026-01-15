@@ -41,6 +41,41 @@ def _infer_dataset_field(samples: List[dict], key: str):
     return next(iter(vals))
 
 
+def _resolve_fmin_fmax(sample: dict, fc_hz: float) -> tuple[float, float]:
+    freq_range = sample.get("freq_range")
+    if freq_range and len(freq_range) >= 2:
+        f_min = float(freq_range[0])
+        f_max = float(freq_range[1])
+    else:
+        bw = sample.get("bw_frac") or sample.get("stopband_bw_frac")
+        if bw is not None and fc_hz > 0.0:
+            f_min = fc_hz * (1.0 - 0.5 * float(bw))
+            f_max = fc_hz * (1.0 + 0.5 * float(bw))
+        else:
+            f_min = fc_hz
+            f_max = fc_hz
+    if not math.isfinite(f_min) or f_min <= 0.0:
+        f_min = max(fc_hz, 1.0)
+    if not math.isfinite(f_max) or f_max <= 0.0:
+        f_max = max(fc_hz, 1.0)
+    if f_min > f_max:
+        f_min, f_max = f_max, f_min
+    return f_min, f_max
+
+
+def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> float:
+    bw = sample.get("bw_frac") or sample.get("stopband_bw_frac")
+    if bw is None:
+        if fc_hz > 0.0:
+            bw = (f_max - f_min) / fc_hz
+        else:
+            bw = 0.0
+    try:
+        return float(bw)
+    except Exception:
+        return 0.0
+
+
 class BilevelEvalDataset(Dataset):
     def __init__(
         self,
@@ -171,6 +206,11 @@ class BilevelEvalDataset(Dataset):
         type_map = {"lowpass": 0, "highpass": 1, "bandpass": 2, "bandstop": 3}
         type_id = type_map.get(ftype, 0)
         scalar = torch.tensor([type_id, fc_hz], dtype=torch.float32)
+        f_min_hz, f_max_hz = _resolve_fmin_fmax(s, fc_hz)
+        bw_frac = _resolve_bw_frac(s, fc_hz, f_min_hz, f_max_hz)
+        ripple_db = float(s.get("ripple_db", 0.5) or 0.5)
+        stopband_max_db = float(s.get("stopband_max_db", -40.0) or -40.0)
+        order = float(s.get("order", 0.0) or 0.0)
 
         mask_min = s.get("mask_min_db")
         mask_max = s.get("mask_max_db")
@@ -187,6 +227,12 @@ class BilevelEvalDataset(Dataset):
             "freq": freq,
             "wave": wave,
             "scalar": scalar,
+            "f_min_hz": float(f_min_hz),
+            "f_max_hz": float(f_max_hz),
+            "bw_frac": float(bw_frac),
+            "ripple_db": float(ripple_db),
+            "stopband_max_db": float(stopband_max_db),
+            "order": float(order),
             "ideal_s21_db": ideal_s21,
             "real_s21_db": real_s21,
             "mask_min_db": mask_min,
@@ -363,7 +409,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-wave", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"], default=None)
     p.add_argument("--freq-mode", choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"], default=None)
     p.add_argument("--freq-scale", choices=["none", "log_fc", "log_f_mean"], default=None)
-    p.add_argument("--spec-mode", choices=["none", "type_fc"], default=None)
+    p.add_argument(
+        "--spec-mode",
+        choices=[
+            "none",
+            "type_fc",
+            "type_fc_bw",
+            "type_fc_bw_ripple",
+            "type_fc_bw_ripple_stop",
+            "type_fc_bw_ripple_stop_order",
+            "type_fmin_fmax",
+            "type_fmin_fmax_ripple",
+            "type_fmin_fmax_ripple_stop",
+            "type_fmin_fmax_ripple_stop_order",
+        ],
+        default=None,
+    )
     p.add_argument("--no-s11", dest="include_s11", action="store_false")
     p.set_defaults(include_s11=None)
     p.add_argument("--wave-norm", dest="wave_norm", action="store_true")
@@ -513,6 +574,12 @@ def main() -> None:
             "mask_min_db": torch.stack([b["mask_min_db"] for b in batch]),
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
+            "f_min_hz": torch.tensor([b["f_min_hz"] for b in batch], dtype=torch.float32),
+            "f_max_hz": torch.tensor([b["f_max_hz"] for b in batch], dtype=torch.float32),
+            "bw_frac": torch.tensor([b["bw_frac"] for b in batch], dtype=torch.float32),
+            "ripple_db": torch.tensor([b["ripple_db"] for b in batch], dtype=torch.float32),
+            "stopband_max_db": torch.tensor([b["stopband_max_db"] for b in batch], dtype=torch.float32),
+            "order": torch.tensor([b["order"] for b in batch], dtype=torch.float32),
             "dsl_tokens": [b["dsl_tokens"] for b in batch],
             "macro_ir_macros": [b.get("macro_ir_macros") for b in batch],
         }
@@ -609,13 +676,29 @@ def main() -> None:
         mask_min = batch["mask_min_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         mask_max = batch["mask_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         scalar = batch["scalar"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        f_min_hz = batch["f_min_hz"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        f_max_hz = batch["f_max_hz"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        bw_frac = batch["bw_frac"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        ripple_db = batch["ripple_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        stopband_max_db = batch["stopband_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        order = batch["order"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         dsl_tokens = batch["dsl_tokens"]
         macro_ir_macros = batch.get("macro_ir_macros")
         filter_type = scalar[:, 0].long()
         fc_hz = scalar[:, 1]
 
         with torch.no_grad():
-            g_logits, slot_raw = model(wave, filter_type=filter_type, fc_hz=fc_hz)
+            g_logits, slot_raw = model(
+                wave,
+                filter_type=filter_type,
+                fc_hz=fc_hz,
+                f_min_hz=f_min_hz,
+                f_max_hz=f_max_hz,
+                bw_frac=bw_frac,
+                ripple_db=ripple_db,
+                stopband_max_db=stopband_max_db,
+                order=order,
+            )
         g_logits = g_logits.float()
         slot_raw = slot_raw.float()
         if phys_init and phys_init_beta != 0.0:

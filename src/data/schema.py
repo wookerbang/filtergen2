@@ -92,6 +92,7 @@ class FilterSample:
     scenario: Optional[str] = None
     scenario_id: Optional[int] = None
     bw_frac: Optional[float] = None
+    freq_range: Optional[Tuple[float, float]] = None
     return_loss_min_db: Optional[float] = None
     notch_freq_hz: Optional[float] = None
     notch_depth_db: Optional[float] = None
@@ -148,6 +149,7 @@ class FilterSample:
             "scenario": self.scenario,
             "scenario_id": self.scenario_id,
             "bw_frac": self.bw_frac,
+            "freq_range": list(self.freq_range) if self.freq_range is not None else None,
             "return_loss_min_db": self.return_loss_min_db,
             "notch_freq_hz": self.notch_freq_hz,
             "notch_depth_db": self.notch_depth_db,

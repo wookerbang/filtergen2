@@ -281,6 +281,7 @@ def build_dataset(
                 scenario=spec.get("scenario"),
                 scenario_id=spec.get("scenario_id"),
                 bw_frac=spec.get("bw_frac"),
+                freq_range=spec.get("freq_range"),
                 return_loss_min_db=spec.get("return_loss_min_db"),
                 notch_freq_hz=spec.get("notch_freq_hz"),
                 notch_depth_db=spec.get("notch_depth_db"),
