@@ -35,8 +35,6 @@ def waveform_error(
     """
     Compute a scalar error between two S21 magnitude responses.
 
-    For tight-tolerance success@τ, the recommended default is "mae_lin"
-    (mean absolute error in linear magnitude).
     """
     pred_db = np.asarray(pred_s21_db, dtype=float)
     tgt_db = np.asarray(target_s21_db, dtype=float)
@@ -99,4 +97,3 @@ def passivity_metrics(S: np.ndarray, *, tol: float = 1e-6) -> PassivityMetrics:
         violation_max=float(np.max(viol)) if viol.size else 0.0,
         violation_mean=float(np.mean(viol)) if viol.size else 0.0,
     )
-

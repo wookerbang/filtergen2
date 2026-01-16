@@ -559,6 +559,57 @@ def build_spec_masks(
     return mask_min, mask_max, passband_min_db, stopband_max_db
 
 
+def build_data_driven_masks(
+    freq_hz: np.ndarray,
+    target_s21_db: np.ndarray,
+    *,
+    margin_pass: float = 1.0,
+    margin_stop: float = 5.0,
+    passband_drop_db: float = 3.0,
+    stopband_thresh_db: float = -20.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build relaxed spec masks directly from target S21 curve (data-driven).
+
+    Passband: target >= max(target) - passband_drop_db.
+    Stopband: target <= stopband_thresh_db (fallback to min(target) + margin_stop).
+    Transition: unconstrained (NaN).
+    """
+    f = np.asarray(freq_hz, dtype=float).reshape(-1)
+    target = np.asarray(target_s21_db, dtype=float).reshape(-1)
+    if f.shape != target.shape:
+        raise ValueError(f"freq_hz and target_s21_db shape mismatch: {f.shape} vs {target.shape}")
+
+    mask_min = np.full_like(target, np.nan, dtype=float)
+    mask_max = np.full_like(target, np.nan, dtype=float)
+
+    finite = np.isfinite(target)
+    if not np.any(finite):
+        return mask_min, mask_max
+
+    max_db = float(np.max(target[finite]))
+    pass_thresh = max_db - float(passband_drop_db)
+    pass_mask = finite & (target >= pass_thresh)
+
+    stop_thresh = float(stopband_thresh_db)
+    stop_mask = finite & (target <= stop_thresh)
+    if not np.any(stop_mask):
+        min_db = float(np.min(target[finite]))
+        stop_thresh = min_db + float(margin_stop)
+        stop_mask = finite & (target <= stop_thresh)
+
+    stop_mask = stop_mask & ~pass_mask
+
+    if np.any(pass_mask):
+        mask_min[pass_mask] = target[pass_mask] - float(margin_pass)
+        mask_max[pass_mask] = np.minimum(0.0, target[pass_mask] + float(margin_pass))
+
+    if np.any(stop_mask):
+        mask_max[stop_mask] = target[stop_mask] + float(margin_stop)
+
+    return mask_min, mask_max
+
+
 def apply_scenario_postprocess(
     components: Iterable[object],
     spec: MutableMapping[str, object],

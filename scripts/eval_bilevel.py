@@ -29,7 +29,7 @@ from src.data.dsl import (
 )
 from src.utils.macro_transition import build_transition_matrices, viterbi_decode
 from src.models import Wave2StructureModel
-from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
+from src.physics.differentiable_rf import DynamicCircuitAssembler, calc_yield, unroll_refine_slots
 
 
 def _resolve_fmin_fmax(sample: dict, fc_hz: float) -> tuple[float, float]:
@@ -288,13 +288,6 @@ def _build_circuit_and_indices(
     else:
         slot_idx_order = [slot_indices[int(i)] for i in value_comp_indices]
     return circuit, torch.tensor(slot_idx_order, device=device, dtype=torch.long)
-
-
-def _mask_satisfied(pred_db: torch.Tensor, mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
-    ok = torch.ones_like(pred_db, dtype=torch.bool)
-    ok &= torch.isnan(mask_min) | (pred_db >= mask_min)
-    ok &= torch.isnan(mask_max) | (pred_db <= mask_max)
-    return bool(ok.all().item())
 
 
 def _has_constraints(mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
@@ -772,18 +765,21 @@ def main() -> None:
 
                 if _has_constraints(mask_min[b], mask_max[b]):
                     yield_total += 1
-                    if _mask_satisfied(target[b], mask_min[b], mask_max[b]):
+                    oracle_pass, _ = calc_yield(target[b], mask_min[b], mask_max[b])
+                    pre_pass, _ = calc_yield(pred_pre, mask_min[b], mask_max[b])
+                    post_pass, _ = calc_yield(pred_post, mask_min[b], mask_max[b])
+                    if bool(oracle_pass.item()):
                         yield_oracle_pass += 1
-                    if _mask_satisfied(pred_pre, mask_min[b], mask_max[b]):
+                    if bool(pre_pass.item()):
                         yield_pre_pass += 1
-                    if _mask_satisfied(pred_post, mask_min[b], mask_max[b]):
+                    if bool(post_pass.item()):
                         yield_post_pass += 1
                     group["yield_total"] += 1
-                    if _mask_satisfied(target[b], mask_min[b], mask_max[b]):
+                    if bool(oracle_pass.item()):
                         group["yield_oracle"] += 1
-                    if _mask_satisfied(pred_pre, mask_min[b], mask_max[b]):
+                    if bool(pre_pass.item()):
                         group["yield_pre"] += 1
-                    if _mask_satisfied(pred_post, mask_min[b], mask_max[b]):
+                    if bool(post_pass.item()):
                         group["yield_post"] += 1
             except Exception:
                 failed += 1

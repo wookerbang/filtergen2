@@ -40,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
-    p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%%).")
     p.add_argument(
         "--q-model",
         type=str,
@@ -182,7 +181,6 @@ def main() -> None:
         max_nodes=int(args.max_nodes),
         q_L=q_l,
         q_C=q_c,
-        tol_frac=float(args.tol),
         q_model=str(args.q_model),
         check_insertion_loss=bool(args.il_check),
         filter_type_override=args.filter_type,

@@ -36,6 +36,8 @@ from src.data.dsl import (
 from src.utils.macro_transition import build_transition_matrices, expected_transition_penalty
 from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import (
+    barrier_loss,
+    calc_yield,
     DynamicCircuitAssembler,
     DifferentiablePhysicsKernel,
     MacroBankEntry,
@@ -219,6 +221,15 @@ class BilevelDataset(Dataset):
         stopband_max_db = float(s.get("stopband_max_db", -40.0) or -40.0)
         order = float(s.get("order", 0.0) or 0.0)
 
+        mask_min = s.get("mask_min_db")
+        mask_max = s.get("mask_max_db")
+        if mask_min is None:
+            mask_min = [float("nan")] * len(freq)
+        if mask_max is None:
+            mask_max = [float("nan")] * len(freq)
+        mask_min = torch.tensor(mask_min, dtype=torch.float32)
+        mask_max = torch.tensor(mask_max, dtype=torch.float32)
+
         dsl_tokens = s.get("dsl_tokens") or []
         return {
             "freq": freq,
@@ -232,6 +243,8 @@ class BilevelDataset(Dataset):
             "order": float(order),
             "ideal_s21_db": ideal_s21,
             "real_s21_db": real_s21,
+            "mask_min_db": mask_min,
+            "mask_max_db": mask_max,
             "dsl_tokens": dsl_tokens,
             "macro_ir_macros": self.macro_ir_macros[idx],
         }
@@ -491,6 +504,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
         ripple_db = torch.tensor([b["ripple_db"] for b in batch], dtype=torch.float32)
         stopband_max_db = torch.tensor([b["stopband_max_db"] for b in batch], dtype=torch.float32)
         order = torch.tensor([b["order"] for b in batch], dtype=torch.float32)
+        mask_min_db = torch.stack([b["mask_min_db"] for b in batch])
+        mask_max_db = torch.stack([b["mask_max_db"] for b in batch])
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
         for i, b in enumerate(batch):
@@ -517,6 +532,8 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
             "freq": freq,
             "ideal_s21_db": ideal_target,
             "real_s21_db": real_target,
+            "mask_min_db": mask_min_db,
+            "mask_max_db": mask_max_db,
             "macro_ids": macro_ids,
         }
 
@@ -625,6 +642,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-nan-backoff", type=float, default=0.5)
     p.add_argument("--inner-nan-tries", type=int, default=3)
     p.add_argument("--phys-weight", type=float, default=1e-2)
+    p.add_argument("--barrier-weight", type=float, default=1.0, help="Barrier loss weight (MSE + w*barrier).")
     p.add_argument("--len-weight", type=float, default=1e-3)
     p.add_argument("--gumbel-tau", type=float, default=1.0)
     p.add_argument("--gumbel-tau-min", type=float, default=None)
@@ -817,6 +835,7 @@ def main() -> None:
         "inner_nan_backoff": args.inner_nan_backoff,
         "inner_nan_tries": args.inner_nan_tries,
         "phys_weight": args.phys_weight,
+        "barrier_weight": args.barrier_weight,
         "gumbel_tau": args.gumbel_tau,
         "gumbel_tau_min": args.gumbel_tau_min,
         "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
@@ -914,6 +933,15 @@ def main() -> None:
     step = 0
     total_steps = int(args.epochs) * max(1, math.ceil(len(dataset) / max(1, args.batch_size)))
     target_wave = str(args.target_wave)
+    barrier_weight = float(args.barrier_weight)
+    inner_raw_min = float(args.inner_raw_min)
+    inner_raw_max = float(args.inner_raw_max)
+
+    def _physics_loss(pred_db: torch.Tensor, target_db: torch.Tensor, mask_min: torch.Tensor, mask_max: torch.Tensor) -> torch.Tensor:
+        loss_val = F.mse_loss(pred_db, target_db)
+        if barrier_weight > 0.0:
+            loss_val = loss_val + float(barrier_weight) * barrier_loss(pred_db, mask_min, mask_max)
+        return loss_val
 
     model.train()
     skipped_nonfinite = 0
@@ -934,6 +962,8 @@ def main() -> None:
         epoch_sym = 0.0
         epoch_alpha = 0.0
         epoch_tau = 0.0
+        epoch_yield_pass = 0
+        epoch_yield_total = 0
         for batch in loader:
             step += 1
             wave = batch["wave"].to(device, dtype=dtype, non_blocking=non_blocking)
@@ -946,6 +976,8 @@ def main() -> None:
             stopband_max_db = batch["stopband_max_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             order = batch["order"].to(device, dtype=dtype, non_blocking=non_blocking)
             freq = batch["freq"].to(device, dtype=dtype, non_blocking=non_blocking)
+            mask_min_db = batch["mask_min_db"].to(device, dtype=dtype, non_blocking=non_blocking)
+            mask_max_db = batch["mask_max_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             if target_wave == "real":
                 target = batch["real_s21_db"].to(device, dtype=dtype, non_blocking=non_blocking)
             else:
@@ -1017,6 +1049,8 @@ def main() -> None:
                 sym_loss = model.query_symmetry_loss(core_only=bool(args.sym_core_only)).to(dtype)
 
             metric_note = ""
+            yield_pass = 0
+            yield_total = 0
             if args.log_train_metrics or args.log_epoch_metrics:
                 with torch.no_grad():
                     pred_ids = torch.argmax(g_logits, dim=-1)
@@ -1030,6 +1064,21 @@ def main() -> None:
                     len_tgt = macro_targets.ne(skip_id).sum(dim=1)
                     len_abs = float((len_pred.float() - len_tgt.float()).abs().sum().item())
                     len_exact = float(len_pred.eq(len_tgt).float().sum().item())
+                    for b in range(wave.shape[0]):
+                        has_constraints = bool(torch.isfinite(mask_min_db[b]).any().item() or torch.isfinite(mask_max_db[b]).any().item())
+                        if not has_constraints:
+                            continue
+                        macro_ids_b = _enforce_non_empty(pred_ids[b], g_logits[b], skip_id)
+                        slot_mask = macro_slot_mask[macro_ids_b].to(dtype)
+                        circuit, slot_idx = circuit_cache.get(macro_ids_b)
+                        raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
+                        values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                        values_vec = values_flat.index_select(0, slot_idx)
+                        pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                        pass_mask, _ = calc_yield(pred_pre, mask_min_db[b], mask_max_db[b])
+                        yield_total += 1
+                        yield_pass += int(pass_mask.item())
+                    yield_rate = yield_pass / yield_total if yield_total else 0.0
                     if args.log_train_metrics:
                         macro_acc = correct_count / tokens if tokens else 0.0
                         macro_non_skip_acc = non_skip_correct / non_skip_count if non_skip_count else 0.0
@@ -1040,7 +1089,10 @@ def main() -> None:
                             f" mac_ns={macro_non_skip_acc:.3f}"
                             f" len_mae={len_mae:.3f}"
                             f" len_exact={len_exact_rate:.3f}"
+                            f" yield={yield_rate:.3f}"
                         )
+                    elif args.log_epoch_metrics:
+                        metric_note = f" yield={yield_rate:.3f}"
 
             physics_loss_soft = None
             if args.oracle_macros:
@@ -1067,13 +1119,16 @@ def main() -> None:
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
                             create_graph=args.unroll_create_graph,
+                            mask_min_db=mask_min_db[b],
+                            mask_max_db=mask_max_db[b],
+                            barrier_weight=barrier_weight,
                         )
                     else:
                         raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                         values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
                         pred = circuit(freq[b], values=values_vec, output="s21_db")
-                        loss_b = F.mse_loss(pred, target[b])
+                        loss_b = _physics_loss(pred, target[b], mask_min_db[b], mask_max_db[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
             elif args.ste_phys:
@@ -1108,13 +1163,16 @@ def main() -> None:
                             nan_backoff=args.inner_nan_backoff,
                             max_backoff=args.inner_nan_tries,
                             create_graph=args.unroll_create_graph,
+                            mask_min_db=mask_min_db[b],
+                            mask_max_db=mask_max_db[b],
+                            barrier_weight=barrier_weight,
                         )
                     else:
                         raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                         values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
                         pred = circuit(freq[b], values=values_vec, output="s21_db")
-                        loss_hard = F.mse_loss(pred, target[b])
+                        loss_hard = _physics_loss(pred, target[b], mask_min_db[b], mask_max_db[b])
                     loss_soft = unroll_refine_slots_mixed(
                         slot_raw[b],
                         g_sparse[b],
@@ -1129,6 +1187,9 @@ def main() -> None:
                         nan_backoff=args.inner_nan_backoff,
                         max_backoff=args.inner_nan_tries,
                         create_graph=args.unroll_create_graph,
+                        mask_min_db=mask_min_db[b],
+                        mask_max_db=mask_max_db[b],
+                        barrier_weight=barrier_weight,
                     )
                     physics_losses_hard.append(loss_hard)
                     physics_losses_soft.append(loss_soft)
@@ -1156,6 +1217,9 @@ def main() -> None:
                                 nan_backoff=args.inner_nan_backoff,
                                 max_backoff=args.inner_nan_tries,
                                 create_graph=args.unroll_create_graph,
+                                mask_min_db=mask_min_db[b],
+                                mask_max_db=mask_max_db[b],
+                                barrier_weight=barrier_weight,
                             )
                         else:
                             pred = mixed_s21_db(
@@ -1166,7 +1230,7 @@ def main() -> None:
                                 raw_min=args.inner_raw_min,
                                 raw_max=args.inner_raw_max,
                             )
-                            loss_b = F.mse_loss(pred, target[b])
+                            loss_b = _physics_loss(pred, target[b], mask_min_db[b], mask_max_db[b])
                     else:
                         g_hard = F.gumbel_softmax(g_logits[b], tau=float(tau), hard=True, dim=-1)
                         macro_ids_raw = torch.argmax(g_hard, dim=-1)
@@ -1194,13 +1258,16 @@ def main() -> None:
                                 nan_backoff=args.inner_nan_backoff,
                                 max_backoff=args.inner_nan_tries,
                                 create_graph=args.unroll_create_graph,
+                                mask_min_db=mask_min_db[b],
+                                mask_max_db=mask_max_db[b],
+                                barrier_weight=barrier_weight,
                             )
                         else:
                             raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
                             values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                             values_vec = values_flat.index_select(0, slot_idx)
                             pred = circuit(freq[b], values=values_vec, output="s21_db")
-                            loss_b = F.mse_loss(pred, target[b])
+                            loss_b = _physics_loss(pred, target[b], mask_min_db[b], mask_max_db[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
 
@@ -1243,6 +1310,8 @@ def main() -> None:
                 epoch_sym += float(sym_loss.item()) * batch_size
                 epoch_alpha += float(alpha_used) * batch_size
                 epoch_tau += float(tau) * batch_size
+                epoch_yield_pass += yield_pass
+                epoch_yield_total += yield_total
             loss.backward()
 
             if step % int(args.grad_accum) == 0:
@@ -1298,6 +1367,7 @@ def main() -> None:
             avg_sym = epoch_sym / float(epoch_samples)
             avg_alpha = epoch_alpha / float(epoch_samples)
             avg_tau = epoch_tau / float(epoch_samples)
+            avg_yield = epoch_yield_pass / epoch_yield_total if epoch_yield_total else 0.0
             reg_note = ""
             ste_note = ""
             if float(args.c_reg_weight) > 0.0:
@@ -1311,7 +1381,7 @@ def main() -> None:
                 f"[epoch {epoch+1}] avg loss={avg_loss:.4f} phys={avg_phys:.4f} "
                 f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
                 f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
-                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f}" + reg_note + ste_note
+                f"len_mae={len_mae:.3f} len_exact={len_exact:.3f} yield={avg_yield:.3f}" + reg_note + ste_note
             )
         ckpt = args.output / f"epoch_{epoch+1}"
         ckpt.mkdir(parents=True, exist_ok=True)

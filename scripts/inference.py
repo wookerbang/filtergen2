@@ -23,7 +23,8 @@ from src.data.dsl import VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn
 from src.data.token_decode import build_label_value_map, decode_components_from_token_ids
 from src.models import VACTT5
 from src.physics import FastTrackEngine
-from src.eval.yield_analysis import build_spec_masks, estimate_yield_mc, estimate_yield_sequential, prepare_yield_spec
+from src.physics.differentiable_rf import calc_yield
+from src.data.scenarios import build_spec_masks
 
 
 def _parse_csv_floats(s: str) -> List[float]:
@@ -126,30 +127,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hinge-power", type=float, default=2.0, help="Hinge power (L2 when 2).")
     p.add_argument("--snap-series", type=str, default="E24", help="Snap-to standard series (E24/E12/none).")
 
-    # yield evaluation (Monte Carlo)
-    p.add_argument("--yield-n", type=int, default=0, help="MC sample count for yield (0 disables).")
-    p.add_argument("--yield-seq", action="store_true", help="Use sequential sampling for yield.")
-    p.add_argument("--yield-n-min", type=int, default=200, help="Min samples for sequential yield.")
-    p.add_argument("--yield-n-max", type=int, default=2000, help="Max samples for sequential yield.")
-    p.add_argument("--yield-batch", type=int, default=200, help="Batch size for sequential yield.")
-    p.add_argument("--yield-ci", type=float, default=0.02, help="Target CI half-width (sequential).")
-    p.add_argument("--yield-ci-method", choices=["wilson", "agresti_coull"], default="wilson")
-    p.add_argument("--yield-score", choices=["mean", "ci_lower"], default="mean", help="Selection score for yield rerank.")
-    p.add_argument("--yield-tol", type=float, default=0.05, help="Tolerance fraction for yield Monte Carlo.")
-    p.add_argument("--yield-tol-l", type=float, default=None, help="Override L tolerance (None -> --yield-tol).")
-    p.add_argument("--yield-tol-c", type=float, default=None, help="Override C tolerance (None -> --yield-tol).")
-    p.add_argument("--yield-dist", choices=["uniform", "normal"], default="uniform", help="Tolerance distribution.")
-    p.add_argument("--yield-sigma-frac", type=float, default=None, help="Sigma fraction for normal tolerance.")
-    p.add_argument("--yield-trunc-sigma", type=float, default=3.0, help="Truncation sigma for normal tolerance.")
-    p.add_argument("--yield-global-sigma", type=float, default=0.0, help="Global (lot) sigma fraction for L/C.")
-    p.add_argument("--yield-global-sigma-l", type=float, default=None, help="Override global sigma for inductors.")
-    p.add_argument("--yield-global-sigma-c", type=float, default=None, help="Override global sigma for capacitors.")
-    p.add_argument("--yield-global-trunc-sigma", type=float, default=3.0, help="Truncation sigma for global shift.")
-    p.add_argument("--yield-rl-min-db", type=float, default=None, help="Return loss minimum (positive, dB).")
-    p.add_argument("--yield-ignore-ripple", action="store_true", help="Ignore ripple spec in yield checks.")
-    p.add_argument("--yield-ripple-db", type=float, default=None, help="Override ripple spec for yield (dB).")
-    p.add_argument("--yield-stage2-top", type=int, default=0, help="Rerun yield on top-N candidates with larger budget.")
-    p.add_argument("--yield-stage2-n", type=int, default=0, help="Stage-2 MC samples (or seq n_max).")
     p.add_argument(
         "--allow-mask-fallback",
         action="store_true",
@@ -293,6 +270,8 @@ def main() -> None:
             continue
         if engine is None or float(engine.z0) != z0:
             engine = FastTrackEngine(z0=z0, device=args.device, dtype=torch.float64)
+        mask_min_t = torch.tensor(mask_min_db, dtype=torch.float32) if mask_min_db is not None else None
+        mask_max_t = torch.tensor(mask_max_db, dtype=torch.float32) if mask_max_db is not None else None
 
         wave = sample["wave"].unsqueeze(0).to(args.device)
         scalars = sample["scalar"]
@@ -419,9 +398,14 @@ def main() -> None:
                 snap_series=None if str(args.snap_series).lower() == "none" else str(args.snap_series),
             )
             final_score = res.snapped_loss if res.snapped_loss is not None else res.final_loss
+            pred_db = res.snapped_s21_db if res.snapped_s21_db is not None else res.final_s21_db
+            pass_mask = None
+            if mask_min_t is not None and mask_max_t is not None:
+                pass_mask, _ = calc_yield(pred_db, mask_min_t, mask_max_t)
             refined_records.append(
                 {
                     "score": float(final_score),
+                    "yield_pass": bool(pass_mask.item()) if pass_mask is not None else None,
                     "components": res.refined_components,
                     "tokens": toks0,
                 }
@@ -433,178 +417,20 @@ def main() -> None:
         best_score = float("inf")
         best_comp = None
         best_tokens = None
-        best_yield = None
-
-        yield_enabled = bool(args.yield_seq) or int(args.yield_n) > 0
-        yield_spec = None
-        if yield_enabled:
-            if args.yield_ignore_ripple:
-                ripple_db = None
-            elif args.yield_ripple_db is not None:
-                ripple_db = float(args.yield_ripple_db)
-            else:
-                ripple_db = float(raw.get("ripple_db")) if raw.get("ripple_db") is not None else None
-            try:
-                yield_spec = prepare_yield_spec(
-                    freq_hz=freq,
-                    mask_min_db=mask_min_db,
-                    mask_max_db=mask_max_db,
-                    spec=raw,
-                    passband_ripple_max_db=ripple_db,
-                    return_loss_min_db=args.yield_rl_min_db,
-                    require_masks=True,
-                )
-            except Exception as exc:
-                print(f"[warn] yield spec build failed for idx={idx}: {exc}")
-                yield_spec = None
-                yield_enabled = False
-
-        if yield_enabled and yield_spec is not None:
-            tol_L = args.yield_tol if args.yield_tol_l is None else args.yield_tol_l
-            tol_C = args.yield_tol if args.yield_tol_c is None else args.yield_tol_c
-            tol_map = {"L": float(tol_L), "C": float(tol_C)}
-            global_sigma_L = args.yield_global_sigma if args.yield_global_sigma_l is None else args.yield_global_sigma_l
-            global_sigma_C = args.yield_global_sigma if args.yield_global_sigma_c is None else args.yield_global_sigma_c
-            global_trunc_sigma = float(args.yield_global_trunc_sigma)
-            base_seed = int(args.seed) + int(idx) * 1009
-            for rec in refined_records:
-                comps = rec["components"]
-                rng = np.random.default_rng(base_seed)
-                if args.yield_seq:
-                    y_res = estimate_yield_sequential(
-                        components=comps,
-                        freq_hz=freq,
-                        spec=yield_spec,
-                        n_min=int(args.yield_n_min),
-                        n_max=int(args.yield_n_max),
-                        batch=int(args.yield_batch),
-                        target_half_width=float(args.yield_ci),
-                        rng=rng,
-                        engine=engine,
-                        z0=z0,
-                        q_L=q_l,
-                        q_C=q_c,
-                        q_model=q_model,
-                        tol_L=float(tol_L),
-                        tol_C=float(tol_C),
-                        tol_map=tol_map,
-                        global_sigma_L=global_sigma_L,
-                        global_sigma_C=global_sigma_C,
-                        global_trunc_sigma=global_trunc_sigma,
-                        dist=str(args.yield_dist),
-                        sigma_frac=args.yield_sigma_frac,
-                        trunc_sigma=float(args.yield_trunc_sigma),
-                        ci_method=str(args.yield_ci_method),
-                    )
-                else:
-                    y_res = estimate_yield_mc(
-                        components=comps,
-                        freq_hz=freq,
-                        spec=yield_spec,
-                        n=int(args.yield_n),
-                        rng=rng,
-                        engine=engine,
-                        z0=z0,
-                        q_L=q_l,
-                        q_C=q_c,
-                        q_model=q_model,
-                        tol_L=float(tol_L),
-                        tol_C=float(tol_C),
-                        tol_map=tol_map,
-                        global_sigma_L=global_sigma_L,
-                        global_sigma_C=global_sigma_C,
-                        global_trunc_sigma=global_trunc_sigma,
-                        dist=str(args.yield_dist),
-                        sigma_frac=args.yield_sigma_frac,
-                        trunc_sigma=float(args.yield_trunc_sigma),
-                        ci_method=str(args.yield_ci_method),
-                    )
-                rec["yield"] = y_res
-                if str(args.yield_score) == "ci_lower":
-                    rec["yield_score"] = float(y_res.ci_low)
-                else:
-                    rec["yield_score"] = float(y_res.yield_hat)
-
-            refined_records.sort(key=lambda r: (float(r.get("yield_score", 0.0)), -float(r.get("score", 0.0))), reverse=True)
-            stage2_top = int(args.yield_stage2_top)
-            stage2_n = int(args.yield_stage2_n)
-            if stage2_top > 0 and stage2_n > 0:
-                for rec in refined_records[: min(stage2_top, len(refined_records))]:
-                    comps = rec["components"]
-                    rng = np.random.default_rng(base_seed)
-                    if args.yield_seq:
-                        n_max2 = max(int(stage2_n), 1)
-                        n_min2 = min(int(args.yield_n_min), n_max2)
-                        y_res = estimate_yield_sequential(
-                            components=comps,
-                            freq_hz=freq,
-                            spec=yield_spec,
-                            n_min=int(n_min2),
-                            n_max=int(n_max2),
-                            batch=int(args.yield_batch),
-                            target_half_width=float(args.yield_ci),
-                            rng=rng,
-                            engine=engine,
-                            z0=z0,
-                            q_L=q_l,
-                            q_C=q_c,
-                            q_model=q_model,
-                            tol_L=float(tol_L),
-                            tol_C=float(tol_C),
-                            tol_map=tol_map,
-                            global_sigma_L=global_sigma_L,
-                            global_sigma_C=global_sigma_C,
-                            global_trunc_sigma=global_trunc_sigma,
-                            dist=str(args.yield_dist),
-                            sigma_frac=args.yield_sigma_frac,
-                            trunc_sigma=float(args.yield_trunc_sigma),
-                            ci_method=str(args.yield_ci_method),
-                        )
-                    else:
-                        y_res = estimate_yield_mc(
-                            components=comps,
-                            freq_hz=freq,
-                            spec=yield_spec,
-                            n=int(stage2_n),
-                            rng=rng,
-                            engine=engine,
-                            z0=z0,
-                            q_L=q_l,
-                            q_C=q_c,
-                            q_model=q_model,
-                            tol_L=float(tol_L),
-                            tol_C=float(tol_C),
-                            tol_map=tol_map,
-                            global_sigma_L=global_sigma_L,
-                            global_sigma_C=global_sigma_C,
-                            global_trunc_sigma=global_trunc_sigma,
-                            dist=str(args.yield_dist),
-                            sigma_frac=args.yield_sigma_frac,
-                            trunc_sigma=float(args.yield_trunc_sigma),
-                            ci_method=str(args.yield_ci_method),
-                        )
-                    rec["yield"] = y_res
-                    if str(args.yield_score) == "ci_lower":
-                        rec["yield_score"] = float(y_res.ci_low)
-                    else:
-                        rec["yield_score"] = float(y_res.yield_hat)
-                refined_records.sort(key=lambda r: (float(r.get("yield_score", 0.0)), -float(r.get("score", 0.0))), reverse=True)
-            best = refined_records[0]
-            best_comp = best["components"]
-            best_tokens = best["tokens"]
-            best_yield = best.get("yield")
-            best_score = float(best.get("score", float("inf")))
-        else:
-            for rec in refined_records:
-                score = float(rec.get("score", float("inf")))
-                if score < best_score:
-                    best_score = score
-                    best_comp = rec["components"]
-                    best_tokens = rec["tokens"]
+        best_yield_pass = None
+        for rec in refined_records:
+            score = float(rec.get("score", float("inf")))
+            if score < best_score:
+                best_score = score
+                best_comp = rec["components"]
+                best_tokens = rec["tokens"]
+                best_yield_pass = rec.get("yield_pass")
 
         if best_comp is None:
             continue
 
+        pass_note = "NA" if best_yield_pass is None else str(int(best_yield_pass))
+        print(f"[yield] idx={idx} pass={pass_note} score={best_score:.4g}")
         dump_rows.append(
             {
                 "idx": idx,
@@ -612,13 +438,9 @@ def main() -> None:
                 "filter_type": raw.get("filter_type"),
                 "fc_hz": float(raw.get("fc_hz", 0.0)),
                 "best_score": float(best_score),
+                "yield_pass": best_yield_pass,
                 "num_components": len(best_comp),
                 "gen_tokens": (best_tokens or [])[:200],
-                "yield_hat": float(best_yield.yield_hat) if best_yield is not None else None,
-                "yield_ci_low": float(best_yield.ci_low) if best_yield is not None else None,
-                "yield_ci_high": float(best_yield.ci_high) if best_yield is not None else None,
-                "yield_n": int(best_yield.num_total) if best_yield is not None else None,
-                "yield_fail_counts": best_yield.fail_counts if best_yield is not None else None,
             }
         )
 

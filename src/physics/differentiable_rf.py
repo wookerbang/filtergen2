@@ -31,6 +31,68 @@ def _complex_dtype_for(real_dtype: torch.dtype) -> torch.dtype:
     raise TypeError(f"Unsupported real dtype for complex simulation: {real_dtype}")
 
 
+def barrier_loss(
+    pred_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Barrier loss that penalizes only mask violations (supports broadcasting).
+    """
+    pred = pred_db
+    mask_min = mask_min_db.to(device=pred.device, dtype=pred.dtype)
+    mask_max = mask_max_db.to(device=pred.device, dtype=pred.dtype)
+    min_term = torch.relu(mask_min - pred)
+    max_term = torch.relu(pred - mask_max)
+    min_term = torch.where(torch.isfinite(mask_min), min_term, torch.zeros_like(min_term))
+    max_term = torch.where(torch.isfinite(mask_max), max_term, torch.zeros_like(max_term))
+    return torch.mean(min_term**2 + max_term**2)
+
+
+def calc_yield(
+    pred_s21_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    pred_s11_db: torch.Tensor | None = None,
+    s11_max_db: float = -10.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute pass mask and yield ratio for S21 mask compliance (optional S11 guard).
+    """
+    pred = pred_s21_db
+    single = pred.ndim == 1
+    if single:
+        pred = pred.unsqueeze(0)
+    mask_min = mask_min_db
+    mask_max = mask_max_db
+    if mask_min.ndim == 1:
+        mask_min = mask_min.unsqueeze(0)
+    if mask_max.ndim == 1:
+        mask_max = mask_max.unsqueeze(0)
+    mask_min = mask_min.to(device=pred.device, dtype=pred.dtype)
+    mask_max = mask_max.to(device=pred.device, dtype=pred.dtype)
+
+    finite_pred = torch.isfinite(pred)
+    min_ok = torch.isnan(mask_min) | (pred >= mask_min)
+    max_ok = torch.isnan(mask_max) | (pred <= mask_max)
+    ok = finite_pred & min_ok & max_ok
+
+    if pred_s11_db is not None:
+        s11 = pred_s11_db
+        if s11.ndim == 1:
+            s11 = s11.unsqueeze(0)
+        s11 = s11.to(device=pred.device, dtype=pred.dtype)
+        s11_ok = torch.isfinite(s11) & (s11 <= float(s11_max_db))
+        ok = ok & s11_ok
+
+    pass_mask = ok.all(dim=-1)
+    yield_ratio = pass_mask.float().mean()
+    if single:
+        return pass_mask.squeeze(0), yield_ratio
+    return pass_mask, yield_ratio
+
+
 class DifferentiablePhysicsKernel:
     """
     Atomic differentiable RF operators for 2-port cascaded networks.
@@ -1154,6 +1216,9 @@ def unroll_refine_slots(
     max_backoff: int = 3,
     create_graph: bool = True,
     return_raw: bool = False,
+    mask_min_db: torch.Tensor | None = None,
+    mask_max_db: torch.Tensor | None = None,
+    barrier_weight: float = 0.0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Differentiable unrolled refinement over per-cell slot values with stability guards.
@@ -1163,6 +1228,11 @@ def unroll_refine_slots(
     raw_flat = raw.reshape(-1)
     mask_flat = mask.reshape(-1)
     idx = slot_indices.to(device=raw.device, dtype=torch.long)
+    mask_min = None
+    mask_max = None
+    if mask_min_db is not None and mask_max_db is not None and float(barrier_weight) > 0.0:
+        mask_min = mask_min_db.to(device=raw.device, dtype=raw.dtype)
+        mask_max = mask_max_db.to(device=raw.device, dtype=raw.dtype)
 
     loss = None
     base_lr = float(lr)
@@ -1177,6 +1247,8 @@ def unroll_refine_slots(
             values_vec = values_flat.index_select(0, idx)
             pred = circuit(freq_hz, values=values_vec, output="s21_db")
             loss = F.mse_loss(pred, target_s21_db)
+            if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
+                loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
             if not torch.isfinite(loss):
                 step_lr *= float(nan_backoff)
                 continue
@@ -1227,6 +1299,9 @@ def unroll_refine_slots_mixed(
     max_backoff: int = 3,
     create_graph: bool = True,
     return_raw: bool = False,
+    mask_min_db: torch.Tensor | None = None,
+    mask_max_db: torch.Tensor | None = None,
+    barrier_weight: float = 0.0,
     z0: float = 50.0,
     q_L: float | torch.Tensor | None = 50.0,
     q_C: float | torch.Tensor | None = 50.0,
@@ -1237,6 +1312,11 @@ def unroll_refine_slots_mixed(
     Unrolled refinement where the forward pass uses mixed macro ABCD matrices.
     """
     raw = slot_raw
+    mask_min = None
+    mask_max = None
+    if mask_min_db is not None and mask_max_db is not None and float(barrier_weight) > 0.0:
+        mask_min = mask_min_db.to(device=slot_raw.device, dtype=slot_raw.dtype)
+        mask_max = mask_max_db.to(device=slot_raw.device, dtype=slot_raw.dtype)
     loss = None
     base_lr = float(lr)
     backoff_tries = max(0, int(max_backoff))
@@ -1261,6 +1341,8 @@ def unroll_refine_slots_mixed(
                 raw_max=None,
             )
             loss = F.mse_loss(pred, target_s21_db)
+            if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
+                loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
             if not torch.isfinite(loss):
                 step_lr *= float(nan_backoff)
                 continue

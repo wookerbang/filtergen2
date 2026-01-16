@@ -21,7 +21,7 @@ from .vact_struct import components_to_vact_struct_tokens
 from .node_canonicalizer import canonicalize_nodes
 from .action_codec import components_to_action_tokens
 from .dsl import VAL_NONE, components_to_dsl_segments, components_to_dsl_tokens, components_to_macro_ir
-from .scenarios import apply_scenario_postprocess, build_freq_grid, build_spec_masks, sample_scenario_spec
+from .scenarios import apply_scenario_postprocess, build_data_driven_masks, build_freq_grid, build_spec_masks, sample_scenario_spec
 from src.physics import FastTrackEngine
 
 
@@ -79,7 +79,6 @@ def build_dataset(
     max_nodes: int = 32,
     q_L: float | None = 50.0,
     q_C: float | None = 50.0,
-    tol_frac: float = 0.05,
     q_model: str = "freq_dependent",
     check_insertion_loss: bool = True,
     filter_type_override: str | None = None,
@@ -98,25 +97,6 @@ def build_dataset(
 
     rng = np.random.default_rng(seed)
     fast_engine: FastTrackEngine | None = None
-
-    def _apply_tolerance(comps: List[ComponentSpec]) -> List[ComponentSpec]:
-        t = float(tol_frac or 0.0)
-        if t <= 0:
-            return list(comps)
-        out: List[ComponentSpec] = []
-        for c in comps:
-            scale = float(rng.uniform(1.0 - t, 1.0 + t))
-            out.append(
-                ComponentSpec(
-                    ctype=c.ctype,
-                    role=c.role,
-                    value_si=float(c.value_si) * scale,
-                    std_label=c.std_label,
-                    node1=c.node1,
-                    node2=c.node2,
-                )
-            )
-        return out
 
     with open(jsonl_path, "w") as f:
         for i in range(num_samples):
@@ -140,7 +120,7 @@ def build_dataset(
             base_components = apply_scenario_postprocess(base_components, spec, rng=rng)
 
             freq_hz = build_freq_grid(spec, num_freqs=256)
-            mask_min_db, mask_max_db, passband_min_db, stopband_max_db = build_spec_masks(spec, freq_hz)
+            _, _, passband_min_db, stopband_max_db = build_spec_masks(spec, freq_hz)
 
             # 非纯 ladder（notch/BP/BS）优先用仿真获取 ideal，以避免 ABCD 近似误差
             need_sim_for_ideal = spec.get("scenario") in ("anti_jamming",) or spec.get("filter_type") != "lowpass"
@@ -172,8 +152,8 @@ def build_dataset(
                     q_model="freq_dependent",
                 )
 
-            # Input waveform: tolerance-perturbed + finite-Q loss model.
-            real_components = _apply_tolerance(discrete_components)
+            # Input waveform: finite-Q loss model (no tolerance perturbation).
+            real_components = list(discrete_components)
             use_spice_real = bool(use_ngspice) and ((q_L is None and q_C is None) or str(q_model) == "fixed_ref")
             if use_spice_real:
                 real_s21_db, real_s11_db = simulate_real_waveform(
@@ -214,6 +194,8 @@ def build_dataset(
                 if is_broken:
                     print(f"Sample {i}: Circuit broken (High insertion loss).")
                     continue
+
+            mask_min_db, mask_max_db = build_data_driven_masks(freq_hz, real_s21_db)
 
             order_token = spec.get("order_effective", spec.get("order"))
             vact_tokens = None
