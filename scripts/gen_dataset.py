@@ -103,6 +103,17 @@ def parse_args() -> argparse.Namespace:
         help="Fix topology type for all samples.",
     )
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
+    p.add_argument(
+        "--narrow-freq-grid",
+        action="store_true",
+        help="Use a narrow frequency grid around fc for LP/HP (BP/BS unchanged).",
+    )
+    p.add_argument(
+        "--narrow-freq-span",
+        type=float,
+        default=0.5,
+        help="Half-span around fc for narrow grid (f in [fc*(1-span), fc*(1+span)]).",
+    )
     p.add_argument("--bp-order-lp", type=int, help="Force LP order for cascade BP (requires bandpass).")
     p.add_argument("--bp-order-hp", type=int, help="Force HP order for cascade BP (requires bandpass).")
     p.add_argument(
@@ -188,6 +199,8 @@ def main() -> None:
         topology_type_override=args.topology_type,
         spec_fixed=spec_fixed,
         spec_ranges=spec_ranges,
+        narrow_freq_grid=bool(args.narrow_freq_grid),
+        narrow_freq_span=float(args.narrow_freq_span),
     )
     print(f"Dataset written to {path}")
 

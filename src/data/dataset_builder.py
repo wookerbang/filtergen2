@@ -86,6 +86,8 @@ def build_dataset(
     topology_type_override: str | None = None,
     spec_fixed: Mapping[str, object] | None = None,
     spec_ranges: Mapping[str, object] | None = None,
+    narrow_freq_grid: bool = False,
+    narrow_freq_span: float = 0.5,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -119,7 +121,12 @@ def build_dataset(
             base_components = synthesize_filter(spec)
             base_components = apply_scenario_postprocess(base_components, spec, rng=rng)
 
-            freq_hz = build_freq_grid(spec, num_freqs=256)
+            freq_hz = build_freq_grid(
+                spec,
+                num_freqs=256,
+                grid_mode="narrow" if narrow_freq_grid else "default",
+                narrow_span=float(narrow_freq_span),
+            )
             _, _, passband_min_db, stopband_max_db = build_spec_masks(spec, freq_hz)
 
             # 非纯 ladder（notch/BP/BS）优先用仿真获取 ideal，以避免 ABCD 近似误差

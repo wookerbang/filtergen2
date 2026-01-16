@@ -459,7 +459,13 @@ def sample_scenario_spec(
     )
 
 
-def build_freq_grid(spec: Mapping[str, object], *, num_freqs: int = 256) -> np.ndarray:
+def build_freq_grid(
+    spec: Mapping[str, object],
+    *,
+    num_freqs: int = 256,
+    grid_mode: str = "default",
+    narrow_span: float | None = None,
+) -> np.ndarray:
     fc = float(spec.get("fc_hz", 1.0))
     f_min = fc / 10.0
     f_max = fc * 10.0
@@ -467,6 +473,13 @@ def build_freq_grid(spec: Mapping[str, object], *, num_freqs: int = 256) -> np.n
     if ftype in ("bandpass", "bandstop"):
         bw = float(spec.get("bw_frac") or spec.get("stopband_bw_frac") or 0.2)
         span = max(0.2, 2.5 * bw)
+        f_min = fc * (1.0 - span)
+        f_max = fc * (1.0 + span)
+        if f_min <= 0:
+            f_min = fc / 10.0
+    elif str(grid_mode).lower() == "narrow":
+        span = float(narrow_span) if narrow_span is not None else 0.5
+        span = min(max(span, 0.05), 0.99)
         f_min = fc * (1.0 - span)
         f_max = fc * (1.0 + span)
         if f_min <= 0:
