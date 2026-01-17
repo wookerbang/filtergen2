@@ -432,7 +432,7 @@ def main() -> None:
     model.to(device).eval()
 
     skip_id = len(id_to_macro)
-    macro_slot_mask = torch.zeros((len(id_to_macro) + 1, slot_count), dtype=torch.float32)
+    macro_slot_mask = torch.zeros((len(id_to_macro) + 1, slot_count), dtype=torch.float32, device=device)
     for mid, macro in enumerate(id_to_macro):
         slen = len(MACRO_LIBRARY[macro].slot_types)
         if slen > 0:
