@@ -497,6 +497,7 @@ def main() -> None:
                 target_for_refine = sample["ideal_s21_db"]
             else:
                 target_for_refine = sample["real_s21_db"] if raw_dict.get("real_s21_db") is not None else sample["ideal_s21_db"]
+            target_for_refine = target_for_refine.to(device=device, dtype=slot_raw.dtype)
             _ = unroll_refine_slots(
                 slot_raw,
                 slot_mask,
