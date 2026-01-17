@@ -499,7 +499,7 @@ def main() -> None:
             else:
                 target_for_refine = sample["real_s21_db"] if raw_dict.get("real_s21_db") is not None else sample["ideal_s21_db"]
             target_for_refine = target_for_refine.to(device=device, dtype=slot_raw.dtype)
-            _ = unroll_refine_slots(
+            _, refined_raw = unroll_refine_slots(
                 slot_raw,
                 slot_mask,
                 slot_idx,
@@ -514,7 +514,9 @@ def main() -> None:
                 nan_backoff=0.5,
                 max_backoff=3,
                 create_graph=False,
+                return_raw=True,
             )
+            slot_raw = refined_raw.detach()
 
         slot_raw_clamped = slot_raw.clamp(min=-32.0, max=-12.0)
         values_flat = torch.exp(slot_raw_clamped.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
