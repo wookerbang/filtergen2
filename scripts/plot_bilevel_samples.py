@@ -491,6 +491,7 @@ def main() -> None:
         )
 
         if args.unroll_steps and int(args.unroll_steps) > 0:
+            slot_raw = slot_raw.detach().requires_grad_(True)
             if args.target_wave == "real":
                 target_for_refine = sample["real_s21_db"]
             elif args.target_wave == "ideal":
