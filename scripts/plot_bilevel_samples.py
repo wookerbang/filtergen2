@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from src.data.dsl import MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
 from src.models import Wave2StructureModel
-from src.physics.differentiable_rf import DynamicCircuitAssembler
+from src.physics.differentiable_rf import DynamicCircuitAssembler, unroll_refine_slots
 
 
 def _resolve_ckpt(path: Path) -> Path:
@@ -372,6 +372,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-s11", dest="include_s11", action="store_false", help="Drop S11 channels.")
     p.set_defaults(include_s11=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--unroll-steps", type=int, default=0, help="Refine slot values before plotting (0 disables).")
+    p.add_argument("--inner-lr", type=float, default=1e-2, help="Inner-loop LR for refinement.")
+    p.add_argument("--inner-max-step", type=float, default=0.5, help="Max step size for refinement.")
     return p.parse_args()
 
 
@@ -476,8 +479,6 @@ def main() -> None:
         macro_ids = torch.argmax(g_logits, dim=-1)
         macro_ids = _enforce_non_empty(macro_ids, g_logits, skip_id)
         slot_mask = macro_slot_mask[macro_ids].to(device=device, dtype=slot_raw.dtype)
-        slot_raw_clamped = slot_raw.clamp(min=-32.0, max=-12.0)
-        values_flat = torch.exp(slot_raw_clamped.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
 
         circuit, slot_idx = _build_circuit_and_indices(
             macro_ids,
@@ -488,6 +489,33 @@ def main() -> None:
             device=device,
             dtype=slot_raw.dtype,
         )
+
+        if args.unroll_steps and int(args.unroll_steps) > 0:
+            if args.target_wave == "real":
+                target_for_refine = sample["real_s21_db"]
+            elif args.target_wave == "ideal":
+                target_for_refine = sample["ideal_s21_db"]
+            else:
+                target_for_refine = sample["real_s21_db"] if raw_dict.get("real_s21_db") is not None else sample["ideal_s21_db"]
+            _ = unroll_refine_slots(
+                slot_raw,
+                slot_mask,
+                slot_idx,
+                circuit,
+                freq,
+                target_for_refine,
+                steps=int(args.unroll_steps),
+                lr=float(args.inner_lr),
+                max_step=float(args.inner_max_step),
+                raw_min=-32.0,
+                raw_max=-12.0,
+                nan_backoff=0.5,
+                max_backoff=3,
+                create_graph=False,
+            )
+
+        slot_raw_clamped = slot_raw.clamp(min=-32.0, max=-12.0)
+        values_flat = torch.exp(slot_raw_clamped.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
         values_vec = values_flat.index_select(0, slot_idx)
         pred_s21 = circuit(freq, values=values_vec, output="s21_db")
 
