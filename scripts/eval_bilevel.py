@@ -221,6 +221,7 @@ class BilevelEvalDataset(Dataset):
             "stopband_max_db": float(stopband_max_db),
             "order": float(order),
             "ideal_s21_db": ideal_s21,
+            "real_s21_db": real_s21,
             "mask_min_db": mask_min,
             "mask_max_db": mask_max,
         }
@@ -375,6 +376,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=None)
     p.add_argument("--inner-nan-backoff", type=float, default=None)
     p.add_argument("--inner-nan-tries", type=int, default=None)
+    p.add_argument(
+        "--target-wave",
+        choices=["ideal", "real"],
+        default=None,
+        help="Target S21 curve for refine/MSE (ideal_s21_db or real_s21_db).",
+    )
     p.add_argument("--use-viterbi", action="store_true", help="Decode macros with Viterbi + hard transitions.")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     return p.parse_args()
@@ -411,6 +418,7 @@ def main() -> None:
     freq_mode = args.freq_mode or cfg.get("freq_mode", "log_fc")
     freq_scale = args.freq_scale or cfg.get("freq_scale", "none")
     spec_mode = args.spec_mode or cfg.get("spec_mode", "type_fc")
+    target_wave = args.target_wave or cfg.get("target_wave", "ideal")
     include_s11 = cfg.get("include_s11", True) if args.include_s11 is None else bool(args.include_s11)
     d_model = int(cfg.get("d_model", 512))
     hidden_mult = int(cfg.get("hidden_mult", 2))
@@ -451,10 +459,14 @@ def main() -> None:
         dataset.macro_ir_macros = dataset.macro_ir_macros[:max_n]
 
     def collate(batch: List[dict]) -> dict:
+        if target_wave == "real":
+            targets = torch.stack([b["real_s21_db"] for b in batch])
+        else:
+            targets = torch.stack([b["ideal_s21_db"] for b in batch])
         return {
             "wave": torch.stack([b["wave"] for b in batch]),
             "freq": torch.stack([b["freq"] for b in batch]),
-            "target_s21_db": torch.stack([b["ideal_s21_db"] for b in batch]),
+            "target_s21_db": targets,
             "mask_min_db": torch.stack([b["mask_min_db"] for b in batch]),
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
@@ -832,6 +844,7 @@ def main() -> None:
         "yield_pre": (yield_pre_pass / yield_total) if yield_total else None,
         "yield_post": (yield_post_pass / yield_total) if yield_total else None,
         "per_filter_type": per_type_out,
+        "target_wave": str(target_wave),
         "config": str(cfg_path),
         "checkpoint": str(ckpt_path),
     }

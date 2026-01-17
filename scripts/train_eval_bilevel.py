@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -41,6 +42,21 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Could not find free path for {path}")
+
+
+def _load_target_wave(output_dir: Path) -> Optional[str]:
+    cfg_path = output_dir / "input_config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    target = cfg.get("target_wave")
+    if target in ("ideal", "real"):
+        return str(target)
+    return None
 
 
 def _run_and_log(cmd: list[str], log_path: Path, *, cwd: Path) -> int:
@@ -183,6 +199,11 @@ def main() -> None:
     if not _has_flag(eval_args, "--output"):
         eval_out = log_dir / f"eval_results_epoch_{ckpt_path.name.split('_')[-1]}.json"
         eval_args = eval_args + ["--output", str(eval_out)]
+
+    if not _has_flag(eval_args, "--target-wave"):
+        target_wave = _load_target_wave(output_dir)
+        if target_wave:
+            eval_args = eval_args + ["--target-wave", str(target_wave)]
 
     eval_cmd = [sys.executable, str(args.eval_script)] + eval_args
     rc = _run_and_log(eval_cmd, eval_log, cwd=ROOT)
