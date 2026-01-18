@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -65,6 +66,95 @@ def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> 
         return float(bw)
     except Exception:
         return 0.0
+
+
+def _masked_mse_components(
+    pred_db: torch.Tensor,
+    target_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    w_pass: float,
+    w_stop: float,
+) -> tuple[float, float, float]:
+    pred = pred_db.reshape(-1)
+    target = target_db.reshape(-1)
+    full_mse = float(F.mse_loss(pred, target).item())
+    min_mask = torch.isfinite(mask_min_db.reshape(-1))
+    max_mask = torch.isfinite(mask_max_db.reshape(-1))
+    constrained_mask = min_mask | max_mask
+    if bool(constrained_mask.any()):
+        constrained = torch.mean((pred[constrained_mask] - target[constrained_mask]) ** 2)
+        constrained_mse = float(constrained.item())
+    else:
+        constrained_mse = full_mse
+    pass_mask = min_mask
+    stop_mask = max_mask & ~pass_mask
+    if bool(pass_mask.any()) or bool(stop_mask.any()):
+        err = (pred - target) ** 2
+        num = 0.0
+        denom = 0.0
+        if bool(pass_mask.any()):
+            num += float(w_pass) * float(err[pass_mask].sum().item())
+            denom += float(w_pass) * float(pass_mask.sum().item())
+        if bool(stop_mask.any()):
+            num += float(w_stop) * float(err[stop_mask].sum().item())
+            denom += float(w_stop) * float(stop_mask.sum().item())
+        weighted_mse = num / denom if denom > 0.0 else full_mse
+    else:
+        weighted_mse = full_mse
+    return full_mse, constrained_mse, weighted_mse
+
+
+def _band_metrics(
+    pred_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+) -> tuple[float | None, float | None]:
+    pred = pred_db.reshape(-1)
+    pass_mask = torch.isfinite(mask_min_db.reshape(-1))
+    stop_mask = torch.isfinite(mask_max_db.reshape(-1)) & ~pass_mask
+    ripple = None
+    if bool(pass_mask.any()):
+        pb = pred[pass_mask]
+        ripple = float((pb.max() - pb.min()).item())
+    stop_max = None
+    if bool(stop_mask.any()):
+        stop_max = float(pred[stop_mask].max().item())
+    return ripple, stop_max
+
+
+def _interp_target(
+    freq_src: torch.Tensor,
+    target_src: torch.Tensor,
+    freq_dst: torch.Tensor,
+) -> torch.Tensor:
+    src = freq_src.detach().cpu().numpy().astype(float)
+    dst = freq_dst.detach().cpu().numpy().astype(float)
+    tgt = target_src.detach().cpu().numpy().astype(float)
+    finite = np.isfinite(tgt)
+    if finite.sum() < 2:
+        return torch.full_like(freq_dst, float("nan"))
+    out = np.interp(dst, src[finite], tgt[finite])
+    return torch.tensor(out, device=target_src.device, dtype=target_src.dtype)
+
+
+def _interp_mask_nearest(
+    freq_src: torch.Tensor,
+    mask_src: torch.Tensor,
+    freq_dst: torch.Tensor,
+) -> torch.Tensor:
+    src = freq_src.detach().cpu().numpy().astype(float)
+    dst = freq_dst.detach().cpu().numpy().astype(float)
+    vals = mask_src.detach().cpu().numpy().astype(float)
+    idx = np.searchsorted(src, dst)
+    idx = np.clip(idx, 1, len(src) - 1)
+    left = idx - 1
+    right = idx
+    choose_right = (dst - src[left]) > (src[right] - dst)
+    nearest = np.where(choose_right, right, left)
+    out = vals[nearest]
+    return torch.tensor(out, device=mask_src.device, dtype=mask_src.dtype)
 
 
 class BilevelEvalDataset(Dataset):
@@ -404,6 +494,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=None)
     p.add_argument("--inner-nan-backoff", type=float, default=None)
     p.add_argument("--inner-nan-tries", type=int, default=None)
+    p.add_argument("--w-pass", type=float, default=1.0, help="Weighted MSE passband weight.")
+    p.add_argument("--w-stop", type=float, default=5.0, help="Weighted MSE stopband weight.")
+    p.add_argument(
+        "--uniform-grid",
+        action="store_true",
+        help="Evaluate additional metrics on a shared wide log-frequency grid.",
+    )
+    p.add_argument("--uniform-grid-points", type=int, default=256, help="Number of points for uniform grid.")
+    p.add_argument("--uniform-grid-mult", type=float, default=10.0, help="Span as fc/mult to fc*mult.")
     p.add_argument(
         "--target-wave",
         choices=["ideal", "real"],
@@ -433,6 +532,16 @@ def _new_group() -> dict:
         "count": 0,
         "mse_pre": 0.0,
         "mse_post": 0.0,
+        "constrained_mse_pre": 0.0,
+        "constrained_mse_post": 0.0,
+        "weighted_mse_pre": 0.0,
+        "weighted_mse_post": 0.0,
+        "ripple_pre_sum": 0.0,
+        "ripple_post_sum": 0.0,
+        "ripple_count": 0,
+        "stop_pre_sum": 0.0,
+        "stop_post_sum": 0.0,
+        "stop_count": 0,
         "yield_total": 0,
         "yield_pre": 0,
         "yield_post": 0,
@@ -445,6 +554,25 @@ def _new_group() -> dict:
         "len_abs_sum": 0.0,
         "len_bias_sum": 0.0,
         "len_exact": 0,
+    }
+
+
+def _new_uniform_group() -> dict:
+    return {
+        "count": 0,
+        "mse_pre": 0.0,
+        "mse_post": 0.0,
+        "constrained_mse_pre": 0.0,
+        "constrained_mse_post": 0.0,
+        "weighted_mse_pre": 0.0,
+        "weighted_mse_post": 0.0,
+        "ripple_pre_sum": 0.0,
+        "ripple_post_sum": 0.0,
+        "ripple_count": 0,
+        "stop_pre_sum": 0.0,
+        "stop_post_sum": 0.0,
+        "stop_count": 0,
+        "failed": 0,
     }
 
 
@@ -585,6 +713,31 @@ def main() -> None:
     total = 0
     pre_mse_sum = 0.0
     post_mse_sum = 0.0
+    pre_constrained_sum = 0.0
+    post_constrained_sum = 0.0
+    pre_weighted_sum = 0.0
+    post_weighted_sum = 0.0
+    ripple_pre_sum = 0.0
+    ripple_post_sum = 0.0
+    ripple_count = 0
+    stop_pre_sum = 0.0
+    stop_post_sum = 0.0
+    stop_count = 0
+    uniform_enabled = bool(args.uniform_grid)
+    uni_pre_mse_sum = 0.0
+    uni_post_mse_sum = 0.0
+    uni_pre_constrained_sum = 0.0
+    uni_post_constrained_sum = 0.0
+    uni_pre_weighted_sum = 0.0
+    uni_post_weighted_sum = 0.0
+    uni_ripple_pre_sum = 0.0
+    uni_ripple_post_sum = 0.0
+    uni_ripple_count = 0
+    uni_stop_pre_sum = 0.0
+    uni_stop_post_sum = 0.0
+    uni_stop_count = 0
+    uni_total = 0
+    per_type_uniform: dict[str, dict] = {name: _new_uniform_group() for name in type_names.values()}
     yield_total = 0
     yield_pre_pass = 0
     yield_post_pass = 0
@@ -694,9 +847,16 @@ def main() -> None:
                     ft_name = type_names.get(ft_id, "unknown")
                     if ft_name not in per_type:
                         per_type[ft_name] = _new_group()
-                    per_type[ft_name]["failed"] += 1
+                        per_type[ft_name]["failed"] += 1
                     continue
-                pre_mse = F.mse_loss(pred_pre, target[b]).item()
+                pre_mse, pre_constrained, pre_weighted = _masked_mse_components(
+                    pred_pre,
+                    target[b],
+                    mask_min[b],
+                    mask_max[b],
+                    w_pass=float(args.w_pass),
+                    w_stop=float(args.w_stop),
+                )
                 if not math.isfinite(pre_mse):
                     nonfinite_pred_pre += 1
                     failed += 1
@@ -704,8 +864,9 @@ def main() -> None:
                     ft_name = type_names.get(ft_id, "unknown")
                     if ft_name not in per_type:
                         per_type[ft_name] = _new_group()
-                    per_type[ft_name]["failed"] += 1
+                        per_type[ft_name]["failed"] += 1
                     continue
+                ripple_pre, stop_pre = _band_metrics(pred_pre, mask_min[b], mask_max[b])
 
                 raw_init = slot_raw[b].to(dtype).detach().requires_grad_(True)
                 loss_post, raw_post = unroll_refine_slots(
@@ -736,9 +897,16 @@ def main() -> None:
                     ft_name = type_names.get(ft_id, "unknown")
                     if ft_name not in per_type:
                         per_type[ft_name] = _new_group()
-                    per_type[ft_name]["failed"] += 1
+                        per_type[ft_name]["failed"] += 1
                     continue
-                post_mse = F.mse_loss(pred_post, target[b]).item()
+                post_mse, post_constrained, post_weighted = _masked_mse_components(
+                    pred_post,
+                    target[b],
+                    mask_min[b],
+                    mask_max[b],
+                    w_pass=float(args.w_pass),
+                    w_stop=float(args.w_stop),
+                )
                 if not math.isfinite(post_mse):
                     nonfinite_pred_post += 1
                     failed += 1
@@ -746,8 +914,9 @@ def main() -> None:
                     ft_name = type_names.get(ft_id, "unknown")
                     if ft_name not in per_type:
                         per_type[ft_name] = _new_group()
-                    per_type[ft_name]["failed"] += 1
+                        per_type[ft_name]["failed"] += 1
                     continue
+                ripple_post, stop_post = _band_metrics(pred_post, mask_min[b], mask_max[b])
 
                 macros = None
                 if macro_ir_macros is not None:
@@ -795,6 +964,109 @@ def main() -> None:
 
                 pre_mse_sum += pre_mse
                 post_mse_sum += post_mse
+                pre_constrained_sum += pre_constrained
+                post_constrained_sum += post_constrained
+                pre_weighted_sum += pre_weighted
+                post_weighted_sum += post_weighted
+                if ripple_pre is not None:
+                    ripple_pre_sum += ripple_pre
+                    ripple_count += 1
+                if ripple_post is not None:
+                    ripple_post_sum += ripple_post
+                if stop_pre is not None:
+                    stop_pre_sum += stop_pre
+                    stop_count += 1
+                if stop_post is not None:
+                    stop_post_sum += stop_post
+
+                if uniform_enabled:
+                    fc_val = float(fc_hz[b].item())
+                    mult = float(args.uniform_grid_mult)
+                    if not math.isfinite(fc_val) or fc_val <= 0.0:
+                        f_min = float(freq[b].min().item())
+                        f_max = float(freq[b].max().item())
+                    else:
+                        f_min = fc_val / mult if mult > 0 else fc_val / 10.0
+                        f_max = fc_val * mult if mult > 0 else fc_val * 10.0
+                        if f_min <= 0.0 or not math.isfinite(f_min):
+                            f_min = fc_val / 10.0
+                        if f_max <= 0.0 or not math.isfinite(f_max):
+                            f_max = fc_val * 10.0
+                    if f_min > f_max:
+                        f_min, f_max = f_max, f_min
+                    freq_u_np = np.logspace(np.log10(f_min), np.log10(f_max), int(args.uniform_grid_points))
+                    freq_u = torch.tensor(freq_u_np, device=freq.device, dtype=freq.dtype)
+                    target_u = _interp_target(freq[b], target[b], freq_u)
+                    mask_min_u = _interp_mask_nearest(freq[b], mask_min[b], freq_u)
+                    mask_max_u = _interp_mask_nearest(freq[b], mask_max[b], freq_u)
+                    pred_pre_u = circuit(freq_u, values=values_vec, output="s21_db")
+                    values_vec_post_u = values_vec_post
+                    pred_post_u = circuit(freq_u, values=values_vec_post_u, output="s21_db")
+                    if torch.isfinite(target_u).all() and torch.isfinite(pred_pre_u).all() and torch.isfinite(pred_post_u).all():
+                        uni_pre_mse, uni_pre_con, uni_pre_w = _masked_mse_components(
+                            pred_pre_u,
+                            target_u,
+                            mask_min_u,
+                            mask_max_u,
+                            w_pass=float(args.w_pass),
+                            w_stop=float(args.w_stop),
+                        )
+                        uni_post_mse, uni_post_con, uni_post_w = _masked_mse_components(
+                            pred_post_u,
+                            target_u,
+                            mask_min_u,
+                            mask_max_u,
+                            w_pass=float(args.w_pass),
+                            w_stop=float(args.w_stop),
+                        )
+                        uni_pre_ripple, uni_pre_stop = _band_metrics(pred_pre_u, mask_min_u, mask_max_u)
+                        uni_post_ripple, uni_post_stop = _band_metrics(pred_post_u, mask_min_u, mask_max_u)
+                        uni_pre_mse_sum += uni_pre_mse
+                        uni_post_mse_sum += uni_post_mse
+                        uni_pre_constrained_sum += uni_pre_con
+                        uni_post_constrained_sum += uni_post_con
+                        uni_pre_weighted_sum += uni_pre_w
+                        uni_post_weighted_sum += uni_post_w
+                        if uni_pre_ripple is not None:
+                            uni_ripple_pre_sum += uni_pre_ripple
+                            uni_ripple_count += 1
+                        if uni_post_ripple is not None:
+                            uni_ripple_post_sum += uni_post_ripple
+                        if uni_pre_stop is not None:
+                            uni_stop_pre_sum += uni_pre_stop
+                            uni_stop_count += 1
+                        if uni_post_stop is not None:
+                            uni_stop_post_sum += uni_post_stop
+                        uni_total += 1
+                        ft_id_u = int(filter_type[b].item())
+                        ft_name_u = type_names.get(ft_id_u, "unknown")
+                        if ft_name_u not in per_type_uniform:
+                            per_type_uniform[ft_name_u] = _new_uniform_group()
+                        ugroup = per_type_uniform[ft_name_u]
+                        ugroup["count"] += 1
+                        ugroup["mse_pre"] += uni_pre_mse
+                        ugroup["mse_post"] += uni_post_mse
+                        ugroup["constrained_mse_pre"] += uni_pre_con
+                        ugroup["constrained_mse_post"] += uni_post_con
+                        ugroup["weighted_mse_pre"] += uni_pre_w
+                        ugroup["weighted_mse_post"] += uni_post_w
+                        if uni_pre_ripple is not None:
+                            ugroup["ripple_pre_sum"] += uni_pre_ripple
+                            ugroup["ripple_count"] += 1
+                        if uni_post_ripple is not None:
+                            ugroup["ripple_post_sum"] += uni_post_ripple
+                        if uni_pre_stop is not None:
+                            ugroup["stop_pre_sum"] += uni_pre_stop
+                            ugroup["stop_count"] += 1
+                        if uni_post_stop is not None:
+                            ugroup["stop_post_sum"] += uni_post_stop
+                    else:
+                        ft_id_u = int(filter_type[b].item())
+                        ft_name_u = type_names.get(ft_id_u, "unknown")
+                        if ft_name_u not in per_type_uniform:
+                            per_type_uniform[ft_name_u] = _new_uniform_group()
+                        per_type_uniform[ft_name_u]["failed"] += 1
+
                 total += 1
                 ft_id = int(filter_type[b].item())
                 ft_name = type_names.get(ft_id, "unknown")
@@ -804,6 +1076,20 @@ def main() -> None:
                 group["count"] += 1
                 group["mse_pre"] += pre_mse
                 group["mse_post"] += post_mse
+                group["constrained_mse_pre"] += pre_constrained
+                group["constrained_mse_post"] += post_constrained
+                group["weighted_mse_pre"] += pre_weighted
+                group["weighted_mse_post"] += post_weighted
+                if ripple_pre is not None:
+                    group["ripple_pre_sum"] += ripple_pre
+                    group["ripple_count"] += 1
+                if ripple_post is not None:
+                    group["ripple_post_sum"] += ripple_post
+                if stop_pre is not None:
+                    group["stop_pre_sum"] += stop_pre
+                    group["stop_count"] += 1
+                if stop_post is not None:
+                    group["stop_post_sum"] += stop_post
                 macro_slot_total += slot_total
                 macro_slot_correct += slot_correct
                 macro_non_skip_total += non_skip_total
@@ -857,6 +1143,14 @@ def main() -> None:
             "failed": group["failed"],
             "mse_pre": group["mse_pre"] / max(1, count),
             "mse_post": group["mse_post"] / max(1, count),
+            "constrained_mse_pre": group["constrained_mse_pre"] / max(1, count),
+            "constrained_mse_post": group["constrained_mse_post"] / max(1, count),
+            "weighted_mse_pre": group["weighted_mse_pre"] / max(1, count),
+            "weighted_mse_post": group["weighted_mse_post"] / max(1, count),
+            "ripple_pre": (group["ripple_pre_sum"] / group["ripple_count"]) if group["ripple_count"] else None,
+            "ripple_post": (group["ripple_post_sum"] / group["ripple_count"]) if group["ripple_count"] else None,
+            "stopband_max_pre": (group["stop_pre_sum"] / group["stop_count"]) if group["stop_count"] else None,
+            "stopband_max_post": (group["stop_post_sum"] / group["stop_count"]) if group["stop_count"] else None,
             "macro_acc": (group["macro_slot_correct"] / slot_total) if slot_total else None,
             "macro_non_skip_acc": (group["macro_non_skip_correct"] / non_skip_total) if non_skip_total else None,
             "len_mae": (group["len_abs_sum"] / max(1, count)),
@@ -878,6 +1172,14 @@ def main() -> None:
         "nonfinite_pred_post": nonfinite_pred_post,
         "mse_pre": pre_mse_sum / max(1, total),
         "mse_post": post_mse_sum / max(1, total),
+        "constrained_mse_pre": pre_constrained_sum / max(1, total),
+        "constrained_mse_post": post_constrained_sum / max(1, total),
+        "weighted_mse_pre": pre_weighted_sum / max(1, total),
+        "weighted_mse_post": post_weighted_sum / max(1, total),
+        "ripple_pre": (ripple_pre_sum / ripple_count) if ripple_count else None,
+        "ripple_post": (ripple_post_sum / ripple_count) if ripple_count else None,
+        "stopband_max_pre": (stop_pre_sum / stop_count) if stop_count else None,
+        "stopband_max_post": (stop_post_sum / stop_count) if stop_count else None,
         "macro_acc": (macro_slot_correct / macro_slot_total) if macro_slot_total else None,
         "macro_non_skip_acc": (macro_non_skip_correct / macro_non_skip_total) if macro_non_skip_total else None,
         "len_mae": (len_abs_sum / max(1, total)),
@@ -892,6 +1194,39 @@ def main() -> None:
         "config": str(cfg_path),
         "checkpoint": str(ckpt_path),
     }
+
+    if uniform_enabled:
+        per_type_uniform_out = {}
+        for name, group in per_type_uniform.items():
+            count = group["count"]
+            per_type_uniform_out[name] = {
+                "count": count,
+                "failed": group["failed"],
+                "mse_pre": group["mse_pre"] / max(1, count),
+                "mse_post": group["mse_post"] / max(1, count),
+                "constrained_mse_pre": group["constrained_mse_pre"] / max(1, count),
+                "constrained_mse_post": group["constrained_mse_post"] / max(1, count),
+                "weighted_mse_pre": group["weighted_mse_pre"] / max(1, count),
+                "weighted_mse_post": group["weighted_mse_post"] / max(1, count),
+                "ripple_pre": (group["ripple_pre_sum"] / group["ripple_count"]) if group["ripple_count"] else None,
+                "ripple_post": (group["ripple_post_sum"] / group["ripple_count"]) if group["ripple_count"] else None,
+                "stopband_max_pre": (group["stop_pre_sum"] / group["stop_count"]) if group["stop_count"] else None,
+                "stopband_max_post": (group["stop_post_sum"] / group["stop_count"]) if group["stop_count"] else None,
+            }
+        results["uniform_grid"] = {
+            "num_samples": uni_total,
+            "mse_pre": (uni_pre_mse_sum / uni_total) if uni_total else None,
+            "mse_post": (uni_post_mse_sum / uni_total) if uni_total else None,
+            "constrained_mse_pre": (uni_pre_constrained_sum / uni_total) if uni_total else None,
+            "constrained_mse_post": (uni_post_constrained_sum / uni_total) if uni_total else None,
+            "weighted_mse_pre": (uni_pre_weighted_sum / uni_total) if uni_total else None,
+            "weighted_mse_post": (uni_post_weighted_sum / uni_total) if uni_total else None,
+            "ripple_pre": (uni_ripple_pre_sum / uni_ripple_count) if uni_ripple_count else None,
+            "ripple_post": (uni_ripple_post_sum / uni_ripple_count) if uni_ripple_count else None,
+            "stopband_max_pre": (uni_stop_pre_sum / uni_stop_count) if uni_stop_count else None,
+            "stopband_max_post": (uni_stop_post_sum / uni_stop_count) if uni_stop_count else None,
+            "per_filter_type": per_type_uniform_out,
+        }
 
     print(json.dumps(results, indent=2))
     if args.output:

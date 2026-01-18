@@ -49,6 +49,48 @@ def barrier_loss(
     return torch.mean(min_term**2 + max_term**2)
 
 
+def _masked_mse_components(
+    pred_db: torch.Tensor,
+    target_db: torch.Tensor,
+    mask_min_db: torch.Tensor | None,
+    mask_max_db: torch.Tensor | None,
+    *,
+    w_pass: float = 1.0,
+    w_stop: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred = pred_db.reshape(-1)
+    target = target_db.reshape(-1)
+    full_mse = F.mse_loss(pred, target)
+    if mask_min_db is None or mask_max_db is None:
+        return full_mse, full_mse, full_mse
+    mask_min = torch.isfinite(mask_min_db.reshape(-1))
+    mask_max = torch.isfinite(mask_max_db.reshape(-1))
+    constrained_mask = mask_min | mask_max
+    if bool(constrained_mask.any()):
+        constrained_mse = torch.mean((pred[constrained_mask] - target[constrained_mask]) ** 2)
+    else:
+        constrained_mse = full_mse
+    pass_mask = mask_min
+    stop_mask = mask_max & ~pass_mask
+    if bool(pass_mask.any()) or bool(stop_mask.any()):
+        err = (pred - target) ** 2
+        num = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        denom = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        if bool(pass_mask.any()):
+            num = num + float(w_pass) * err[pass_mask].sum()
+            denom = denom + float(w_pass) * pass_mask.sum()
+        if bool(stop_mask.any()):
+            num = num + float(w_stop) * err[stop_mask].sum()
+            denom = denom + float(w_stop) * stop_mask.sum()
+        if bool(denom.item() > 0):
+            weighted_mse = num / denom
+        else:
+            weighted_mse = full_mse
+    else:
+        weighted_mse = full_mse
+    return full_mse, constrained_mse, weighted_mse
+
+
 def calc_yield(
     pred_s21_db: torch.Tensor,
     mask_min_db: torch.Tensor,
@@ -1219,6 +1261,9 @@ def unroll_refine_slots(
     mask_min_db: torch.Tensor | None = None,
     mask_max_db: torch.Tensor | None = None,
     barrier_weight: float = 0.0,
+    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse"] = "full_mse",
+    w_pass: float = 1.0,
+    w_stop: float = 5.0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Differentiable unrolled refinement over per-cell slot values with stability guards.
@@ -1228,11 +1273,8 @@ def unroll_refine_slots(
     raw_flat = raw.reshape(-1)
     mask_flat = mask.reshape(-1)
     idx = slot_indices.to(device=raw.device, dtype=torch.long)
-    mask_min = None
-    mask_max = None
-    if mask_min_db is not None and mask_max_db is not None and float(barrier_weight) > 0.0:
-        mask_min = mask_min_db.to(device=raw.device, dtype=raw.dtype)
-        mask_max = mask_max_db.to(device=raw.device, dtype=raw.dtype)
+    mask_min = mask_min_db.to(device=raw.device, dtype=raw.dtype) if mask_min_db is not None else None
+    mask_max = mask_max_db.to(device=raw.device, dtype=raw.dtype) if mask_max_db is not None else None
 
     loss = None
     base_lr = float(lr)
@@ -1246,7 +1288,20 @@ def unroll_refine_slots(
             values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
             values_vec = values_flat.index_select(0, idx)
             pred = circuit(freq_hz, values=values_vec, output="s21_db")
-            loss = F.mse_loss(pred, target_s21_db)
+            full_mse, constrained_mse, weighted_mse = _masked_mse_components(
+                pred,
+                target_s21_db,
+                mask_min,
+                mask_max,
+                w_pass=w_pass,
+                w_stop=w_stop,
+            )
+            if loss_mode == "constrained_mse":
+                loss = constrained_mse
+            elif loss_mode == "weighted_mse":
+                loss = weighted_mse
+            else:
+                loss = full_mse
             if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
                 loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
             if not torch.isfinite(loss):
@@ -1302,6 +1357,9 @@ def unroll_refine_slots_mixed(
     mask_min_db: torch.Tensor | None = None,
     mask_max_db: torch.Tensor | None = None,
     barrier_weight: float = 0.0,
+    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse"] = "full_mse",
+    w_pass: float = 1.0,
+    w_stop: float = 5.0,
     z0: float = 50.0,
     q_L: float | torch.Tensor | None = 50.0,
     q_C: float | torch.Tensor | None = 50.0,
@@ -1312,11 +1370,8 @@ def unroll_refine_slots_mixed(
     Unrolled refinement where the forward pass uses mixed macro ABCD matrices.
     """
     raw = slot_raw
-    mask_min = None
-    mask_max = None
-    if mask_min_db is not None and mask_max_db is not None and float(barrier_weight) > 0.0:
-        mask_min = mask_min_db.to(device=slot_raw.device, dtype=slot_raw.dtype)
-        mask_max = mask_max_db.to(device=slot_raw.device, dtype=slot_raw.dtype)
+    mask_min = mask_min_db.to(device=slot_raw.device, dtype=slot_raw.dtype) if mask_min_db is not None else None
+    mask_max = mask_max_db.to(device=slot_raw.device, dtype=slot_raw.dtype) if mask_max_db is not None else None
     loss = None
     base_lr = float(lr)
     backoff_tries = max(0, int(max_backoff))
@@ -1340,7 +1395,20 @@ def unroll_refine_slots_mixed(
                 raw_min=None,
                 raw_max=None,
             )
-            loss = F.mse_loss(pred, target_s21_db)
+            full_mse, constrained_mse, weighted_mse = _masked_mse_components(
+                pred,
+                target_s21_db,
+                mask_min,
+                mask_max,
+                w_pass=w_pass,
+                w_stop=w_stop,
+            )
+            if loss_mode == "constrained_mse":
+                loss = constrained_mse
+            elif loss_mode == "weighted_mse":
+                loss = weighted_mse
+            else:
+                loss = full_mse
             if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
                 loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
             if not torch.isfinite(loss):
