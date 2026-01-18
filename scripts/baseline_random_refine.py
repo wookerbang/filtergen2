@@ -238,7 +238,7 @@ def main() -> None:
     id_to_macro = list(macro_vocab)
     skip_id = len(macro_vocab)
     slot_count = max(len(MACRO_LIBRARY[m].slot_types) for m in macro_vocab)
-    macro_slot_mask = torch.zeros((len(macro_vocab) + 1, slot_count), dtype=torch.float32)
+    macro_slot_mask = torch.zeros((len(macro_vocab) + 1, slot_count), dtype=torch.float32, device=device)
     for mid, macro in enumerate(macro_vocab):
         slen = len(MACRO_LIBRARY[macro].slot_types)
         if slen > 0:
