@@ -233,6 +233,8 @@ def main() -> None:
     else:
         idxs = list(range(len(samples)))
 
+    device = torch.device(args.device)
+
     macro_vocab = sorted({m for seq in macro_seqs for m in seq})
     macro_to_id = {m: i for i, m in enumerate(macro_vocab)}
     id_to_macro = list(macro_vocab)
@@ -248,7 +250,6 @@ def main() -> None:
     shunt_macros = [m for m in macro_vocab if m not in SERIES_MACROS]
 
     assembler = DynamicCircuitAssembler(z0=50.0)
-    device = torch.device(args.device)
 
     results = []
     steps_to_success_list: List[int] = []
