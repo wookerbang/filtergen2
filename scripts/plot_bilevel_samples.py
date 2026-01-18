@@ -229,6 +229,15 @@ class BilevelPlotDataset:
         stopband_max_db = float(s.get("stopband_max_db", -40.0) or -40.0)
         order = float(s.get("order", 0.0) or 0.0)
 
+        mask_min = s.get("mask_min_db")
+        mask_max = s.get("mask_max_db")
+        if mask_min is None:
+            mask_min = [float("nan")] * len(freq)
+        if mask_max is None:
+            mask_max = [float("nan")] * len(freq)
+        mask_min = torch.tensor(mask_min, dtype=torch.float32)
+        mask_max = torch.tensor(mask_max, dtype=torch.float32)
+
         return {
             "raw": s,
             "macro_ir_macros": self.macro_ir_macros[idx],
@@ -243,6 +252,8 @@ class BilevelPlotDataset:
             "order": float(order),
             "ideal_s21_db": ideal_s21,
             "real_s21_db": real_s21,
+            "mask_min_db": mask_min,
+            "mask_max_db": mask_max,
         }
 
 
@@ -375,6 +386,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--unroll-steps", type=int, default=0, help="Refine slot values before plotting (0 disables).")
     p.add_argument("--inner-lr", type=float, default=1e-2, help="Inner-loop LR for refinement.")
     p.add_argument("--inner-max-step", type=float, default=0.5, help="Max step size for refinement.")
+    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument("--w-pass", type=float, default=None, help="Weighted MSE passband weight.")
+    p.add_argument("--w-stop", type=float, default=None, help="Weighted MSE stopband weight.")
+    p.add_argument("--barrier-weight", type=float, default=None, help="Barrier loss weight for refine.")
     return p.parse_args()
 
 
@@ -395,6 +410,10 @@ def main() -> None:
     spec_mode = args.spec_mode or cfg.get("spec_mode", "type_fc")
     include_s11 = bool(args.include_s11) if args.include_s11 is not None else bool(cfg.get("include_s11", True))
     wave_norm = bool(args.wave_norm) if args.wave_norm is not None else bool(cfg.get("wave_norm", False))
+    loss_mode = args.loss_mode or cfg.get("loss_mode", "full_mse")
+    w_pass = float(args.w_pass) if args.w_pass is not None else float(cfg.get("w_pass", 1.0))
+    w_stop = float(args.w_stop) if args.w_stop is not None else float(cfg.get("w_stop", 5.0))
+    barrier_weight = float(args.barrier_weight) if args.barrier_weight is not None else float(cfg.get("barrier_weight", 0.0))
 
     dataset = BilevelPlotDataset(
         str(args.data),
@@ -515,6 +534,12 @@ def main() -> None:
                 max_backoff=3,
                 create_graph=False,
                 return_raw=True,
+                mask_min_db=sample.get("mask_min_db"),
+                mask_max_db=sample.get("mask_max_db"),
+                barrier_weight=barrier_weight,
+                loss_mode=loss_mode,
+                w_pass=w_pass,
+                w_stop=w_stop,
             )
             slot_raw = refined_raw.detach()
 

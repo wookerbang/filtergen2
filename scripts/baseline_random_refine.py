@@ -151,6 +151,9 @@ def _refine_slots(
     raw_min: float,
     raw_max: float,
     barrier_weight: float,
+    loss_mode: str,
+    w_pass: float,
+    w_stop: float,
     yield_threshold: float,
 ) -> Tuple[torch.Tensor, List[float], int]:
     raw_flat = slot_raw.reshape(-1).detach()
@@ -162,7 +165,38 @@ def _refine_slots(
         values_flat = torch.exp(raw_flat) * mask_flat + 1e-30
         values_vec = values_flat.index_select(0, slot_idx)
         pred = circuit(freq, values=values_vec, output="s21_db")
-        loss = F.mse_loss(pred, target)
+        full_mse = F.mse_loss(pred, target)
+        min_mask = torch.isfinite(mask_min.reshape(-1))
+        max_mask = torch.isfinite(mask_max.reshape(-1))
+        constrained_mask = min_mask | max_mask
+        if bool(constrained_mask.any()):
+            constrained_mse = torch.mean((pred.reshape(-1)[constrained_mask] - target.reshape(-1)[constrained_mask]) ** 2)
+        else:
+            constrained_mse = full_mse
+        pass_mask = min_mask
+        stop_mask = max_mask & ~pass_mask
+        if bool(pass_mask.any()) or bool(stop_mask.any()):
+            err = (pred - target) ** 2
+            num = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            denom = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            if bool(pass_mask.any()):
+                num = num + float(w_pass) * err[pass_mask].sum()
+                denom = denom + float(w_pass) * pass_mask.sum()
+            if bool(stop_mask.any()):
+                num = num + float(w_stop) * err[stop_mask].sum()
+                denom = denom + float(w_stop) * stop_mask.sum()
+            if bool(denom.item() > 0):
+                weighted_mse = num / denom
+            else:
+                weighted_mse = full_mse
+        else:
+            weighted_mse = full_mse
+        if loss_mode == "constrained_mse":
+            loss = constrained_mse
+        elif loss_mode == "weighted_mse":
+            loss = weighted_mse
+        else:
+            loss = full_mse
         if barrier_weight > 0.0:
             loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
         loss_hist.append(float(loss.detach().cpu().item()))
@@ -180,6 +214,7 @@ def _refine_slots(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Random-topology + refine baseline.")
     p.add_argument("--data", type=Path, required=True, help="Path to eval jsonl.")
+    p.add_argument("--config", type=Path, help="Optional input_config.json to sync refine loss settings.")
     p.add_argument("--num", type=int, default=200, help="Number of samples to evaluate (0=all).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -193,7 +228,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-max-step", type=float, default=0.5)
     p.add_argument("--raw-min", type=float, default=-32.0)
     p.add_argument("--raw-max", type=float, default=-12.0)
-    p.add_argument("--barrier-weight", type=float, default=1.0)
+    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument("--w-pass", type=float, default=None)
+    p.add_argument("--w-stop", type=float, default=None)
+    p.add_argument("--barrier-weight", type=float, default=None)
     p.add_argument("--yield-threshold", type=float, default=1.0)
     p.add_argument("--output", type=Path, help="Optional JSONL output path.")
     return p.parse_args()
@@ -204,6 +242,14 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    cfg = {}
+    if args.config is not None:
+        with args.config.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    loss_mode = args.loss_mode or cfg.get("loss_mode", "full_mse")
+    w_pass = float(args.w_pass) if args.w_pass is not None else float(cfg.get("w_pass", 1.0))
+    w_stop = float(args.w_stop) if args.w_stop is not None else float(cfg.get("w_stop", 5.0))
+    barrier_weight = float(args.barrier_weight) if args.barrier_weight is not None else float(cfg.get("barrier_weight", 1.0))
 
     samples: List[dict] = []
     macro_seqs: List[List[str]] = []
@@ -334,7 +380,10 @@ def main() -> None:
             max_step=float(args.inner_max_step),
             raw_min=float(args.raw_min),
             raw_max=float(args.raw_max),
-            barrier_weight=float(args.barrier_weight),
+            barrier_weight=barrier_weight,
+            loss_mode=loss_mode,
+            w_pass=w_pass,
+            w_stop=w_stop,
             yield_threshold=float(args.yield_threshold),
         )
         total_sims += int(args.steps)

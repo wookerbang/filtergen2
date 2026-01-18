@@ -494,8 +494,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=None)
     p.add_argument("--inner-nan-backoff", type=float, default=None)
     p.add_argument("--inner-nan-tries", type=int, default=None)
-    p.add_argument("--w-pass", type=float, default=1.0, help="Weighted MSE passband weight.")
-    p.add_argument("--w-stop", type=float, default=5.0, help="Weighted MSE stopband weight.")
+    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument("--w-pass", type=float, default=None, help="Weighted MSE passband weight.")
+    p.add_argument("--w-stop", type=float, default=None, help="Weighted MSE stopband weight.")
+    p.add_argument("--barrier-weight", type=float, default=None, help="Barrier loss weight for refine.")
     p.add_argument(
         "--uniform-grid",
         action="store_true",
@@ -590,6 +592,10 @@ def main() -> None:
     target_wave = args.target_wave or cfg.get("target_wave", "ideal")
     force_order_length = bool(cfg.get("force_order_length", False)) if args.force_order_length is None else bool(args.force_order_length)
     include_s11 = cfg.get("include_s11", True) if args.include_s11 is None else bool(args.include_s11)
+    loss_mode = args.loss_mode or cfg.get("loss_mode", "full_mse")
+    w_pass = float(args.w_pass) if args.w_pass is not None else float(cfg.get("w_pass", 1.0))
+    w_stop = float(args.w_stop) if args.w_stop is not None else float(cfg.get("w_stop", 5.0))
+    barrier_weight = float(args.barrier_weight) if args.barrier_weight is not None else float(cfg.get("barrier_weight", 0.0))
     d_model = int(cfg.get("d_model", 512))
     hidden_mult = int(cfg.get("hidden_mult", 2))
     dropout = float(cfg.get("dropout", 0.1))
@@ -854,8 +860,8 @@ def main() -> None:
                     target[b],
                     mask_min[b],
                     mask_max[b],
-                    w_pass=float(args.w_pass),
-                    w_stop=float(args.w_stop),
+                    w_pass=w_pass,
+                    w_stop=w_stop,
                 )
                 if not math.isfinite(pre_mse):
                     nonfinite_pred_pre += 1
@@ -885,6 +891,12 @@ def main() -> None:
                     max_backoff=inner_nan_tries,
                     create_graph=False,
                     return_raw=True,
+                    mask_min_db=mask_min[b],
+                    mask_max_db=mask_max[b],
+                    barrier_weight=barrier_weight,
+                    loss_mode=loss_mode,
+                    w_pass=w_pass,
+                    w_stop=w_stop,
                 )
                 raw_post = raw_post.to(dtype)
                 values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
@@ -904,8 +916,8 @@ def main() -> None:
                     target[b],
                     mask_min[b],
                     mask_max[b],
-                    w_pass=float(args.w_pass),
-                    w_stop=float(args.w_stop),
+                    w_pass=w_pass,
+                    w_stop=w_stop,
                 )
                 if not math.isfinite(post_mse):
                     nonfinite_pred_post += 1
@@ -1008,16 +1020,16 @@ def main() -> None:
                             target_u,
                             mask_min_u,
                             mask_max_u,
-                            w_pass=float(args.w_pass),
-                            w_stop=float(args.w_stop),
+                            w_pass=w_pass,
+                            w_stop=w_stop,
                         )
                         uni_post_mse, uni_post_con, uni_post_w = _masked_mse_components(
                             pred_post_u,
                             target_u,
                             mask_min_u,
                             mask_max_u,
-                            w_pass=float(args.w_pass),
-                            w_stop=float(args.w_stop),
+                            w_pass=w_pass,
+                            w_stop=w_stop,
                         )
                         uni_pre_ripple, uni_pre_stop = _band_metrics(pred_pre_u, mask_min_u, mask_max_u)
                         uni_post_ripple, uni_post_stop = _band_metrics(pred_post_u, mask_min_u, mask_max_u)
