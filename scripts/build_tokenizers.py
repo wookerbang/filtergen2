@@ -98,6 +98,11 @@ def main() -> None:
     dsl_vocab = SPECIAL_TOKENS + build_dsl_vocab(order_range=order_range)
     build_wordlevel_tokenizer(dsl_vocab, out_dir / "dsl_tokenizer")
 
+    # DSL vocab with discrete value tokens
+    dsl_value_vocab = SPECIAL_TOKENS + build_dsl_vocab(order_range=order_range)
+    dsl_value_vocab += [f"<VAL_{label}>" for label in val_labels]
+    build_wordlevel_tokenizer(dsl_value_vocab, out_dir / "dsl_value_tokenizer")
+
     # SFCI net-centric vocab
     sfci_vocab = SPECIAL_TOKENS + build_sfci_net_vocab(
         value_labels=val_labels,
@@ -113,6 +118,7 @@ def main() -> None:
     print(f"Saved VACT tokenizer to {out_dir / 'vact_tokenizer'}")
     print(f"Saved VACT-Struct tokenizer to {out_dir / 'vact_struct_tokenizer'}")
     print(f"Saved DSL tokenizer to {out_dir / 'dsl_tokenizer'}")
+    print(f"Saved DSL+Value tokenizer to {out_dir / 'dsl_value_tokenizer'}")
     print(f"Saved SFCI tokenizer to {out_dir / 'sfci_tokenizer'}")
     print(f"Saved Action tokenizer to {out_dir / 'action_tokenizer'}")
 

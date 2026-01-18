@@ -11,6 +11,9 @@ from typing import Literal, Sequence
 import torch
 from torch.utils.data import Dataset
 
+from . import quantization
+from .dsl import VAL_NONE, VALUE_SLOTS
+
 
 class FilterDesignDataset(Dataset):
     def __init__(
@@ -19,7 +22,7 @@ class FilterDesignDataset(Dataset):
         tokenizer,
         use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
         mix_real_prob: float = 0.3,
-        use_repr: Literal["vact", "vact_struct", "dsl", "sfci", "action"] = "vact",
+        use_repr: Literal["vact", "vact_struct", "dsl", "dsl_value", "sfci", "action"] = "vact",
         normalize_wave: bool = False,
         freq_mode: Literal["none", "log_fc", "linear_fc", "log_f", "log_f_centered"] = "log_fc",
         freq_scale: Literal["none", "log_fc", "log_f_mean"] = "none",
@@ -37,6 +40,86 @@ class FilterDesignDataset(Dataset):
         self.freq_mode = freq_mode
         self.freq_scale = freq_scale
         self.include_s11 = include_s11
+        self._dsl_value_cfg = None
+        if self.use_repr == "dsl_value":
+            self._dsl_value_cfg = self._build_dsl_value_cfg()
+
+    def _build_dsl_value_cfg(self) -> dict:
+        vocab = self.tokenizer.get_vocab()
+        slot_token_kind: dict[str, str] = {}
+        for tok in VALUE_SLOTS:
+            if tok.startswith("<VAL_L"):
+                slot_token_kind[tok] = "L"
+            elif tok.startswith("<VAL_C"):
+                slot_token_kind[tok] = "C"
+
+        value_tokens: dict[str, dict[float, str]] = {"L": {}, "C": {}}
+        value_lists: dict[str, list[tuple[float, str]]] = {"L": [], "C": []}
+        for tok in vocab:
+            if not tok.startswith("<VAL_"):
+                continue
+            if tok in VALUE_SLOTS or tok == VAL_NONE:
+                continue
+            label = tok.replace("<VAL_", "").replace(">", "")
+            kind = label.split("_", 1)[0] if "_" in label else ""
+            if kind not in ("L", "C"):
+                continue
+            try:
+                value = float(quantization.label_to_value(label))
+            except Exception:
+                continue
+            key = round(value, 18)
+            value_tokens[kind][key] = tok
+            value_lists[kind].append((value, tok))
+        for kind in value_lists:
+            value_lists[kind].sort(key=lambda x: x[0])
+        if not value_lists["L"] or not value_lists["C"]:
+            raise ValueError("dsl_value repr requires value label tokens (build dsl_value_tokenizer).")
+        return {
+            "slot_token_kind": slot_token_kind,
+            "value_tokens": value_tokens,
+            "value_lists": value_lists,
+        }
+
+    def _nearest_value_token(self, kind: str, value: float) -> str | None:
+        if self._dsl_value_cfg is None:
+            return None
+        candidates = self._dsl_value_cfg["value_lists"].get(kind) or []
+        if not candidates:
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        best_tok = None
+        best_err = float("inf")
+        for v, tok in candidates:
+            err = abs(v - value) / max(abs(value), 1e-24)
+            if err < best_err:
+                best_err = err
+                best_tok = tok
+        return best_tok
+
+    def _dsl_tokens_with_values(self, tokens: Sequence[str], slot_values: Sequence[float] | None) -> list[str]:
+        if self._dsl_value_cfg is None:
+            return list(tokens or [])
+        out: list[str] = []
+        slot_vals = list(slot_values) if slot_values is not None else []
+        slot_token_kind = self._dsl_value_cfg["slot_token_kind"]
+        value_tokens = self._dsl_value_cfg["value_tokens"]
+        for idx, tok in enumerate(tokens or []):
+            if tok in VALUE_SLOTS:
+                kind = slot_token_kind.get(tok)
+                v = slot_vals[idx] if idx < len(slot_vals) else float("nan")
+                if kind is None or not math.isfinite(v) or v <= 0.0:
+                    out.append(VAL_NONE)
+                    continue
+                key = round(float(v), 18)
+                tok_match = value_tokens.get(kind, {}).get(key)
+                if tok_match is None:
+                    tok_match = self._nearest_value_token(kind, float(v))
+                out.append(tok_match if tok_match is not None else VAL_NONE)
+            else:
+                out.append(tok)
+        return out
 
     def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
         """
@@ -158,6 +241,10 @@ class FilterDesignDataset(Dataset):
         elif self.use_repr == "dsl":
             tokens_raw = s.get("dsl_tokens")
             value_targets = s.get("dsl_slot_values")
+        elif self.use_repr == "dsl_value":
+            tokens_raw = s.get("dsl_tokens")
+            value_targets = None
+            tokens_raw = self._dsl_tokens_with_values(tokens_raw or [], s.get("dsl_slot_values") or [])
         elif self.use_repr == "sfci":
             tokens_raw = s.get("sfci_tokens")
         else:
@@ -183,8 +270,8 @@ class FilterDesignDataset(Dataset):
             "input_ids": token_ids,
             "vact_tokens": token_ids if self.use_repr == "vact" else None,
             "vact_struct_tokens": token_ids if self.use_repr == "vact_struct" else None,
-            "dsl_tokens": token_ids if self.use_repr == "dsl" else None,
-            "dsl_tokens_raw": list(tokens_raw or []) if self.use_repr == "dsl" else None,
+            "dsl_tokens": token_ids if self.use_repr in ("dsl", "dsl_value") else None,
+            "dsl_tokens_raw": list(tokens_raw or []) if self.use_repr in ("dsl", "dsl_value") else None,
             "sfci_tokens": token_ids if self.use_repr == "sfci" else None,
             "action_tokens": token_ids if self.use_repr == "action" else None,
             "value_targets": value_targets,

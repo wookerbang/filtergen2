@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "action"],
+        choices=["vact", "vact_struct", "dsl", "dsl_value", "action"],
         default="vact_struct",
     )
     p.add_argument("--num", type=int, default=50, help="Number of samples to run.")
@@ -227,7 +227,7 @@ def main() -> None:
             prefix_allowed = make_vact_syntax_prefix_allowed_tokens_fn(tokenizer)
         elif args.repr == "vact_struct":
             prefix_allowed = make_vact_struct_prefix_allowed_tokens_fn(tokenizer)
-        elif args.repr == "dsl":
+        elif args.repr in ("dsl", "dsl_value"):
             prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
 
     q_l = args.q if args.q_l is None else args.q_l

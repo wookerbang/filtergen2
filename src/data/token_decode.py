@@ -9,7 +9,7 @@ from .sfci_net_codec import sfci_net_tokens_to_components
 from .vact_codec import vact_tokens_to_components
 
 
-ReprKind = Literal["vact", "vact_struct", "sfci", "action", "dsl"]
+ReprKind = Literal["vact", "vact_struct", "sfci", "action", "dsl", "dsl_value"]
 
 
 def build_label_value_map(tokenizer) -> Dict[str, float]:
@@ -47,7 +47,7 @@ def decode_components_from_token_ids(
     if repr_kind == "sfci":
         comps = sfci_net_tokens_to_components(tokens, label_to_value=label_to_value)
         return comps, tokens
-    if repr_kind == "dsl":
+    if repr_kind in ("dsl", "dsl_value"):
         if slot_values is not None:
             if len(slot_values) != len(ids):
                 raise ValueError(f"slot_values must align with token_ids: {len(slot_values)} != {len(ids)}")

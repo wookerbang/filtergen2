@@ -41,13 +41,15 @@ def make_collate_fn(tokenizer, use_repr: str):
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
     vocab = tokenizer.get_vocab()
+    use_value_targets = use_repr != "dsl_value"
     id_to_value = [float("nan")] * len(vocab)
-    for tok, tid in vocab.items():
-        if tok.startswith("<VAL_"):
-            try:
-                id_to_value[int(tid)] = float(quantization.label_to_value(tok.replace("<VAL_", "").replace(">", "")))
-            except Exception:
-                continue
+    if use_value_targets:
+        for tok, tid in vocab.items():
+            if tok.startswith("<VAL_"):
+                try:
+                    id_to_value[int(tid)] = float(quantization.label_to_value(tok.replace("<VAL_", "").replace(">", "")))
+                except Exception:
+                    continue
 
     def collate(batch: list[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         waves = torch.stack([b["wave"] for b in batch])  # (B, C, L)
@@ -61,6 +63,8 @@ def make_collate_fn(tokenizer, use_repr: str):
             tokens_key = "vact_struct_tokens"
         elif use_repr == "dsl":
             tokens_key = "dsl_tokens"
+        elif use_repr == "dsl_value":
+            tokens_key = "dsl_tokens"
         else:
             tokens_key = "sfci_tokens"
         seqs = []
@@ -73,27 +77,32 @@ def make_collate_fn(tokenizer, use_repr: str):
             value_lists.append(b.get("value_targets"))
         max_len = max(len(s) for s in seqs)
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
-        value_targets = torch.full((len(batch), max_len), float("nan"), dtype=torch.float32)
+        value_targets = None
+        if use_value_targets:
+            value_targets = torch.full((len(batch), max_len), float("nan"), dtype=torch.float32)
         for i, seq in enumerate(seqs):
             l = len(seq)
             input_ids[i, :l] = torch.tensor(seq, dtype=torch.long)
-            vt_list = value_lists[i] if value_lists[i] is not None else None
-            for t, tid in enumerate(seq):
-                if t >= max_len:
-                    break
-                if vt_list is not None and t < len(vt_list) and vt_list[t] == vt_list[t]:
-                    value_targets[i, t] = float(vt_list[t])
-                elif 0 <= tid < len(id_to_value) and not (id_to_value[tid] != id_to_value[tid]):
-                    value_targets[i, t] = float(id_to_value[tid])
+            if use_value_targets:
+                vt_list = value_lists[i] if value_lists[i] is not None else None
+                for t, tid in enumerate(seq):
+                    if t >= max_len:
+                        break
+                    if vt_list is not None and t < len(vt_list) and vt_list[t] == vt_list[t]:
+                        value_targets[i, t] = float(vt_list[t])
+                    elif 0 <= tid < len(id_to_value) and not (id_to_value[tid] != id_to_value[tid]):
+                        value_targets[i, t] = float(id_to_value[tid])
         labels = input_ids.clone()
         labels[labels == pad_id] = -100  # ignore pad in loss
-        return {
+        batch_out = {
             "wave": waves,
             "filter_type": filter_type,
             "fc_hz": fc_hz,
             "labels": labels,
-            "value_targets": value_targets,
         }
+        if use_value_targets:
+            batch_out["value_targets"] = value_targets
+        return batch_out
 
     return collate
 
@@ -440,7 +449,7 @@ def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
         return _mask_vact
     if repr_kind == "vact_struct":
         return _mask_vact_struct
-    if repr_kind == "dsl":
+    if repr_kind in ("dsl", "dsl_value"):
         prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
 
         def _mask_dsl(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -563,7 +572,7 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(include_s11=True)
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "sfci", "action"],
+        choices=["vact", "vact_struct", "dsl", "dsl_value", "sfci", "action"],
         default="dsl",
         help="Which token sequence to train on.",
     )

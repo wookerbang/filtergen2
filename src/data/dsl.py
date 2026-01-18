@@ -15,6 +15,7 @@ from typing import Callable, Dict, Iterable, List, Sequence, Set, Tuple
 
 from .schema import ComponentSpec
 from .action_codec import components_to_action_tokens
+from .quantization import label_to_value
 
 # ---- Tokens ----
 
@@ -488,6 +489,42 @@ SLOT_TYPE_TO_TOKEN = {
     "L_NOTCH": VAL_L_NOTCH,
     "C_NOTCH": VAL_C_NOTCH,
 }
+
+
+def _is_value_label_token(tok: str) -> bool:
+    return tok.startswith("<VAL_") and tok not in VALUE_SLOTS and tok != VAL_NONE
+
+
+def _slot_type_kind(slot_type: str) -> str | None:
+    if not slot_type:
+        return None
+    head = slot_type[0]
+    if head == "L":
+        return "L"
+    if head == "C":
+        return "C"
+    return None
+
+
+def _label_kind(label: str) -> str | None:
+    if "_" not in label:
+        return None
+    kind = label.split("_", 1)[0]
+    return kind if kind in ("L", "C") else None
+
+
+def _value_from_label_token(tok: str, slot_type: str | None = None) -> float | None:
+    if not _is_value_label_token(tok):
+        return None
+    label = tok.replace("<VAL_", "").replace(">", "")
+    kind = _label_kind(label)
+    expected = _slot_type_kind(slot_type) if slot_type else None
+    if expected is not None and kind is not None and kind != expected:
+        return None
+    try:
+        return float(label_to_value(label))
+    except Exception:
+        return None
 
 
 # ---- Vocab builder ----
@@ -1290,10 +1327,15 @@ def dsl_tokens_to_components(
                     expected_tok = SLOT_TYPE_TO_TOKEN.get(slot_type)
                     if tok_slot == VAL_NONE:
                         vals_for_macro.append(float("nan"))
-                    elif expected_tok is None or tok_slot != expected_tok:
-                        return []
                     else:
-                        vals_for_macro.append(float(v_slot) if v_slot == v_slot else float("nan"))
+                        val = None
+                        if expected_tok is not None and tok_slot == expected_tok:
+                            val = float(v_slot) if v_slot == v_slot else float("nan")
+                        else:
+                            val = _value_from_label_token(tok_slot, slot_type=slot_type)
+                        if val is None:
+                            return []
+                        vals_for_macro.append(val)
                 segments.append((tok_macro, vals_for_macro))
             tok_end, _ = _next()
             if tok_end != REPEAT_END:
@@ -1311,10 +1353,15 @@ def dsl_tokens_to_components(
                 expected_tok = SLOT_TYPE_TO_TOKEN.get(slot_type)
                 if tok_slot == VAL_NONE:
                     vals_for_macro.append(float("nan"))
-                elif expected_tok is None or tok_slot != expected_tok:
-                    return []
                 else:
-                    vals_for_macro.append(float(v_slot) if v_slot == v_slot else float("nan"))
+                    val = None
+                    if expected_tok is not None and tok_slot == expected_tok:
+                        val = float(v_slot) if v_slot == v_slot else float("nan")
+                    else:
+                        val = _value_from_label_token(tok_slot, slot_type=slot_type)
+                    if val is None:
+                        return []
+                    vals_for_macro.append(val)
             segments.append((tok_macro, vals_for_macro))
         else:
             return []
@@ -1341,6 +1388,144 @@ def dsl_tokens_to_components(
         else:
             comps.extend(macro.expand_fn(current, current, "gnd", vals_for_macro, i))
     return comps
+
+
+# ---- DSL parsing helpers ----
+
+
+def dsl_tokens_to_macro_values(
+    tokens: Sequence[str],
+    *,
+    slot_values: Sequence[float] | None = None,
+    strict: bool = True,
+) -> List[Tuple[str, List[float]]]:
+    """
+    Parse DSL tokens into an expanded macro list with per-cell slot values.
+    Returns [(macro_id, [slot_values...]), ...] in cell order.
+    """
+    toks = list(tokens)
+    vals = list(slot_values) if slot_values is not None else [float("nan")] * len(toks)
+    idx = 0
+
+    def _next() -> Tuple[str | None, float]:
+        nonlocal idx
+        tok = toks[idx] if idx < len(toks) else None
+        val = vals[idx] if idx < len(vals) else float("nan")
+        idx += 1
+        return tok, val
+
+    def _fail(msg: str) -> List[Tuple[str, List[float]]]:
+        if strict:
+            raise ValueError(msg)
+        return []
+
+    tok, _ = _next()
+    if tok == BOS:
+        tok, _ = _next()
+    while tok is not None and tok.startswith("<ORDER_"):
+        tok, _ = _next()
+    if tok != MAIN_START:
+        return _fail("DSL parse error: missing <MAIN>.")
+    for expected in (PORT_IN, PORT_OUT, PORT_GND):
+        tok, _ = _next()
+        if tok != expected:
+            return _fail(f"DSL parse error: expected {expected}, got {tok}.")
+
+    segments: List[Tuple[str, List[float]]] = []
+    while True:
+        tok, _ = _next()
+        if tok is None or tok == MAIN_END:
+            break
+        if tok == REPEAT_START:
+            tok_k, _ = _next()
+            if tok_k == K_VAR_START:
+                digits: List[str] = []
+                while True:
+                    tok_digit, _ = _next()
+                    if tok_digit is None:
+                        return _fail("DSL parse error: unterminated <K>...</K>.")
+                    if tok_digit == K_VAR_END:
+                        break
+                    if tok_digit not in DIGIT_TOKENS:
+                        return _fail(f"DSL parse error: invalid digit token {tok_digit}.")
+                    digits.append(tok_digit.removeprefix("<D_").removesuffix(">"))
+                try:
+                    k_val = max(1, int("".join(digits))) if digits else 1
+                except Exception:
+                    return _fail("DSL parse error: invalid K varint.")
+            elif tok_k in K_TOKENS:
+                try:
+                    k_val = int(tok_k.removeprefix("<K_").removesuffix(">"))
+                except Exception:
+                    return _fail(f"DSL parse error: invalid K token {tok_k}.")
+            else:
+                return _fail(f"DSL parse error: invalid K token {tok_k}.")
+            tok_c, _ = _next()
+            if tok_c != CASCADE:
+                return _fail(f"DSL parse error: expected {CASCADE}, got {tok_c}.")
+            tok_call, _ = _next()
+            if tok_call != CALL:
+                return _fail(f"DSL parse error: expected {CALL}, got {tok_call}.")
+            tok_macro, _ = _next()
+            if tok_macro not in MACRO_LIBRARY:
+                return _fail(f"DSL parse error: unknown macro {tok_macro}.")
+            macro = MACRO_LIBRARY[tok_macro]
+            use_cell_tokens = (idx < len(toks) and toks[idx] == CELL)
+            for _ in range(k_val):
+                if use_cell_tokens:
+                    tok_cell, _ = _next()
+                    if tok_cell != CELL:
+                        return _fail(f"DSL parse error: expected {CELL}, got {tok_cell}.")
+                    while idx < len(toks) and toks[idx] in CELL_INDEX_TOKENS:
+                        _next()
+                vals_for_macro: List[float] = []
+                for slot_type in macro.slot_types:
+                    tok_slot, v_slot = _next()
+                    while tok_slot in CELL_INDEX_TOKENS:
+                        tok_slot, v_slot = _next()
+                    expected_tok = SLOT_TYPE_TO_TOKEN.get(slot_type)
+                    if tok_slot == VAL_NONE:
+                        vals_for_macro.append(float("nan"))
+                    else:
+                        val = None
+                        if expected_tok is not None and tok_slot == expected_tok:
+                            val = float(v_slot) if v_slot == v_slot else float("nan")
+                        else:
+                            val = _value_from_label_token(tok_slot, slot_type=slot_type)
+                        if val is None:
+                            return _fail(f"DSL parse error: expected {expected_tok}, got {tok_slot}.")
+                        vals_for_macro.append(val)
+                segments.append((tok_macro, vals_for_macro))
+            tok_end, _ = _next()
+            if tok_end != REPEAT_END:
+                return _fail(f"DSL parse error: expected {REPEAT_END}, got {tok_end}.")
+        elif tok == CALL:
+            tok_macro, _ = _next()
+            if tok_macro not in MACRO_LIBRARY:
+                return _fail(f"DSL parse error: unknown macro {tok_macro}.")
+            macro = MACRO_LIBRARY[tok_macro]
+            vals_for_macro: List[float] = []
+            for slot_type in macro.slot_types:
+                tok_slot, v_slot = _next()
+                while tok_slot in CELL_INDEX_TOKENS:
+                    tok_slot, v_slot = _next()
+                expected_tok = SLOT_TYPE_TO_TOKEN.get(slot_type)
+                if tok_slot == VAL_NONE:
+                    vals_for_macro.append(float("nan"))
+                else:
+                    val = None
+                    if expected_tok is not None and tok_slot == expected_tok:
+                        val = float(v_slot) if v_slot == v_slot else float("nan")
+                    else:
+                        val = _value_from_label_token(tok_slot, slot_type=slot_type)
+                    if val is None:
+                        return _fail(f"DSL parse error: expected {expected_tok}, got {tok_slot}.")
+                    vals_for_macro.append(val)
+            segments.append((tok_macro, vals_for_macro))
+        else:
+            return _fail(f"DSL parse error: unexpected token {tok}.")
+
+    return segments
 
 
 # ---- Macro parsing helpers ----
@@ -1465,7 +1650,11 @@ def dsl_tokens_to_macro_sequence(tokens: Sequence[str], *, strict: bool = True) 
                     expected = SLOT_TYPE_TO_TOKEN.get(slot_type)
                     if tok_slot == VAL_NONE:
                         pass
-                    elif expected is None or tok_slot != expected:
+                    elif expected is not None and tok_slot == expected:
+                        pass
+                    elif _value_from_label_token(tok_slot, slot_type=slot_type) is not None:
+                        pass
+                    else:
                         if strict:
                             raise ValueError(f"DSL parse error: expected {expected}, got {tok_slot}.")
                         return []
@@ -1486,7 +1675,11 @@ def dsl_tokens_to_macro_sequence(tokens: Sequence[str], *, strict: bool = True) 
                 expected = SLOT_TYPE_TO_TOKEN.get(slot_type)
                 if tok_slot == VAL_NONE:
                     pass
-                elif expected is None or tok_slot != expected:
+                elif expected is not None and tok_slot == expected:
+                    pass
+                elif _value_from_label_token(tok_slot, slot_type=slot_type) is not None:
+                    pass
+                else:
                     if strict:
                         raise ValueError(f"DSL parse error: expected {expected}, got {tok_slot}.")
                     return []
@@ -1531,13 +1724,28 @@ def make_dsl_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], L
     val_none_id = _id(VAL_NONE)
     order_ids = {tid for tok, tid in vocab.items() if tok.startswith("<ORDER_")}
     k_id_to_val = {_id(tok): int(tok.removeprefix("<K_").removesuffix(">")) for tok in K_TOKENS if _id(tok) is not None}
+    value_label_ids_by_kind = {"L": set(), "C": set()}
+    for tok, tid in vocab.items():
+        if not tok.startswith("<VAL_"):
+            continue
+        if tok in VALUE_SLOTS or tok == VAL_NONE:
+            continue
+        label = tok.replace("<VAL_", "").replace(">", "")
+        kind = _label_kind(label)
+        if kind in value_label_ids_by_kind:
+            value_label_ids_by_kind[kind].add(int(tid))
+    value_label_ids_all = set().union(*value_label_ids_by_kind.values()) if value_label_ids_by_kind else set()
     macro_slots_len: Dict[int, int] = {}
     macro_slots_order: Dict[int, List[int]] = {}
     slot_type_to_id: Dict[str, int] = {}
+    slot_token_kind: Dict[int, str] = {}
     for slot_type, slot_tok in SLOT_TYPE_TO_TOKEN.items():
         tid = _id(slot_tok)
         if tid is not None:
             slot_type_to_id[slot_type] = tid
+            kind = _slot_type_kind(slot_type)
+            if kind is not None:
+                slot_token_kind[tid] = kind
     for tok in MACRO_IDS:
         tid = _id(tok)
         if tid is None:
@@ -1707,7 +1915,18 @@ def make_dsl_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], L
                     expected_tok = cell_id if pos_in_group == 0 else (expected_slots[pos_in_group - 1] if expected_slots else None)
                 else:
                     expected_tok = expected_slots[slot_pos] if 0 <= slot_pos < macro_len else None
-                if expected_tok is not None and (tid == expected_tok or (expected_tok != cell_id and tid == val_none_id)):
+                allowed_vals = set()
+                if expected_tok is not None and expected_tok != cell_id:
+                    kind = slot_token_kind.get(expected_tok)
+                    if kind is None:
+                        allowed_vals = value_label_ids_all
+                    else:
+                        allowed_vals = value_label_ids_by_kind.get(kind, set())
+                if expected_tok is not None and (
+                    tid == expected_tok
+                    or (expected_tok != cell_id and tid == val_none_id)
+                    or (expected_tok != cell_id and tid in allowed_vals)
+                ):
                     slot_needed -= 1
                     slot_pos += 1
                     if slot_needed <= 0:
@@ -1814,6 +2033,12 @@ def make_dsl_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], L
                 allowed.add(expected_tok)
                 if expected_tok != cell_id and val_none_id is not None:
                     allowed.add(val_none_id)
+                if expected_tok != cell_id:
+                    kind = slot_token_kind.get(expected_tok)
+                    if kind is None:
+                        allowed.update(value_label_ids_all)
+                    else:
+                        allowed.update(value_label_ids_by_kind.get(kind, set()))
             if in_repeat and cell_idx_ids:
                 allowed.update(cell_idx_ids)
         elif state == S_EXPECT_REPEAT_END:

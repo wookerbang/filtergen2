@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "action"],
+        choices=["vact", "vact_struct", "dsl", "dsl_value", "action"],
         default="vact_struct",
         help="Target representation to decode.",
     )
@@ -308,7 +308,7 @@ def main() -> None:
             prefix_allowed = make_vact_syntax_prefix_allowed_tokens_fn(tokenizer)
         elif args.repr == "vact_struct":
             prefix_allowed = make_vact_struct_prefix_allowed_tokens_fn(tokenizer)
-        elif args.repr == "dsl":
+        elif args.repr in ("dsl", "dsl_value"):
             prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
 
     # metrics accumulators
