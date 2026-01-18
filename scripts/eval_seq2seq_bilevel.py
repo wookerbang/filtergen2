@@ -265,6 +265,44 @@ def _has_constraints(mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
     return bool(torch.isfinite(mask_min).any().item() or torch.isfinite(mask_max).any().item())
 
 
+def _masked_mse_components(
+    pred_db: torch.Tensor,
+    target_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    w_pass: float,
+    w_stop: float,
+) -> tuple[float, float, float]:
+    pred = pred_db.reshape(-1)
+    target = target_db.reshape(-1)
+    full_mse = float(F.mse_loss(pred, target).item())
+    min_mask = torch.isfinite(mask_min_db.reshape(-1))
+    max_mask = torch.isfinite(mask_max_db.reshape(-1))
+    constrained_mask = min_mask | max_mask
+    if bool(constrained_mask.any()):
+        constrained = torch.mean((pred[constrained_mask] - target[constrained_mask]) ** 2)
+        constrained_mse = float(constrained.item())
+    else:
+        constrained_mse = full_mse
+    pass_mask = min_mask
+    stop_mask = max_mask & ~pass_mask
+    if bool(pass_mask.any()) or bool(stop_mask.any()):
+        err = (pred - target) ** 2
+        num = 0.0
+        denom = 0.0
+        if bool(pass_mask.any()):
+            num += float(w_pass) * float(err[pass_mask].sum().item())
+            denom += float(w_pass) * float(pass_mask.sum().item())
+        if bool(stop_mask.any()):
+            num += float(w_stop) * float(err[stop_mask].sum().item())
+            denom += float(w_stop) * float(stop_mask.sum().item())
+        weighted_mse = num / denom if denom > 0.0 else full_mse
+    else:
+        weighted_mse = full_mse
+    return full_mse, constrained_mse, weighted_mse
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate seq2seq DSL model with unroll refinement.")
     p.add_argument("--data", required=True, type=Path, help="Path to dataset jsonl (val/test).")
@@ -322,6 +360,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=-12.0)
     p.add_argument("--inner-nan-backoff", type=float, default=0.5)
     p.add_argument("--inner-nan-tries", type=int, default=3)
+    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument("--w-pass", type=float, default=None)
+    p.add_argument("--w-stop", type=float, default=None)
+    p.add_argument("--barrier-weight", type=float, default=None)
 
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     p.add_argument("--output", type=Path, help="Optional JSON output path.")
@@ -426,6 +468,17 @@ def main() -> None:
                 print(f"[warn] {msg}")
             else:
                 raise ValueError(msg)
+    else:
+        cfg = {}
+
+    loss_mode = args.loss_mode or cfg.get("loss_mode", "full_mse")
+    w_pass = float(args.w_pass) if args.w_pass is not None else float(cfg.get("w_pass", 1.0))
+    w_stop = float(args.w_stop) if args.w_stop is not None else float(cfg.get("w_stop", 5.0))
+    barrier_weight = (
+        float(args.barrier_weight)
+        if args.barrier_weight is not None
+        else float(cfg.get("barrier_weight", 0.0))
+    )
 
     model = VACTT5(
         t5_name=args.t5_name,
@@ -458,6 +511,12 @@ def main() -> None:
     failed = 0
     pre_mse_sum = 0.0
     post_mse_sum = 0.0
+    pre_loss_sum = 0.0
+    post_loss_sum = 0.0
+    pre_constrained_sum = 0.0
+    post_constrained_sum = 0.0
+    pre_weighted_sum = 0.0
+    post_weighted_sum = 0.0
     yield_total = 0
     yield_pre_pass = 0
     yield_post_pass = 0
@@ -568,10 +627,23 @@ def main() -> None:
                 if not torch.isfinite(pred_pre).all():
                     failed += 1
                     continue
-                pre_mse = F.mse_loss(pred_pre, target[b]).item()
+                pre_mse, pre_constrained, pre_weighted = _masked_mse_components(
+                    pred_pre,
+                    target[b],
+                    mask_min[b],
+                    mask_max[b],
+                    w_pass=w_pass,
+                    w_stop=w_stop,
+                )
                 if not math.isfinite(pre_mse):
                     failed += 1
                     continue
+                if loss_mode == "constrained_mse":
+                    pre_loss = pre_constrained
+                elif loss_mode == "weighted_mse":
+                    pre_loss = pre_weighted
+                else:
+                    pre_loss = pre_mse
 
                 raw_init = slot_raw.detach().clone().requires_grad_(True)
                 _, raw_post = unroll_refine_slots(
@@ -590,6 +662,12 @@ def main() -> None:
                     max_backoff=int(args.inner_nan_tries),
                     create_graph=False,
                     return_raw=True,
+                    mask_min_db=mask_min[b],
+                    mask_max_db=mask_max[b],
+                    barrier_weight=barrier_weight,
+                    loss_mode=loss_mode,
+                    w_pass=w_pass,
+                    w_stop=w_stop,
                 )
                 values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec_post = values_flat_post.index_select(0, slot_idx)
@@ -597,13 +675,32 @@ def main() -> None:
                 if not torch.isfinite(pred_post).all():
                     failed += 1
                     continue
-                post_mse = F.mse_loss(pred_post, target[b]).item()
+                post_mse, post_constrained, post_weighted = _masked_mse_components(
+                    pred_post,
+                    target[b],
+                    mask_min[b],
+                    mask_max[b],
+                    w_pass=w_pass,
+                    w_stop=w_stop,
+                )
                 if not math.isfinite(post_mse):
                     failed += 1
                     continue
+                if loss_mode == "constrained_mse":
+                    post_loss = post_constrained
+                elif loss_mode == "weighted_mse":
+                    post_loss = post_weighted
+                else:
+                    post_loss = post_mse
 
                 pre_mse_sum += pre_mse
                 post_mse_sum += post_mse
+                pre_constrained_sum += pre_constrained
+                post_constrained_sum += post_constrained
+                pre_weighted_sum += pre_weighted
+                post_weighted_sum += post_weighted
+                pre_loss_sum += pre_loss
+                post_loss_sum += post_loss
 
                 if _has_constraints(mask_min[b], mask_max[b]):
                     yield_total += 1
@@ -625,6 +722,13 @@ def main() -> None:
         "failed_samples": failed,
         "mse_pre": pre_mse_sum / max(1, total - failed),
         "mse_post": post_mse_sum / max(1, total - failed),
+        "constrained_mse_pre": pre_constrained_sum / max(1, total - failed),
+        "constrained_mse_post": post_constrained_sum / max(1, total - failed),
+        "weighted_mse_pre": pre_weighted_sum / max(1, total - failed),
+        "weighted_mse_post": post_weighted_sum / max(1, total - failed),
+        "loss_mode": loss_mode,
+        "loss_pre": pre_loss_sum / max(1, total - failed),
+        "loss_post": post_loss_sum / max(1, total - failed),
         "yield_total": yield_total,
         "yield_oracle": (yield_oracle_pass / yield_total) if yield_total else None,
         "yield_pre": (yield_pre_pass / yield_total) if yield_total else None,
