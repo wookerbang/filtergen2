@@ -650,6 +650,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-start", type=float, default=1.0)
     p.add_argument("--alpha-min", type=float, default=0.1)
     p.add_argument("--alpha-decay-frac", type=float, default=0.3)
+    p.add_argument(
+        "--force-order-length",
+        dest="force_order_length",
+        action="store_true",
+        help="Force macro length to match filter order (assumes 1 macro per component).",
+    )
+    p.add_argument(
+        "--no-force-order-length",
+        dest="force_order_length",
+        action="store_false",
+        help="Disable order-length constraint.",
+    )
+    p.set_defaults(force_order_length=False)
     p.add_argument("--no-macro-ce", dest="use_macro_ce", action="store_false", help="Disable macro CE loss.")
     p.set_defaults(use_macro_ce=True)
     p.add_argument("--use-token-loss", action="store_true", help="(Reserved) include token loss during bilevel.")
@@ -707,6 +720,34 @@ def _ste_topk_schedule(step: int, total_steps: int, *, k_init: int, anneal_frac:
     frac = min(1.0, float(step - start) / float(denom))
     k_val = float(k_init) - (float(k_init) - 1.0) * frac
     return max(1, int(round(k_val)))
+
+
+def _apply_order_length_mask(
+    logits: torch.Tensor,
+    order: torch.Tensor,
+    *,
+    skip_id: int,
+) -> torch.Tensor:
+    """
+    Enforce exact macro length = order (non-skip before order, skip after).
+    """
+    if logits.ndim != 3:
+        raise ValueError(f"logits must have shape (B,K,V), got {tuple(logits.shape)}")
+    bsz, k_max, _ = logits.shape
+    if order.ndim == 0:
+        order = order.unsqueeze(0)
+    order = order.to(device=logits.device)
+    finite = torch.isfinite(order)
+    order_int = torch.round(order).to(torch.long).clamp(min=1, max=k_max)
+    pos = torch.arange(k_max, device=logits.device).unsqueeze(0).expand(bsz, k_max)
+    before = (pos < order_int.unsqueeze(1)) & finite.unsqueeze(1)
+    after = (pos >= order_int.unsqueeze(1)) & finite.unsqueeze(1)
+    masked = logits.clone()
+    if bool(before.any()):
+        masked[..., skip_id] = masked[..., skip_id].masked_fill(before, -1e9)
+    if bool(after.any()):
+        masked[..., :skip_id] = masked[..., :skip_id].masked_fill(after.unsqueeze(-1), -1e9)
+    return masked
 
 
 def _sparse_topk_probs(probs: torch.Tensor, k: int) -> torch.Tensor:
@@ -842,6 +883,7 @@ def main() -> None:
         "gumbel_tau_decay_frac": args.gumbel_tau_decay_frac,
         "mix_topk": args.mix_topk,
         "ste_phys": bool(args.ste_phys),
+        "force_order_length": bool(args.force_order_length),
         "ste_topk": args.ste_topk,
         "ste_topk_anneal_frac": args.ste_topk_anneal_frac,
         "ste_phys_weight": args.ste_phys_weight,
@@ -1010,6 +1052,8 @@ def main() -> None:
                 g_logits = g_logits.float()
                 slot_raw = slot_raw.float()
             slot_raw = slot_raw.to(dtype)
+            if args.force_order_length:
+                g_logits = _apply_order_length_mask(g_logits, order, skip_id=skip_id)
             if not (torch.isfinite(g_logits).all() and torch.isfinite(slot_raw).all()):
                 skipped_nonfinite += 1
                 if not args.skip_nonfinite and skipped_nonfinite <= 3:

@@ -295,6 +295,34 @@ def _has_constraints(mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
     return bool(torch.isfinite(mask_min).any().item() or torch.isfinite(mask_max).any().item())
 
 
+def _apply_order_length_mask(
+    logits: torch.Tensor,
+    order: torch.Tensor,
+    *,
+    skip_id: int,
+) -> torch.Tensor:
+    """
+    Enforce exact macro length = order (non-skip before order, skip after).
+    """
+    if logits.ndim != 3:
+        raise ValueError(f"logits must have shape (B,K,V), got {tuple(logits.shape)}")
+    bsz, k_max, _ = logits.shape
+    if order.ndim == 0:
+        order = order.unsqueeze(0)
+    order = order.to(device=logits.device)
+    finite = torch.isfinite(order)
+    order_int = torch.round(order).to(torch.long).clamp(min=1, max=k_max)
+    pos = torch.arange(k_max, device=logits.device).unsqueeze(0).expand(bsz, k_max)
+    before = (pos < order_int.unsqueeze(1)) & finite.unsqueeze(1)
+    after = (pos >= order_int.unsqueeze(1)) & finite.unsqueeze(1)
+    masked = logits.clone()
+    if bool(before.any()):
+        masked[..., skip_id] = masked[..., skip_id].masked_fill(before, -1e9)
+    if bool(after.any()):
+        masked[..., :skip_id] = masked[..., :skip_id].masked_fill(after.unsqueeze(-1), -1e9)
+    return masked
+
+
 def _resolve_ckpt(path: Path) -> Path:
     if path.is_file():
         return path
@@ -382,6 +410,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Target S21 curve for refine/MSE (ideal_s21_db or real_s21_db).",
     )
+    p.add_argument(
+        "--force-order-length",
+        dest="force_order_length",
+        action="store_true",
+        help="Force macro length to match filter order (assumes 1 macro per component).",
+    )
+    p.add_argument(
+        "--no-force-order-length",
+        dest="force_order_length",
+        action="store_false",
+        help="Disable order-length constraint.",
+    )
+    p.set_defaults(force_order_length=None)
     p.add_argument("--use-viterbi", action="store_true", help="Decode macros with Viterbi + hard transitions.")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     return p.parse_args()
@@ -419,6 +460,7 @@ def main() -> None:
     freq_scale = args.freq_scale or cfg.get("freq_scale", "none")
     spec_mode = args.spec_mode or cfg.get("spec_mode", "type_fc")
     target_wave = args.target_wave or cfg.get("target_wave", "ideal")
+    force_order_length = bool(cfg.get("force_order_length", False)) if args.force_order_length is None else bool(args.force_order_length)
     include_s11 = cfg.get("include_s11", True) if args.include_s11 is None else bool(args.include_s11)
     d_model = int(cfg.get("d_model", 512))
     hidden_mult = int(cfg.get("hidden_mult", 2))
@@ -594,6 +636,8 @@ def main() -> None:
             )
         g_logits = g_logits.float()
         slot_raw = slot_raw.float()
+        if force_order_length:
+            g_logits = _apply_order_length_mask(g_logits, order, skip_id=skip_id)
 
         if use_viterbi:
             macro_ids = viterbi_decode(g_logits, c_hard)
