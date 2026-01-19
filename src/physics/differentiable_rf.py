@@ -1261,7 +1261,7 @@ def unroll_refine_slots(
     mask_min_db: torch.Tensor | None = None,
     mask_max_db: torch.Tensor | None = None,
     barrier_weight: float = 0.0,
-    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse"] = "full_mse",
+    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse", "barrier_only"] = "full_mse",
     w_pass: float = 1.0,
     w_stop: float = 5.0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1300,6 +1300,8 @@ def unroll_refine_slots(
                 loss = constrained_mse
             elif loss_mode == "weighted_mse":
                 loss = weighted_mse
+            elif loss_mode == "barrier_only":
+                loss = pred.new_zeros(())
             else:
                 loss = full_mse
             if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
@@ -1357,7 +1359,7 @@ def unroll_refine_slots_mixed(
     mask_min_db: torch.Tensor | None = None,
     mask_max_db: torch.Tensor | None = None,
     barrier_weight: float = 0.0,
-    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse"] = "full_mse",
+    loss_mode: Literal["full_mse", "constrained_mse", "weighted_mse", "barrier_only"] = "full_mse",
     w_pass: float = 1.0,
     w_stop: float = 5.0,
     z0: float = 50.0,
@@ -1407,6 +1409,8 @@ def unroll_refine_slots_mixed(
                 loss = constrained_mse
             elif loss_mode == "weighted_mse":
                 loss = weighted_mse
+            elif loss_mode == "barrier_only":
+                loss = pred.new_zeros(())
             else:
                 loss = full_mse
             if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:

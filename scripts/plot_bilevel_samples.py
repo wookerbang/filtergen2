@@ -386,7 +386,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--unroll-steps", type=int, default=0, help="Refine slot values before plotting (0 disables).")
     p.add_argument("--inner-lr", type=float, default=1e-2, help="Inner-loop LR for refinement.")
     p.add_argument("--inner-max-step", type=float, default=0.5, help="Max step size for refinement.")
-    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument(
+        "--loss-mode",
+        choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
+        default=None,
+    )
     p.add_argument("--w-pass", type=float, default=None, help="Weighted MSE passband weight.")
     p.add_argument("--w-stop", type=float, default=None, help="Weighted MSE stopband weight.")
     p.add_argument("--barrier-weight", type=float, default=None, help="Barrier loss weight for refine.")

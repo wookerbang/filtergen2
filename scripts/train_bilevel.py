@@ -643,7 +643,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-nan-tries", type=int, default=3)
     p.add_argument(
         "--loss-mode",
-        choices=["full_mse", "constrained_mse", "weighted_mse"],
+        choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
         default="constrained_mse",
         help="Physics loss base term before barrier.",
     )
@@ -1052,6 +1052,8 @@ def main() -> None:
             base_loss = constrained_mse
         elif args.loss_mode == "weighted_mse":
             base_loss = weighted_mse
+        elif args.loss_mode == "barrier_only":
+            base_loss = pred_db.new_zeros(())
         else:
             base_loss = full_mse
         if barrier_weight_eff > 0.0:

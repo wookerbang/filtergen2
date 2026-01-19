@@ -26,7 +26,12 @@ from src.data.dsl import (
     make_dsl_prefix_allowed_tokens_fn,
 )  # noqa: E402
 from src.models import VACTT5  # noqa: E402
-from src.physics.differentiable_rf import DynamicCircuitAssembler, calc_yield, unroll_refine_slots  # noqa: E402
+from src.physics.differentiable_rf import (  # noqa: E402
+    DynamicCircuitAssembler,
+    barrier_loss,
+    calc_yield,
+    unroll_refine_slots,
+)
 
 
 def _resolve_fmin_fmax(sample: dict, fc_hz: float) -> tuple[float, float]:
@@ -360,7 +365,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=-12.0)
     p.add_argument("--inner-nan-backoff", type=float, default=0.5)
     p.add_argument("--inner-nan-tries", type=int, default=3)
-    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument(
+        "--loss-mode",
+        choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
+        default=None,
+    )
     p.add_argument("--w-pass", type=float, default=None)
     p.add_argument("--w-stop", type=float, default=None)
     p.add_argument("--barrier-weight", type=float, default=None)
@@ -642,6 +651,10 @@ def main() -> None:
                     pre_loss = pre_constrained
                 elif loss_mode == "weighted_mse":
                     pre_loss = pre_weighted
+                elif loss_mode == "barrier_only":
+                    pre_loss = float(barrier_weight) * float(
+                        barrier_loss(pred_pre, mask_min[b], mask_max[b]).item()
+                    )
                 else:
                     pre_loss = pre_mse
 
@@ -690,6 +703,10 @@ def main() -> None:
                     post_loss = post_constrained
                 elif loss_mode == "weighted_mse":
                     post_loss = post_weighted
+                elif loss_mode == "barrier_only":
+                    post_loss = float(barrier_weight) * float(
+                        barrier_loss(pred_post, mask_min[b], mask_max[b]).item()
+                    )
                 else:
                     post_loss = post_mse
 

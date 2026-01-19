@@ -195,6 +195,8 @@ def _refine_slots(
             loss = constrained_mse
         elif loss_mode == "weighted_mse":
             loss = weighted_mse
+        elif loss_mode == "barrier_only":
+            loss = pred.new_zeros(())
         else:
             loss = full_mse
         if barrier_weight > 0.0:
@@ -228,7 +230,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-max-step", type=float, default=0.5)
     p.add_argument("--raw-min", type=float, default=-32.0)
     p.add_argument("--raw-max", type=float, default=-12.0)
-    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument(
+        "--loss-mode",
+        choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
+        default=None,
+    )
     p.add_argument("--w-pass", type=float, default=None)
     p.add_argument("--w-stop", type=float, default=None)
     p.add_argument("--barrier-weight", type=float, default=None)

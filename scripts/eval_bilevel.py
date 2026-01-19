@@ -494,7 +494,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inner-raw-max", type=float, default=None)
     p.add_argument("--inner-nan-backoff", type=float, default=None)
     p.add_argument("--inner-nan-tries", type=int, default=None)
-    p.add_argument("--loss-mode", choices=["full_mse", "constrained_mse", "weighted_mse"], default=None)
+    p.add_argument(
+        "--loss-mode",
+        choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
+        default=None,
+    )
     p.add_argument("--w-pass", type=float, default=None, help="Weighted MSE passband weight.")
     p.add_argument("--w-stop", type=float, default=None, help="Weighted MSE stopband weight.")
     p.add_argument("--barrier-weight", type=float, default=None, help="Barrier loss weight for refine.")
