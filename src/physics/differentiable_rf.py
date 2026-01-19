@@ -1332,6 +1332,29 @@ def unroll_refine_slots(
                 return torch.zeros((), device=raw.device, dtype=raw.dtype), raw_flat.view_as(raw)
             return torch.zeros((), device=raw.device, dtype=raw.dtype)
 
+    if not create_graph:
+        values_flat = torch.exp(raw_flat) * mask_flat + float(eps)
+        values_vec = values_flat.index_select(0, idx)
+        pred = circuit(freq_hz, values=values_vec, output="s21_db")
+        full_mse, constrained_mse, weighted_mse = _masked_mse_components(
+            pred,
+            target_s21_db,
+            mask_min,
+            mask_max,
+            w_pass=w_pass,
+            w_stop=w_stop,
+        )
+        if loss_mode == "constrained_mse":
+            loss = constrained_mse
+        elif loss_mode == "weighted_mse":
+            loss = weighted_mse
+        elif loss_mode == "barrier_only":
+            loss = pred.new_zeros(())
+        else:
+            loss = full_mse
+        if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
+            loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
+
     if loss is None:
         raise ValueError("unroll_refine_slots requires steps >= 1.")
     if return_raw:
@@ -1440,6 +1463,40 @@ def unroll_refine_slots_mixed(
             if return_raw:
                 return torch.zeros((), device=slot_raw.device, dtype=slot_raw.dtype), raw
             return torch.zeros((), device=slot_raw.device, dtype=slot_raw.dtype)
+
+    if not create_graph:
+        pred = mixed_s21_db(
+            raw,
+            g_soft,
+            macro_bank,
+            freq_hz,
+            z0=z0,
+            q_L=q_L,
+            q_C=q_C,
+            q_model=q_model,
+            ref_freq_hz=ref_freq_hz,
+            eps=eps,
+            raw_min=None,
+            raw_max=None,
+        )
+        full_mse, constrained_mse, weighted_mse = _masked_mse_components(
+            pred,
+            target_s21_db,
+            mask_min,
+            mask_max,
+            w_pass=w_pass,
+            w_stop=w_stop,
+        )
+        if loss_mode == "constrained_mse":
+            loss = constrained_mse
+        elif loss_mode == "weighted_mse":
+            loss = weighted_mse
+        elif loss_mode == "barrier_only":
+            loss = pred.new_zeros(())
+        else:
+            loss = full_mse
+        if mask_min is not None and mask_max is not None and float(barrier_weight) > 0.0:
+            loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
 
     if loss is None:
         raise ValueError("unroll_refine_slots_mixed requires steps >= 1.")
