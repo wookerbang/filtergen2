@@ -399,7 +399,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--yield-alphas",
         type=str,
-        default="0.01,0.05",
+        default="0.01,0.03,0.05",
         help="Comma-separated alpha for robust yield reporting.",
     )
     p.add_argument(
