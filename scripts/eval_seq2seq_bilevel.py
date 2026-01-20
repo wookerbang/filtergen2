@@ -27,9 +27,11 @@ from src.data.dsl import (
 )  # noqa: E402
 from src.models import VACTT5  # noqa: E402
 from src.physics.differentiable_rf import (  # noqa: E402
+    calc_violation_max,
+    calc_violation_quantile,
     DynamicCircuitAssembler,
     barrier_loss,
-    calc_yield,
+    DifferentiablePhysicsKernel,
     unroll_refine_slots,
 )
 
@@ -67,6 +69,10 @@ def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> 
         return float(bw)
     except Exception:
         return 0.0
+
+
+def _parse_csv_floats(s: str) -> List[float]:
+    return [float(x) for x in s.split(",") if x.strip()]
 
 
 class Seq2SeqEvalDataset(Dataset):
@@ -210,7 +216,9 @@ class Seq2SeqEvalDataset(Dataset):
             "stopband_max_db": float(stopband_max_db),
             "order": float(order),
             "ideal_s21_db": ideal_s21,
+            "ideal_s11_db": ideal_s11,
             "real_s21_db": real_s21,
+            "real_s11_db": real_s11,
             "mask_min_db": mask_min,
             "mask_max_db": mask_max,
         }
@@ -308,6 +316,15 @@ def _masked_mse_components(
     return full_mse, constrained_mse, weighted_mse
 
 
+def _circuit_s11_db(
+    circuit: object,
+    freq_hz: torch.Tensor,
+    values_vec: torch.Tensor,
+) -> torch.Tensor:
+    s11, _, _, _ = circuit(freq_hz, values=values_vec, output="sparams")
+    return DifferentiablePhysicsKernel.s11_db(s11)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate seq2seq DSL model with unroll refinement.")
     p.add_argument("--data", required=True, type=Path, help="Path to dataset jsonl (val/test).")
@@ -373,6 +390,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-pass", type=float, default=None)
     p.add_argument("--w-stop", type=float, default=None)
     p.add_argument("--barrier-weight", type=float, default=None)
+    p.add_argument(
+        "--yield-taus",
+        type=str,
+        default="0,0.25,0.5,1.0",
+        help="Comma-separated tau (dB) slack for yield reporting.",
+    )
+    p.add_argument(
+        "--yield-alphas",
+        type=str,
+        default="0.01,0.05",
+        help="Comma-separated alpha for robust yield reporting.",
+    )
+    p.add_argument(
+        "--yield-s11-max-db",
+        type=float,
+        default=-10.0,
+        help="S11 max (dB) for yield guard; set NaN to disable.",
+    )
 
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     p.add_argument("--output", type=Path, help="Optional JSON output path.")
@@ -383,6 +418,13 @@ def main() -> None:
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    yield_taus = sorted({t for t in _parse_csv_floats(args.yield_taus) if math.isfinite(t) and t >= 0.0})
+    if not yield_taus:
+        yield_taus = [0.0]
+    yield_alphas = sorted({a for a in _parse_csv_floats(args.yield_alphas) if math.isfinite(a) and 0.0 < a < 1.0})
+    primary_tau = yield_taus[0]
+    use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
+    yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
 
     tok_path = args.tokenizer or args.ckpt
     tokenizer = AutoTokenizer.from_pretrained(tok_path, use_fast=False)
@@ -408,11 +450,14 @@ def main() -> None:
 
     def collate(batch: List[dict]) -> dict:
         target_key = "real_s21_db" if args.target_wave == "real" else "ideal_s21_db"
+        target_s11_key = "real_s11_db" if args.target_wave == "real" else "ideal_s11_db"
         targets = torch.stack([b[target_key] for b in batch])
+        targets_s11 = torch.stack([b[target_s11_key] for b in batch])
         return {
             "wave": torch.stack([b["wave"] for b in batch]),
             "freq": torch.stack([b["freq"] for b in batch]),
             "target_s21_db": targets,
+            "target_s11_db": targets_s11,
             "mask_min_db": torch.stack([b["mask_min_db"] for b in batch]),
             "mask_max_db": torch.stack([b["mask_max_db"] for b in batch]),
             "scalar": torch.stack([b["scalar"] for b in batch]),
@@ -527,14 +572,20 @@ def main() -> None:
     pre_weighted_sum = 0.0
     post_weighted_sum = 0.0
     yield_total = 0
-    yield_pre_pass = 0
-    yield_post_pass = 0
-    yield_oracle_pass = 0
+    yield_pre_pass = {tau: 0 for tau in yield_taus}
+    yield_post_pass = {tau: 0 for tau in yield_taus}
+    yield_oracle_pass = {tau: 0 for tau in yield_taus}
+    yield_pre_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+    yield_post_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+    yield_oracle_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
 
     for batch in loader:
         wave = batch["wave"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         freq = batch["freq"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         target = batch["target_s21_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        target_s11 = None
+        if use_s11_yield:
+            target_s11 = batch["target_s11_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         mask_min = batch["mask_min_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         mask_max = batch["mask_max_db"].to(device=device, dtype=dtype, non_blocking=non_blocking)
         scalar = batch["scalar"].to(device=device, dtype=dtype, non_blocking=non_blocking)
@@ -633,6 +684,9 @@ def main() -> None:
                 values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec = values_flat.index_select(0, slot_idx)
                 pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                pred_pre_s11 = None
+                if use_s11_yield:
+                    pred_pre_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
                 if not torch.isfinite(pred_pre).all():
                     failed += 1
                     continue
@@ -685,6 +739,9 @@ def main() -> None:
                 values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec_post = values_flat_post.index_select(0, slot_idx)
                 pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                pred_post_s11 = None
+                if use_s11_yield:
+                    pred_post_s11 = _circuit_s11_db(circuit, freq[b], values_vec_post)
                 if not torch.isfinite(pred_post).all():
                     failed += 1
                     continue
@@ -721,18 +778,101 @@ def main() -> None:
 
                 if _has_constraints(mask_min[b], mask_max[b]):
                     yield_total += 1
-                    oracle_pass, _ = calc_yield(target[b], mask_min[b], mask_max[b])
-                    pre_pass, _ = calc_yield(pred_pre, mask_min[b], mask_max[b])
-                    post_pass, _ = calc_yield(pred_post, mask_min[b], mask_max[b])
-                    if bool(oracle_pass.item()):
-                        yield_oracle_pass += 1
-                    if bool(pre_pass.item()):
-                        yield_pre_pass += 1
-                    if bool(post_pass.item()):
-                        yield_post_pass += 1
+                    oracle_s11 = target_s11[b] if use_s11_yield and target_s11 is not None else None
+                    oracle_max = float(
+                        calc_violation_max(
+                            target[b],
+                            mask_min[b],
+                            mask_max[b],
+                            pred_s11_db=oracle_s11,
+                            s11_max_db=yield_s11_max_db,
+                        ).item()
+                    )
+                    pre_max = float(
+                        calc_violation_max(
+                            pred_pre,
+                            mask_min[b],
+                            mask_max[b],
+                            pred_s11_db=pred_pre_s11,
+                            s11_max_db=yield_s11_max_db,
+                        ).item()
+                    )
+                    post_max = float(
+                        calc_violation_max(
+                            pred_post,
+                            mask_min[b],
+                            mask_max[b],
+                            pred_s11_db=pred_post_s11,
+                            s11_max_db=yield_s11_max_db,
+                        ).item()
+                    )
+                    for tau_val in yield_taus:
+                        if oracle_max <= tau_val:
+                            yield_oracle_pass[tau_val] += 1
+                        if pre_max <= tau_val:
+                            yield_pre_pass[tau_val] += 1
+                        if post_max <= tau_val:
+                            yield_post_pass[tau_val] += 1
+                    for alpha_val in yield_alphas:
+                        oracle_q = float(
+                            calc_violation_quantile(
+                                target[b],
+                                mask_min[b],
+                                mask_max[b],
+                                alpha=alpha_val,
+                                pred_s11_db=oracle_s11,
+                                s11_max_db=yield_s11_max_db,
+                            ).item()
+                        )
+                        pre_q = float(
+                            calc_violation_quantile(
+                                pred_pre,
+                                mask_min[b],
+                                mask_max[b],
+                                alpha=alpha_val,
+                                pred_s11_db=pred_pre_s11,
+                                s11_max_db=yield_s11_max_db,
+                            ).item()
+                        )
+                        post_q = float(
+                            calc_violation_quantile(
+                                pred_post,
+                                mask_min[b],
+                                mask_max[b],
+                                alpha=alpha_val,
+                                pred_s11_db=pred_post_s11,
+                                s11_max_db=yield_s11_max_db,
+                            ).item()
+                        )
+                        for tau_val in yield_taus:
+                            if oracle_q <= tau_val:
+                                yield_oracle_robust[(tau_val, alpha_val)] += 1
+                            if pre_q <= tau_val:
+                                yield_pre_robust[(tau_val, alpha_val)] += 1
+                            if post_q <= tau_val:
+                                yield_post_robust[(tau_val, alpha_val)] += 1
             except Exception:
                 failed += 1
                 continue
+
+    def _rate(val: int) -> float | None:
+        return (val / yield_total) if yield_total else None
+
+    yield_oracle_tight = {f"{tau:g}": _rate(yield_oracle_pass[tau]) for tau in yield_taus}
+    yield_pre_tight = {f"{tau:g}": _rate(yield_pre_pass[tau]) for tau in yield_taus}
+    yield_post_tight = {f"{tau:g}": _rate(yield_post_pass[tau]) for tau in yield_taus}
+    yield_oracle_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_oracle_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_pre_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_pre_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_post_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_post_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
 
     results = {
         "num_samples": total,
@@ -747,9 +887,18 @@ def main() -> None:
         "loss_pre": pre_loss_sum / max(1, total - failed),
         "loss_post": post_loss_sum / max(1, total - failed),
         "yield_total": yield_total,
-        "yield_oracle": (yield_oracle_pass / yield_total) if yield_total else None,
-        "yield_pre": (yield_pre_pass / yield_total) if yield_total else None,
-        "yield_post": (yield_post_pass / yield_total) if yield_total else None,
+        "yield_oracle": _rate(yield_oracle_pass[primary_tau]),
+        "yield_pre": _rate(yield_pre_pass[primary_tau]),
+        "yield_post": _rate(yield_post_pass[primary_tau]),
+        "yield_taus_db": yield_taus,
+        "yield_alphas": yield_alphas,
+        "yield_s11_max_db": yield_s11_max_db,
+        "yield_oracle_tight_by_tau": yield_oracle_tight,
+        "yield_pre_tight_by_tau": yield_pre_tight,
+        "yield_post_tight_by_tau": yield_post_tight,
+        "yield_oracle_robust_by_tau": yield_oracle_robust_out,
+        "yield_pre_robust_by_tau": yield_pre_robust_out,
+        "yield_post_robust_by_tau": yield_post_robust_out,
         "target_wave": str(args.target_wave),
         "checkpoint": str(args.ckpt),
     }

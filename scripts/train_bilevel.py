@@ -37,11 +37,13 @@ from src.utils.macro_transition import build_transition_matrices, expected_trans
 from src.models import Wave2StructureModel
 from src.physics.differentiable_rf import (
     barrier_loss,
-    calc_yield,
+    calc_violation_max,
+    calc_violation_quantile,
     DynamicCircuitAssembler,
     DifferentiablePhysicsKernel,
     MacroBankEntry,
     mixed_s21_db,
+    mixed_s11_db,
     unroll_refine_slots,
     unroll_refine_slots_mixed,
 )
@@ -80,6 +82,15 @@ def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> 
         return float(bw)
     except Exception:
         return 0.0
+
+
+def _parse_csv_floats(s: str) -> List[float]:
+    return [float(x) for x in s.split(",") if x.strip()]
+
+
+def _format_float_tag(val: float) -> str:
+    s = f"{val:g}"
+    return s.replace("-", "m").replace(".", "p")
 
 
 class BilevelDataset(Dataset):
@@ -572,6 +583,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-nonfinite", dest="skip_nonfinite", action="store_true", help="Skip updates on non-finite batches.")
     p.add_argument("--no-skip-nonfinite", dest="skip_nonfinite", action="store_false")
     p.set_defaults(skip_nonfinite=False)
+    p.add_argument(
+        "--yield-taus",
+        type=str,
+        default="0,0.25,0.5,1.0",
+        help="Comma-separated tau (dB) slack for yield reporting.",
+    )
+    p.add_argument(
+        "--yield-alphas",
+        type=str,
+        default="0.01,0.05",
+        help="Comma-separated alpha for robust yield reporting.",
+    )
+    p.add_argument(
+        "--yield-s11-max-db",
+        type=float,
+        default=-10.0,
+        help="S11 max (dB) for yield guard; set NaN to disable.",
+    )
 
     # input config
     p.add_argument("--use-wave", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"], default="ideal")
@@ -814,6 +843,15 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    yield_taus = sorted({t for t in _parse_csv_floats(args.yield_taus) if math.isfinite(t) and t >= 0.0})
+    if not yield_taus:
+        yield_taus = [0.0]
+    yield_alphas = sorted({a for a in _parse_csv_floats(args.yield_alphas) if math.isfinite(a) and 0.0 < a < 1.0})
+    yield_tau_tags = {t: _format_float_tag(t) for t in yield_taus}
+    yield_alpha_tags = {a: _format_float_tag(a) for a in yield_alphas}
+    primary_tau = yield_taus[0]
+    use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
+    yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
 
     dataset = BilevelDataset(
         str(args.data),
@@ -910,6 +948,9 @@ def main() -> None:
         "c_skip_penalty": args.c_skip_penalty,
         "c_redundant_penalty": args.c_redundant_penalty,
         "init_from": str(args.init_from) if args.init_from else None,
+        "yield_taus_db": yield_taus,
+        "yield_alphas": yield_alphas,
+        "yield_s11_max_db": args.yield_s11_max_db,
     }
     with (args.output / "input_config.json").open("w") as f:
         json.dump(cfg, f, indent=2)
@@ -1003,6 +1044,20 @@ def main() -> None:
     inner_raw_max = float(args.inner_raw_max)
     log_yield = bool(args.log_train_metrics or args.log_epoch_metrics)
 
+    def _init_yield_pass_dict() -> dict[float, int]:
+        return {tau: 0 for tau in yield_taus}
+
+    def _init_yield_robust_pass_dict() -> dict[tuple[float, float], int]:
+        return {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+
+    def _circuit_s11_db(
+        circuit: object,
+        freq_hz: torch.Tensor,
+        values_vec: torch.Tensor,
+    ) -> torch.Tensor:
+        s11, _, _, _ = circuit(freq_hz, values=values_vec, output="sparams")
+        return DifferentiablePhysicsKernel.s11_db(s11)
+
     def _masked_mse_components(
         pred_db: torch.Tensor,
         target_db: torch.Tensor,
@@ -1086,10 +1141,11 @@ def main() -> None:
         epoch_sym = 0.0
         epoch_alpha = 0.0
         epoch_tau = 0.0
-        epoch_yield_pre_pass = 0
-        epoch_yield_pre_total = 0
-        epoch_yield_post_pass = 0
-        epoch_yield_post_total = 0
+        epoch_yield_pre_pass = _init_yield_pass_dict()
+        epoch_yield_post_pass = _init_yield_pass_dict()
+        epoch_yield_pre_robust = _init_yield_robust_pass_dict()
+        epoch_yield_post_robust = _init_yield_robust_pass_dict()
+        epoch_yield_total = 0
         for batch in loader:
             step += 1
             if barrier_ramp_steps > 0:
@@ -1182,10 +1238,11 @@ def main() -> None:
                 sym_loss = model.query_symmetry_loss(core_only=bool(args.sym_core_only)).to(dtype)
 
             metric_note = ""
-            yield_pre_pass = 0
-            yield_pre_total = 0
-            yield_post_pass = 0
-            yield_post_total = 0
+            yield_pre_pass = _init_yield_pass_dict()
+            yield_post_pass = _init_yield_pass_dict()
+            yield_pre_robust = _init_yield_robust_pass_dict()
+            yield_post_robust = _init_yield_robust_pass_dict()
+            yield_total = 0
             if args.log_train_metrics or args.log_epoch_metrics:
                 with torch.no_grad():
                     pred_ids = torch.argmax(g_logits, dim=-1)
@@ -1205,18 +1262,71 @@ def main() -> None:
                     len_mae = len_abs / float(len_pred.numel())
                     len_exact_rate = len_exact / float(len_pred.numel())
             if log_yield:
-                def _accum_yield(pred_pre: torch.Tensor, pred_post: torch.Tensor, mask_min_b: torch.Tensor, mask_max_b: torch.Tensor) -> None:
-                    nonlocal yield_pre_pass, yield_pre_total, yield_post_pass, yield_post_total
+                def _accum_yield(
+                    pred_pre: torch.Tensor,
+                    pred_post: torch.Tensor,
+                    mask_min_b: torch.Tensor,
+                    mask_max_b: torch.Tensor,
+                    *,
+                    pred_pre_s11: torch.Tensor | None = None,
+                    pred_post_s11: torch.Tensor | None = None,
+                ) -> None:
+                    nonlocal yield_pre_pass, yield_post_pass, yield_pre_robust, yield_post_robust, yield_total
                     has_constraints = bool(torch.isfinite(mask_min_b).any().item() or torch.isfinite(mask_max_b).any().item())
                     if not has_constraints:
                         return
+                    yield_total += 1
                     with torch.no_grad():
-                        pre_pass, _ = calc_yield(pred_pre.detach(), mask_min_b, mask_max_b)
-                        post_pass, _ = calc_yield(pred_post.detach(), mask_min_b, mask_max_b)
-                    yield_pre_total += 1
-                    yield_post_total += 1
-                    yield_pre_pass += int(pre_pass.item())
-                    yield_post_pass += int(post_pass.item())
+                        pre_max = float(
+                            calc_violation_max(
+                                pred_pre.detach(),
+                                mask_min_b,
+                                mask_max_b,
+                                pred_s11_db=pred_pre_s11,
+                                s11_max_db=yield_s11_max_db,
+                            ).item()
+                        )
+                        post_max = float(
+                            calc_violation_max(
+                                pred_post.detach(),
+                                mask_min_b,
+                                mask_max_b,
+                                pred_s11_db=pred_post_s11,
+                                s11_max_db=yield_s11_max_db,
+                            ).item()
+                        )
+                        for tau_val in yield_taus:
+                            if pre_max <= tau_val:
+                                yield_pre_pass[tau_val] += 1
+                            if post_max <= tau_val:
+                                yield_post_pass[tau_val] += 1
+                        if yield_alphas:
+                            for alpha_val in yield_alphas:
+                                pre_q = float(
+                                    calc_violation_quantile(
+                                        pred_pre.detach(),
+                                        mask_min_b,
+                                        mask_max_b,
+                                        alpha=alpha_val,
+                                        pred_s11_db=pred_pre_s11,
+                                        s11_max_db=yield_s11_max_db,
+                                    ).item()
+                                )
+                                post_q = float(
+                                    calc_violation_quantile(
+                                        pred_post.detach(),
+                                        mask_min_b,
+                                        mask_max_b,
+                                        alpha=alpha_val,
+                                        pred_s11_db=pred_post_s11,
+                                        s11_max_db=yield_s11_max_db,
+                                    ).item()
+                                )
+                                for tau_val in yield_taus:
+                                    if pre_q <= tau_val:
+                                        yield_pre_robust[(tau_val, alpha_val)] += 1
+                                    if post_q <= tau_val:
+                                        yield_post_robust[(tau_val, alpha_val)] += 1
             else:
                 def _accum_yield(*_args, **_kwargs) -> None:
                     return
@@ -1252,11 +1362,14 @@ def main() -> None:
                     slot_mask = macro_slot_mask[macro_ids_oracle].to(dtype)
                     circuit, slot_idx = circuit_cache.get(macro_ids_oracle)
                     pred_pre = None
+                    pred_pre_s11 = None
                     if log_yield:
                         raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
                         values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
                         pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                        if use_s11_yield:
+                            pred_pre_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
                     if args.use_unroll:
                         need_raw = bool(log_yield or log_phys_metrics)
                         if need_raw:
@@ -1287,8 +1400,18 @@ def main() -> None:
                             values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                             values_vec_post = values_flat_post.index_select(0, slot_idx)
                             pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                            pred_post_s11 = None
+                            if log_yield and use_s11_yield:
+                                pred_post_s11 = _circuit_s11_db(circuit, freq[b], values_vec_post)
                             if log_yield:
-                                _accum_yield(pred_pre, pred_post, mask_min_db[b], mask_max_db[b])
+                                _accum_yield(
+                                    pred_pre,
+                                    pred_post,
+                                    mask_min_db[b],
+                                    mask_max_db[b],
+                                    pred_pre_s11=pred_pre_s11,
+                                    pred_post_s11=pred_post_s11,
+                                )
                             _record_phys(pred_post, target[b], mask_min_db[b], mask_max_db[b])
                         else:
                             loss_b = unroll_refine_slots(
@@ -1326,7 +1449,17 @@ def main() -> None:
                             barrier_weight_eff=barrier_weight_eff,
                         )
                         if log_yield:
-                            _accum_yield(pred, pred, mask_min_db[b], mask_max_db[b])
+                            pred_s11 = None
+                            if use_s11_yield:
+                                pred_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
+                            _accum_yield(
+                                pred,
+                                pred,
+                                mask_min_db[b],
+                                mask_max_db[b],
+                                pred_pre_s11=pred_s11,
+                                pred_post_s11=pred_s11,
+                            )
                         _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
@@ -1347,11 +1480,14 @@ def main() -> None:
                     slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
                     circuit, slot_idx = circuit_cache.get(macro_ids_hard)
                     pred_pre = None
+                    pred_pre_s11 = None
                     if log_yield:
                         raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
                         values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                         values_vec = values_flat.index_select(0, slot_idx)
                         pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                        if use_s11_yield:
+                            pred_pre_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
                     if args.use_unroll:
                         need_raw = bool(log_yield or log_phys_metrics)
                         if need_raw:
@@ -1382,8 +1518,18 @@ def main() -> None:
                             values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                             values_vec_post = values_flat_post.index_select(0, slot_idx)
                             pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                            pred_post_s11 = None
+                            if log_yield and use_s11_yield:
+                                pred_post_s11 = _circuit_s11_db(circuit, freq[b], values_vec_post)
                             if log_yield:
-                                _accum_yield(pred_pre, pred_post, mask_min_db[b], mask_max_db[b])
+                                _accum_yield(
+                                    pred_pre,
+                                    pred_post,
+                                    mask_min_db[b],
+                                    mask_max_db[b],
+                                    pred_pre_s11=pred_pre_s11,
+                                    pred_post_s11=pred_post_s11,
+                                )
                             _record_phys(pred_post, target[b], mask_min_db[b], mask_max_db[b])
                         else:
                             loss_hard = unroll_refine_slots(
@@ -1421,7 +1567,17 @@ def main() -> None:
                             barrier_weight_eff=barrier_weight_eff,
                         )
                         if log_yield:
-                            _accum_yield(pred, pred, mask_min_db[b], mask_max_db[b])
+                            pred_s11 = None
+                            if use_s11_yield:
+                                pred_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
+                            _accum_yield(
+                                pred,
+                                pred,
+                                mask_min_db[b],
+                                mask_max_db[b],
+                                pred_pre_s11=pred_s11,
+                                pred_post_s11=pred_s11,
+                            )
                         _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
                     loss_soft = unroll_refine_slots_mixed(
                         slot_raw[b],
@@ -1456,6 +1612,7 @@ def main() -> None:
                         if macro_bank is None:
                             raise ValueError("matrix_mix enabled but macro_bank not initialized.")
                         pred_pre = None
+                        pred_pre_s11 = None
                         if log_yield:
                             pred_pre = mixed_s21_db(
                                 slot_raw[b],
@@ -1465,6 +1622,15 @@ def main() -> None:
                                 raw_min=args.inner_raw_min,
                                 raw_max=args.inner_raw_max,
                             )
+                            if use_s11_yield:
+                                pred_pre_s11 = mixed_s11_db(
+                                    slot_raw[b],
+                                    g_phys[b],
+                                    macro_bank,
+                                    freq[b],
+                                    raw_min=args.inner_raw_min,
+                                    raw_max=args.inner_raw_max,
+                                )
                         if args.use_unroll:
                             need_raw = bool(log_yield or log_phys_metrics)
                             if need_raw:
@@ -1500,7 +1666,24 @@ def main() -> None:
                                     raw_max=args.inner_raw_max,
                                 )
                                 if log_yield:
-                                    _accum_yield(pred_pre, pred_post, mask_min_db[b], mask_max_db[b])
+                                    pred_post_s11 = None
+                                    if use_s11_yield:
+                                        pred_post_s11 = mixed_s11_db(
+                                            raw_post,
+                                            g_phys[b],
+                                            macro_bank,
+                                            freq[b],
+                                            raw_min=args.inner_raw_min,
+                                            raw_max=args.inner_raw_max,
+                                        )
+                                    _accum_yield(
+                                        pred_pre,
+                                        pred_post,
+                                        mask_min_db[b],
+                                        mask_max_db[b],
+                                        pred_pre_s11=pred_pre_s11,
+                                        pred_post_s11=pred_post_s11,
+                                    )
                                 _record_phys(pred_post, target[b], mask_min_db[b], mask_max_db[b])
                             else:
                                 loss_b = unroll_refine_slots_mixed(
@@ -1541,7 +1724,24 @@ def main() -> None:
                                 barrier_weight_eff=barrier_weight_eff,
                             )
                             if log_yield:
-                                _accum_yield(pred, pred, mask_min_db[b], mask_max_db[b])
+                                pred_s11 = None
+                                if use_s11_yield:
+                                    pred_s11 = mixed_s11_db(
+                                        slot_raw[b],
+                                        g_phys[b],
+                                        macro_bank,
+                                        freq[b],
+                                        raw_min=args.inner_raw_min,
+                                        raw_max=args.inner_raw_max,
+                                    )
+                                _accum_yield(
+                                    pred,
+                                    pred,
+                                    mask_min_db[b],
+                                    mask_max_db[b],
+                                    pred_pre_s11=pred_s11,
+                                    pred_post_s11=pred_s11,
+                                )
                             _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
                     else:
                         g_hard = F.gumbel_softmax(g_logits[b], tau=float(tau), hard=True, dim=-1)
@@ -1555,11 +1755,14 @@ def main() -> None:
                         slot_mask = (hard_mask - soft_mask.detach() + soft_mask).to(dtype)
                         circuit, slot_idx = circuit_cache.get(macro_ids_hard)
                         pred_pre = None
+                        pred_pre_s11 = None
                         if log_yield:
                             raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
                             values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                             values_vec = values_flat.index_select(0, slot_idx)
                             pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                            if use_s11_yield:
+                                pred_pre_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
                         if args.use_unroll:
                             need_raw = bool(log_yield or log_phys_metrics)
                             if need_raw:
@@ -1590,8 +1793,18 @@ def main() -> None:
                                 values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                                 values_vec_post = values_flat_post.index_select(0, slot_idx)
                                 pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                                pred_post_s11 = None
+                                if log_yield and use_s11_yield:
+                                    pred_post_s11 = _circuit_s11_db(circuit, freq[b], values_vec_post)
                                 if log_yield:
-                                    _accum_yield(pred_pre, pred_post, mask_min_db[b], mask_max_db[b])
+                                    _accum_yield(
+                                        pred_pre,
+                                        pred_post,
+                                        mask_min_db[b],
+                                        mask_max_db[b],
+                                        pred_pre_s11=pred_pre_s11,
+                                        pred_post_s11=pred_post_s11,
+                                    )
                                 _record_phys(pred_post, target[b], mask_min_db[b], mask_max_db[b])
                             else:
                                 loss_b = unroll_refine_slots(
@@ -1629,7 +1842,17 @@ def main() -> None:
                                 barrier_weight_eff=barrier_weight_eff,
                             )
                             if log_yield:
-                                _accum_yield(pred, pred, mask_min_db[b], mask_max_db[b])
+                                pred_s11 = None
+                                if use_s11_yield:
+                                    pred_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
+                                _accum_yield(
+                                    pred,
+                                    pred,
+                                    mask_min_db[b],
+                                    mask_max_db[b],
+                                    pred_pre_s11=pred_s11,
+                                    pred_post_s11=pred_s11,
+                                )
                             _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
@@ -1645,8 +1868,25 @@ def main() -> None:
                 physics_barrier = torch.stack(phys_barrier).mean()
 
             if log_yield:
-                yield_pre_rate = yield_pre_pass / yield_pre_total if yield_pre_total else 0.0
-                yield_post_rate = yield_post_pass / yield_post_total if yield_post_total else 0.0
+                denom = float(yield_total) if yield_total else 0.0
+                yield_pre_rate = (yield_pre_pass[primary_tau] / denom) if denom else 0.0
+                yield_post_rate = (yield_post_pass[primary_tau] / denom) if denom else 0.0
+                extra_yield = ""
+                if len(yield_taus) > 1:
+                    for tau_val in yield_taus:
+                        if tau_val == primary_tau:
+                            continue
+                        tag = yield_tau_tags[tau_val]
+                        pre_rate = (yield_pre_pass[tau_val] / denom) if denom else 0.0
+                        post_rate = (yield_post_pass[tau_val] / denom) if denom else 0.0
+                        extra_yield += f" yield_pre_t{tag}={pre_rate:.3f} yield_post_t{tag}={post_rate:.3f}"
+                for alpha_val in yield_alphas:
+                    a_tag = yield_alpha_tags[alpha_val]
+                    for tau_val in yield_taus:
+                        t_tag = yield_tau_tags[tau_val]
+                        pre_rate = (yield_pre_robust[(tau_val, alpha_val)] / denom) if denom else 0.0
+                        post_rate = (yield_post_robust[(tau_val, alpha_val)] / denom) if denom else 0.0
+                        extra_yield += f" yield_pre_r_a{a_tag}_t{t_tag}={pre_rate:.3f} yield_post_r_a{a_tag}_t{t_tag}={post_rate:.3f}"
                 if args.log_train_metrics:
                     metric_note = (
                         f" mac_acc={macro_acc:.3f}"
@@ -1655,9 +1895,10 @@ def main() -> None:
                         f" len_exact={len_exact_rate:.3f}"
                         f" yield_pre={yield_pre_rate:.3f}"
                         f" yield_post={yield_post_rate:.3f}"
+                        f"{extra_yield}"
                     )
                 elif args.log_epoch_metrics:
-                    metric_note = f" yield_pre={yield_pre_rate:.3f} yield_post={yield_post_rate:.3f}"
+                    metric_note = f" yield_pre={yield_pre_rate:.3f} yield_post={yield_post_rate:.3f}{extra_yield}"
 
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
             alpha_used = float(alpha) if bool(args.use_macro_ce) else 0.0
@@ -1706,10 +1947,14 @@ def main() -> None:
                 epoch_sym += float(sym_loss.item()) * batch_size
                 epoch_alpha += float(alpha_used) * batch_size
                 epoch_tau += float(tau) * batch_size
-                epoch_yield_pre_pass += yield_pre_pass
-                epoch_yield_pre_total += yield_pre_total
-                epoch_yield_post_pass += yield_post_pass
-                epoch_yield_post_total += yield_post_total
+                epoch_yield_total += yield_total
+                for tau_val in yield_taus:
+                    epoch_yield_pre_pass[tau_val] += yield_pre_pass[tau_val]
+                    epoch_yield_post_pass[tau_val] += yield_post_pass[tau_val]
+                for key in yield_pre_robust:
+                    epoch_yield_pre_robust[key] += yield_pre_robust[key]
+                for key in yield_post_robust:
+                    epoch_yield_post_robust[key] += yield_post_robust[key]
             loss.backward()
 
             if step % int(args.grad_accum) == 0:
@@ -1780,8 +2025,25 @@ def main() -> None:
             avg_phys_constrained = epoch_phys_constrained / float(epoch_samples) if epoch_phys_constrained or epoch_phys_constrained == 0.0 else 0.0
             avg_phys_weighted = epoch_phys_weighted / float(epoch_samples) if epoch_phys_weighted or epoch_phys_weighted == 0.0 else 0.0
             avg_phys_barrier = epoch_phys_barrier / float(epoch_samples) if epoch_phys_barrier or epoch_phys_barrier == 0.0 else 0.0
-            avg_yield_pre = epoch_yield_pre_pass / epoch_yield_pre_total if epoch_yield_pre_total else 0.0
-            avg_yield_post = epoch_yield_post_pass / epoch_yield_post_total if epoch_yield_post_total else 0.0
+            denom = float(epoch_yield_total) if epoch_yield_total else 0.0
+            avg_yield_pre = (epoch_yield_pre_pass[primary_tau] / denom) if denom else 0.0
+            avg_yield_post = (epoch_yield_post_pass[primary_tau] / denom) if denom else 0.0
+            extra_yield = ""
+            if len(yield_taus) > 1:
+                for tau_val in yield_taus:
+                    if tau_val == primary_tau:
+                        continue
+                    tag = yield_tau_tags[tau_val]
+                    pre_rate = (epoch_yield_pre_pass[tau_val] / denom) if denom else 0.0
+                    post_rate = (epoch_yield_post_pass[tau_val] / denom) if denom else 0.0
+                    extra_yield += f" yield_pre_t{tag}={pre_rate:.3f} yield_post_t{tag}={post_rate:.3f}"
+            for alpha_val in yield_alphas:
+                a_tag = yield_alpha_tags[alpha_val]
+                for tau_val in yield_taus:
+                    t_tag = yield_tau_tags[tau_val]
+                    pre_rate = (epoch_yield_pre_robust[(tau_val, alpha_val)] / denom) if denom else 0.0
+                    post_rate = (epoch_yield_post_robust[(tau_val, alpha_val)] / denom) if denom else 0.0
+                    extra_yield += f" yield_pre_r_a{a_tag}_t{t_tag}={pre_rate:.3f} yield_post_r_a{a_tag}_t{t_tag}={post_rate:.3f}"
             reg_note = ""
             ste_note = ""
             phys_note = ""
@@ -1801,7 +2063,7 @@ def main() -> None:
                 f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
                 f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
                 f"len_mae={len_mae:.3f} len_exact={len_exact:.3f} "
-                f"yield_pre={avg_yield_pre:.3f} yield_post={avg_yield_post:.3f}" + phys_note + reg_note + ste_note
+                f"yield_pre={avg_yield_pre:.3f} yield_post={avg_yield_post:.3f}" + extra_yield + phys_note + reg_note + ste_note
             )
         ckpt = args.output / f"epoch_{epoch+1}"
         ckpt.mkdir(parents=True, exist_ok=True)

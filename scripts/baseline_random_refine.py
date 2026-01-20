@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.dsl import MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
-from src.physics.differentiable_rf import DynamicCircuitAssembler, barrier_loss, calc_yield
+from src.physics.differentiable_rf import DynamicCircuitAssembler, barrier_loss, calc_yield, DifferentiablePhysicsKernel
 
 
 def _expand_macros_with_placeholders(macro_seq: List[Tuple[int, str]], slot_count: int) -> Tuple[list, List[int]]:
@@ -110,6 +110,15 @@ def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> 
         return 0.0
 
 
+def _circuit_s11_db(
+    circuit: object,
+    freq_hz: torch.Tensor,
+    values_vec: torch.Tensor,
+) -> torch.Tensor:
+    s11, _, _, _ = circuit(freq_hz, values=values_vec, output="sparams")
+    return DifferentiablePhysicsKernel.s11_db(s11)
+
+
 def _sample_random_macros(
     gt_macros: List[str],
     *,
@@ -155,11 +164,14 @@ def _refine_slots(
     w_pass: float,
     w_stop: float,
     yield_threshold: float,
+    yield_tau: float,
+    yield_s11_max_db: float | None,
 ) -> Tuple[torch.Tensor, List[float], int]:
     raw_flat = slot_raw.reshape(-1).detach()
     mask_flat = slot_mask.reshape(-1)
     steps_to_success = -1
     loss_hist: List[float] = []
+    use_s11_yield = yield_s11_max_db is not None and math.isfinite(float(yield_s11_max_db))
     for step in range(int(steps)):
         raw_flat = raw_flat.clamp(min=raw_min, max=raw_max).detach().requires_grad_(True)
         values_flat = torch.exp(raw_flat) * mask_flat + 1e-30
@@ -202,7 +214,17 @@ def _refine_slots(
         if barrier_weight > 0.0:
             loss = loss + float(barrier_weight) * barrier_loss(pred, mask_min, mask_max)
         loss_hist.append(float(loss.detach().cpu().item()))
-        _, y = calc_yield(pred, mask_min, mask_max)
+        pred_s11 = None
+        if use_s11_yield:
+            pred_s11 = _circuit_s11_db(circuit, freq, values_vec)
+        _, y = calc_yield(
+            pred,
+            mask_min,
+            mask_max,
+            pred_s11_db=pred_s11,
+            s11_max_db=yield_s11_max_db,
+            tau_db=yield_tau,
+        )
         if steps_to_success < 0 and float(y.item()) >= float(yield_threshold):
             steps_to_success = step + 1
         grad = torch.autograd.grad(loss, raw_flat, create_graph=False)[0]
@@ -239,6 +261,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-stop", type=float, default=None)
     p.add_argument("--barrier-weight", type=float, default=None)
     p.add_argument("--yield-threshold", type=float, default=1.0)
+    p.add_argument("--yield-tau", type=float, default=0.0, help="Yield tau slack in dB.")
+    p.add_argument(
+        "--yield-s11-max-db",
+        type=float,
+        default=-10.0,
+        help="S11 max (dB) for yield guard; set NaN to disable.",
+    )
     p.add_argument("--output", type=Path, help="Optional JSONL output path.")
     return p.parse_args()
 
@@ -248,6 +277,9 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
+    yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
+    yield_tau = float(args.yield_tau)
     cfg = {}
     if args.config is not None:
         with args.config.open("r", encoding="utf-8") as f:
@@ -367,8 +399,18 @@ def main() -> None:
         values_flat = torch.exp(slot_raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
         values_vec = values_flat.index_select(0, slot_idx)
         pred_pre = circuit(freq, values=values_vec, output="s21_db")
+        pred_pre_s11 = None
+        if use_s11_yield:
+            pred_pre_s11 = _circuit_s11_db(circuit, freq, values_vec)
         pre_mse = float(F.mse_loss(pred_pre, target).detach().cpu().item())
-        _, pre_yield = calc_yield(pred_pre, mask_min, mask_max)
+        _, pre_yield = calc_yield(
+            pred_pre,
+            mask_min,
+            mask_max,
+            pred_s11_db=pred_pre_s11,
+            s11_max_db=yield_s11_max_db,
+            tau_db=yield_tau,
+        )
         if float(pre_yield.item()) >= float(args.yield_threshold):
             success_pre += 1
 
@@ -391,6 +433,8 @@ def main() -> None:
             w_pass=w_pass,
             w_stop=w_stop,
             yield_threshold=float(args.yield_threshold),
+            yield_tau=yield_tau,
+            yield_s11_max_db=yield_s11_max_db,
         )
         total_sims += int(args.steps)
         if steps_to_success > 0:
@@ -399,8 +443,18 @@ def main() -> None:
         values_flat = torch.exp(refined_raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
         values_vec = values_flat.index_select(0, slot_idx)
         pred_post = circuit(freq, values=values_vec, output="s21_db")
+        pred_post_s11 = None
+        if use_s11_yield:
+            pred_post_s11 = _circuit_s11_db(circuit, freq, values_vec)
         post_mse = float(F.mse_loss(pred_post, target).detach().cpu().item())
-        _, post_yield = calc_yield(pred_post, mask_min, mask_max)
+        _, post_yield = calc_yield(
+            pred_post,
+            mask_min,
+            mask_max,
+            pred_s11_db=pred_post_s11,
+            s11_max_db=yield_s11_max_db,
+            tau_db=yield_tau,
+        )
 
         results.append(
             {

@@ -91,44 +91,185 @@ def _masked_mse_components(
     return full_mse, constrained_mse, weighted_mse
 
 
+def _prepare_yield_tensors(
+    pred_s21_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    pred_s11_db: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    pred = pred_s21_db
+    if pred.ndim == 1:
+        pred = pred.unsqueeze(0)
+    mask_min = mask_min_db
+    if mask_min.ndim == 1:
+        mask_min = mask_min.unsqueeze(0)
+    mask_max = mask_max_db
+    if mask_max.ndim == 1:
+        mask_max = mask_max.unsqueeze(0)
+    if pred_s11_db is not None and pred_s11_db.ndim == 1:
+        pred_s11_db = pred_s11_db.unsqueeze(0)
+    return pred, mask_min, mask_max, pred_s11_db
+
+
+def _s21_violation(
+    pred_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mask_min = mask_min_db.to(device=pred_db.device, dtype=pred_db.dtype)
+    mask_max = mask_max_db.to(device=pred_db.device, dtype=pred_db.dtype)
+    min_mask = torch.isfinite(mask_min)
+    max_mask = torch.isfinite(mask_max)
+    finite_pred = torch.isfinite(pred_db)
+    constrained = (min_mask | max_mask) | (~finite_pred)
+    min_term = torch.relu(mask_min - pred_db)
+    max_term = torch.relu(pred_db - mask_max)
+    min_term = torch.where(min_mask, min_term, torch.zeros_like(min_term))
+    max_term = torch.where(max_mask, max_term, torch.zeros_like(max_term))
+    violation = torch.maximum(min_term, max_term)
+    inf = pred_db.new_full((), float("inf"))
+    violation = torch.where(~finite_pred, inf, violation)
+    return violation, constrained
+
+
+def _reduce_violation_max(violation: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if violation.ndim != 2:
+        raise ValueError(f"Expected violation shape (B, F), got {tuple(violation.shape)}")
+    out = torch.zeros((violation.shape[0],), device=violation.device, dtype=violation.dtype)
+    for i in range(violation.shape[0]):
+        if not bool(mask[i].any().item()):
+            out[i] = 0.0
+            continue
+        vals = violation[i][mask[i]]
+        if not torch.isfinite(vals).all():
+            out[i] = float("inf")
+        else:
+            out[i] = vals.max()
+    return out
+
+
+def _reduce_violation_quantile(violation: torch.Tensor, mask: torch.Tensor, alpha: float) -> torch.Tensor:
+    if violation.ndim != 2:
+        raise ValueError(f"Expected violation shape (B, F), got {tuple(violation.shape)}")
+    alpha_val = float(alpha)
+    if not math.isfinite(alpha_val) or alpha_val <= 0.0:
+        return _reduce_violation_max(violation, mask)
+    alpha_val = min(alpha_val, 0.999999)
+    q = 1.0 - alpha_val
+    out = torch.zeros((violation.shape[0],), device=violation.device, dtype=violation.dtype)
+    for i in range(violation.shape[0]):
+        if not bool(mask[i].any().item()):
+            out[i] = 0.0
+            continue
+        vals = violation[i][mask[i]]
+        if not torch.isfinite(vals).all():
+            out[i] = float("inf")
+        else:
+            out[i] = torch.quantile(vals, q)
+    return out
+
+
+def calc_violation_max(
+    pred_s21_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    pred_s11_db: torch.Tensor | None = None,
+    s11_max_db: float | None = -10.0,
+) -> torch.Tensor:
+    """
+    Max violation over constrained S21 (and optional S11 guard), shape (B,).
+    """
+    pred, mask_min, mask_max, pred_s11 = _prepare_yield_tensors(pred_s21_db, mask_min_db, mask_max_db, pred_s11_db)
+    s21_violation, s21_mask = _s21_violation(pred, mask_min, mask_max)
+    s21_max = _reduce_violation_max(s21_violation, s21_mask)
+    s11_max = torch.zeros_like(s21_max)
+    if pred_s11 is not None and s11_max_db is not None and math.isfinite(float(s11_max_db)):
+        s11 = pred_s11.to(device=pred.device, dtype=pred.dtype)
+        s11_violation = torch.relu(s11 - float(s11_max_db))
+        inf = pred.new_full((), float("inf"))
+        s11_violation = torch.where(torch.isfinite(s11), s11_violation, inf)
+        s11_mask = torch.ones_like(s11, dtype=torch.bool)
+        s11_max = _reduce_violation_max(s11_violation, s11_mask)
+    return torch.maximum(s21_max, s11_max)
+
+
+def calc_violation_quantile(
+    pred_s21_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    alpha: float,
+    pred_s11_db: torch.Tensor | None = None,
+    s11_max_db: float | None = -10.0,
+) -> torch.Tensor:
+    """
+    (1 - alpha) violation quantile over constrained S21 (and optional S11 guard), shape (B,).
+    """
+    pred, mask_min, mask_max, pred_s11 = _prepare_yield_tensors(pred_s21_db, mask_min_db, mask_max_db, pred_s11_db)
+    s21_violation, s21_mask = _s21_violation(pred, mask_min, mask_max)
+    s21_q = _reduce_violation_quantile(s21_violation, s21_mask, alpha)
+    s11_q = torch.zeros_like(s21_q)
+    if pred_s11 is not None and s11_max_db is not None and math.isfinite(float(s11_max_db)):
+        s11 = pred_s11.to(device=pred.device, dtype=pred.dtype)
+        s11_violation = torch.relu(s11 - float(s11_max_db))
+        inf = pred.new_full((), float("inf"))
+        s11_violation = torch.where(torch.isfinite(s11), s11_violation, inf)
+        s11_mask = torch.ones_like(s11, dtype=torch.bool)
+        s11_q = _reduce_violation_quantile(s11_violation, s11_mask, alpha)
+    return torch.maximum(s21_q, s11_q)
+
+
 def calc_yield(
     pred_s21_db: torch.Tensor,
     mask_min_db: torch.Tensor,
     mask_max_db: torch.Tensor,
     *,
     pred_s11_db: torch.Tensor | None = None,
-    s11_max_db: float = -10.0,
+    s11_max_db: float | None = -10.0,
+    tau_db: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute pass mask and yield ratio for S21 mask compliance (optional S11 guard).
     """
-    pred = pred_s21_db
-    single = pred.ndim == 1
+    single = pred_s21_db.ndim == 1
+    violations = calc_violation_max(
+        pred_s21_db,
+        mask_min_db,
+        mask_max_db,
+        pred_s11_db=pred_s11_db,
+        s11_max_db=s11_max_db,
+    )
+    pass_mask = violations <= float(tau_db)
+    yield_ratio = pass_mask.float().mean()
     if single:
-        pred = pred.unsqueeze(0)
-    mask_min = mask_min_db
-    mask_max = mask_max_db
-    if mask_min.ndim == 1:
-        mask_min = mask_min.unsqueeze(0)
-    if mask_max.ndim == 1:
-        mask_max = mask_max.unsqueeze(0)
-    mask_min = mask_min.to(device=pred.device, dtype=pred.dtype)
-    mask_max = mask_max.to(device=pred.device, dtype=pred.dtype)
+        return pass_mask.squeeze(0), yield_ratio
+    return pass_mask, yield_ratio
 
-    finite_pred = torch.isfinite(pred)
-    min_ok = torch.isnan(mask_min) | (pred >= mask_min)
-    max_ok = torch.isnan(mask_max) | (pred <= mask_max)
-    ok = finite_pred & min_ok & max_ok
 
-    if pred_s11_db is not None:
-        s11 = pred_s11_db
-        if s11.ndim == 1:
-            s11 = s11.unsqueeze(0)
-        s11 = s11.to(device=pred.device, dtype=pred.dtype)
-        s11_ok = torch.isfinite(s11) & (s11 <= float(s11_max_db))
-        ok = ok & s11_ok
-
-    pass_mask = ok.all(dim=-1)
+def calc_yield_robust(
+    pred_s21_db: torch.Tensor,
+    mask_min_db: torch.Tensor,
+    mask_max_db: torch.Tensor,
+    *,
+    alpha: float,
+    pred_s11_db: torch.Tensor | None = None,
+    s11_max_db: float | None = -10.0,
+    tau_db: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Robust yield: (1 - alpha) violation quantile <= tau_db (optional S11 guard).
+    """
+    single = pred_s21_db.ndim == 1
+    violations = calc_violation_quantile(
+        pred_s21_db,
+        mask_min_db,
+        mask_max_db,
+        alpha=alpha,
+        pred_s11_db=pred_s11_db,
+        s11_max_db=s11_max_db,
+    )
+    pass_mask = violations <= float(tau_db)
     yield_ratio = pass_mask.float().mean()
     if single:
         return pass_mask.squeeze(0), yield_ratio
@@ -460,9 +601,17 @@ class DifferentiablePhysicsKernel:
         return S11, S21, S12, S22
 
     @staticmethod
-    def s21_db(S21: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
-        mag = torch.abs(S21)
+    def sparam_db(S: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+        mag = torch.abs(S)
         return 20.0 * torch.log10(mag + eps)
+
+    @staticmethod
+    def s21_db(S21: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+        return DifferentiablePhysicsKernel.sparam_db(S21, eps=eps)
+
+    @staticmethod
+    def s11_db(S11: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+        return DifferentiablePhysicsKernel.sparam_db(S11, eps=eps)
 
 
 class _BoundedPositiveReparam(nn.Module):
@@ -942,6 +1091,70 @@ def mixed_s21_db(
     raw_min: float | None = None,
     raw_max: float | None = None,
 ) -> torch.Tensor:
+    _, S21, _, _ = mixed_sparams(
+        slot_raw,
+        g_soft,
+        macro_bank,
+        freq_hz,
+        z0=z0,
+        q_L=q_L,
+        q_C=q_C,
+        q_model=q_model,
+        ref_freq_hz=ref_freq_hz,
+        eps=eps,
+        raw_min=raw_min,
+        raw_max=raw_max,
+    )
+    return DifferentiablePhysicsKernel.s21_db(S21)
+
+
+def mixed_s11_db(
+    slot_raw: torch.Tensor,
+    g_soft: torch.Tensor,
+    macro_bank: Sequence[MacroBankEntry],
+    freq_hz: torch.Tensor,
+    *,
+    z0: float = 50.0,
+    q_L: float | torch.Tensor | None = 50.0,
+    q_C: float | torch.Tensor | None = 50.0,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
+    ref_freq_hz: float | torch.Tensor | None = None,
+    eps: float = 1e-30,
+    raw_min: float | None = None,
+    raw_max: float | None = None,
+) -> torch.Tensor:
+    S11, _, _, _ = mixed_sparams(
+        slot_raw,
+        g_soft,
+        macro_bank,
+        freq_hz,
+        z0=z0,
+        q_L=q_L,
+        q_C=q_C,
+        q_model=q_model,
+        ref_freq_hz=ref_freq_hz,
+        eps=eps,
+        raw_min=raw_min,
+        raw_max=raw_max,
+    )
+    return DifferentiablePhysicsKernel.s11_db(S11)
+
+
+def mixed_sparams(
+    slot_raw: torch.Tensor,
+    g_soft: torch.Tensor,
+    macro_bank: Sequence[MacroBankEntry],
+    freq_hz: torch.Tensor,
+    *,
+    z0: float = 50.0,
+    q_L: float | torch.Tensor | None = 50.0,
+    q_C: float | torch.Tensor | None = 50.0,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
+    ref_freq_hz: float | torch.Tensor | None = None,
+    eps: float = 1e-30,
+    raw_min: float | None = None,
+    raw_max: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if slot_raw.ndim != 2:
         raise ValueError(f"slot_raw must have shape (K, S), got {tuple(slot_raw.shape)}")
     if g_soft.ndim != 2:
@@ -994,8 +1207,7 @@ def mixed_s21_db(
     D_mix = D_mix + p_skip
 
     A_tot, B_tot, C_tot, D_tot = _cascade_abcd_cells(A_mix, B_mix, C_mix, D_mix)
-    _, S21, _, _ = DifferentiablePhysicsKernel.abcd_to_sparams(A_tot, B_tot, C_tot, D_tot, z0=z0, eps=eps)
-    return DifferentiablePhysicsKernel.s21_db(S21)
+    return DifferentiablePhysicsKernel.abcd_to_sparams(A_tot, B_tot, C_tot, D_tot, z0=z0, eps=eps)
 
 
 class InferenceTimeOptimizer:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -132,6 +133,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow spec-based mask fallback when dataset masks are missing (demo only).",
     )
+    p.add_argument("--yield-tau", type=float, default=0.0, help="Yield tau slack in dB.")
+    p.add_argument(
+        "--yield-s11-max-db",
+        type=float,
+        default=-10.0,
+        help="S11 max (dB) for yield guard; set NaN to disable.",
+    )
 
     p.add_argument("--dump", type=Path, help="Optional JSONL dump of per-sample best candidate + score.")
     return p.parse_args()
@@ -142,6 +150,9 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
+    yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
+    yield_tau = float(args.yield_tau)
 
     tok_path = args.tokenizer or args.ckpt
     tokenizer = AutoTokenizer.from_pretrained(tok_path, use_fast=False)
@@ -401,7 +412,24 @@ def main() -> None:
             pred_db = res.snapped_s21_db if res.snapped_s21_db is not None else res.final_s21_db
             pass_mask = None
             if mask_min_t is not None and mask_max_t is not None:
-                pass_mask, _ = calc_yield(pred_db, mask_min_t, mask_max_t)
+                pred_s11 = None
+                if use_s11_yield:
+                    _, pred_s11_np = engine.simulate_sparams_db(
+                        res.refined_components,
+                        freq,
+                        q_L=q_l,
+                        q_C=q_c,
+                        q_model=q_model,
+                    )
+                    pred_s11 = torch.tensor(pred_s11_np, device=pred_db.device, dtype=pred_db.dtype)
+                pass_mask, _ = calc_yield(
+                    pred_db,
+                    mask_min_t,
+                    mask_max_t,
+                    pred_s11_db=pred_s11,
+                    s11_max_db=yield_s11_max_db,
+                    tau_db=yield_tau,
+                )
             refined_records.append(
                 {
                     "score": float(final_score),
