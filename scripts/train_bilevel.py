@@ -598,8 +598,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--yield-s11-max-db",
         type=float,
-        default=-10.0,
-        help="S11 max (dB) for yield guard; set NaN to disable.",
+        default=None,
+        help="S11 max (dB) for yield guard (disabled by default).",
     )
 
     # input config

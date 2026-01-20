@@ -189,7 +189,8 @@ def calc_violation_max(
         s11_violation = torch.relu(s11 - float(s11_max_db))
         inf = pred.new_full((), float("inf"))
         s11_violation = torch.where(torch.isfinite(s11), s11_violation, inf)
-        s11_mask = torch.ones_like(s11, dtype=torch.bool)
+        mask_min_t = mask_min.to(device=pred.device, dtype=pred.dtype)
+        s11_mask = torch.isfinite(mask_min_t)
         s11_max = _reduce_violation_max(s11_violation, s11_mask)
     return torch.maximum(s21_max, s11_max)
 
@@ -215,7 +216,8 @@ def calc_violation_quantile(
         s11_violation = torch.relu(s11 - float(s11_max_db))
         inf = pred.new_full((), float("inf"))
         s11_violation = torch.where(torch.isfinite(s11), s11_violation, inf)
-        s11_mask = torch.ones_like(s11, dtype=torch.bool)
+        mask_min_t = mask_min.to(device=pred.device, dtype=pred.dtype)
+        s11_mask = torch.isfinite(mask_min_t)
         s11_q = _reduce_violation_quantile(s11_violation, s11_mask, alpha)
     return torch.maximum(s21_q, s11_q)
 
