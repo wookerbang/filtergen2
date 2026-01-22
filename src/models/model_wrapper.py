@@ -108,6 +108,7 @@ class VACTT5(nn.Module):
         decoder_input_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         value_targets: Optional[torch.Tensor] = None,
+        macro_slot_targets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         encoder_outputs = self.encode(wave, filter_type, fc_hz)
@@ -120,7 +121,7 @@ class VACTT5(nn.Module):
         )
 
         dec_hidden = None
-        if value_targets is not None or kwargs.get("macro_slot_targets") is not None:
+        if value_targets is not None or macro_slot_targets is not None:
             dec_hidden = outputs.decoder_hidden_states[-1]  # (B,L,d)
 
         # mixed discrete-continuous loss: token CE + (mantissa CE + decade CE + residual regression)
@@ -154,7 +155,6 @@ class VACTT5(nn.Module):
                 outputs.value_loss_decade = dec_loss
                 outputs.value_loss_residual = res_loss
 
-        macro_slot_targets = kwargs.get("macro_slot_targets")
         if macro_slot_targets is not None:
             if self.macro_value_head is None or self.macro_slot_mask is None or labels is None:
                 raise ValueError("macro_slot_targets provided but macro_value_head/macro_slot_mask/labels missing.")
