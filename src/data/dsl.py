@@ -560,6 +560,29 @@ def build_dsl_vocab(
     return sorted(vocab)
 
 
+def build_macro_ir_vocab(
+    *,
+    include_bos: bool = False,
+    include_eos: bool = True,
+    include_order: bool = True,
+    order_range: Tuple[int, int] | None = None,
+) -> List[str]:
+    vocab: Set[str] = set()
+    vocab.update(MACRO_IDS)
+    if include_order:
+        if order_range is None:
+            vocab.update(ORDER_TOKENS)
+        else:
+            lo, hi = int(order_range[0]), int(order_range[1])
+            if lo <= hi:
+                vocab.update([f"<ORDER_{i}>" for i in range(lo, hi + 1)])
+    if include_eos:
+        vocab.add(EOS)
+    if include_bos:
+        vocab.add(BOS)
+    return sorted(vocab)
+
+
 # ---- Encoding helpers (components -> segments) ----
 
 
@@ -2060,6 +2083,55 @@ def make_dsl_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], L
         if not allowed:
             return all_ids
         return sorted(allowed)
+
+    return _prefix_allowed_tokens_fn
+
+
+def make_macro_ir_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], List[int]]:
+    vocab = tokenizer.get_vocab()
+    all_ids = list(vocab.values())
+    macro_ids = {vocab[tok] for tok in MACRO_IDS if tok in vocab}
+    order_ids = {tid for tok, tid in vocab.items() if tok.startswith("<ORDER_")}
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+
+    if not macro_ids:
+        return lambda batch_id, input_ids: all_ids
+
+    def _state_from_ids(input_ids: List[int]) -> Tuple[bool, bool]:
+        seen_macro = False
+        done = False
+        for tid in input_ids:
+            if tid in special_ids:
+                continue
+            if done:
+                continue
+            if tid in order_ids and not seen_macro:
+                continue
+            if tid in macro_ids:
+                seen_macro = True
+                continue
+            if eos_id is not None and tid == eos_id:
+                done = True
+                continue
+            return False, True
+        return seen_macro, done
+
+    def _prefix_allowed_tokens_fn(batch_id: int, input_ids) -> List[int]:
+        ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        seen_macro, done = _state_from_ids(ids)
+        if done:
+            allowed = {eos_id} if eos_id is not None else set()
+        else:
+            allowed = set(macro_ids)
+            if not seen_macro:
+                allowed.update(order_ids)
+            if eos_id is not None:
+                allowed.add(eos_id)
+        if pad_id is not None:
+            allowed.add(pad_id)
+        return sorted(allowed) if allowed else all_ids
 
     return _prefix_allowed_tokens_fn
 

@@ -97,6 +97,7 @@ def _apply_spec_overrides(
     spec_ranges: Mapping[str, object] | None,
     rng: np.random.Generator,
 ) -> Dict[str, object]:
+    freq_range_overridden = bool(spec_fixed and ("freq_range" in spec_fixed))
     if spec_ranges:
         order_range = _parse_range(spec_ranges.get("order"))
         if order_range is not None:
@@ -136,16 +137,30 @@ def _apply_spec_overrides(
             spec["order"] = 4
             spec["order_effective"] = 4
 
-    if ftype in ("bandpass", "bandstop") and spec.get("freq_range") is None:
-        fc = float(spec.get("fc_hz", 1.0))
-        bw = spec.get("bw_frac") or spec.get("stopband_bw_frac")
-        if bw is not None and fc > 0.0:
-            bw = float(bw)
-            f_min = fc * (1.0 - 0.5 * bw)
-            f_max = fc * (1.0 + 0.5 * bw)
-            if f_min <= 0:
-                f_min = fc / 10.0
-            spec["freq_range"] = [float(f_min), float(f_max)]
+    if ftype in ("bandpass", "bandstop"):
+        if freq_range_overridden:
+            freq_range = spec.get("freq_range")
+            if isinstance(freq_range, (list, tuple)) and len(freq_range) >= 2:
+                f_min = float(freq_range[0])
+                f_max = float(freq_range[1])
+                if f_min > f_max:
+                    f_min, f_max = f_max, f_min
+                fc = 0.5 * (f_min + f_max)
+                if fc > 0.0:
+                    bw = (f_max - f_min) / fc
+                    spec["fc_hz"] = float(fc)
+                    spec["bw_frac"] = float(bw)
+                    spec["freq_range"] = [float(f_min), float(f_max)]
+        else:
+            fc = float(spec.get("fc_hz", 1.0))
+            bw = spec.get("bw_frac") or spec.get("stopband_bw_frac")
+            if bw is not None and fc > 0.0:
+                bw = float(bw)
+                f_min = fc * (1.0 - 0.5 * bw)
+                f_max = fc * (1.0 + 0.5 * bw)
+                if f_min <= 0:
+                    f_min = fc / 10.0
+                spec["freq_range"] = [float(f_min), float(f_max)]
 
     return spec
 

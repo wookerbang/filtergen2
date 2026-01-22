@@ -12,7 +12,14 @@ import torch
 from torch.utils.data import Dataset
 
 from . import quantization
-from .dsl import VAL_NONE, VALUE_SLOTS
+from .dsl import (
+    EOS,
+    MACRO_LIBRARY,
+    VALUE_SLOTS,
+    VAL_NONE,
+    dsl_tokens_to_macro_sequence,
+    dsl_tokens_to_macro_values,
+)
 
 
 class FilterDesignDataset(Dataset):
@@ -22,11 +29,12 @@ class FilterDesignDataset(Dataset):
         tokenizer,
         use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
         mix_real_prob: float = 0.3,
-        use_repr: Literal["vact", "vact_struct", "dsl", "dsl_value", "sfci", "action"] = "vact",
+        use_repr: Literal["vact", "vact_struct", "dsl", "dsl_value", "macro_ir", "sfci", "action"] = "vact",
         normalize_wave: bool = False,
         freq_mode: Literal["none", "log_fc", "linear_fc", "log_f", "log_f_centered"] = "log_fc",
         freq_scale: Literal["none", "log_fc", "log_f_mean"] = "none",
         include_s11: bool = True,
+        macro_order: bool = False,
     ):
         self.samples = []
         with open(jsonl_path, "r") as f:
@@ -40,9 +48,11 @@ class FilterDesignDataset(Dataset):
         self.freq_mode = freq_mode
         self.freq_scale = freq_scale
         self.include_s11 = include_s11
+        self.macro_order = bool(macro_order)
         self._dsl_value_cfg = None
         if self.use_repr == "dsl_value":
             self._dsl_value_cfg = self._build_dsl_value_cfg()
+        self._macro_slot_count = max(len(m.slot_types) for m in MACRO_LIBRARY.values())
 
     def _build_dsl_value_cfg(self) -> dict:
         vocab = self.tokenizer.get_vocab()
@@ -120,6 +130,49 @@ class FilterDesignDataset(Dataset):
             else:
                 out.append(tok)
         return out
+
+    def _macro_ir_tokens_and_targets(self, sample: dict) -> tuple[list[str], list[list[float]]]:
+        macros = sample.get("macro_ir_macros") or []
+        if not macros:
+            dsl_tokens = sample.get("dsl_tokens") or []
+            if dsl_tokens:
+                try:
+                    macros = dsl_tokens_to_macro_sequence(dsl_tokens, strict=True)
+                except Exception:
+                    macros = []
+        slot_targets: list[list[float]] = []
+        tokens: list[str] = []
+        order_val = sample.get("order")
+        if self.macro_order and order_val is not None:
+            tokens.append(f"<ORDER_{int(order_val)}>")
+            slot_targets.append([float("nan")] * self._macro_slot_count)
+
+        macro_vals = None
+        dsl_tokens = sample.get("dsl_tokens") or []
+        dsl_vals = sample.get("dsl_slot_values") or []
+        if dsl_tokens:
+            try:
+                macro_vals = dsl_tokens_to_macro_values(dsl_tokens, slot_values=dsl_vals, strict=False)
+            except Exception:
+                macro_vals = None
+        if macro_vals and len(macro_vals) == len(macros):
+            macro_values = [vals for _, vals in macro_vals]
+        else:
+            macro_values = [None] * len(macros)
+
+        for macro, vals in zip(macros, macro_values):
+            tokens.append(str(macro))
+            row = [float("nan")] * self._macro_slot_count
+            if vals:
+                for j in range(min(len(vals), self._macro_slot_count)):
+                    v = float(vals[j])
+                    if math.isfinite(v) and v > 0.0:
+                        row[j] = math.log(v)
+            slot_targets.append(row)
+
+        tokens.append(EOS)
+        slot_targets.append([float("nan")] * self._macro_slot_count)
+        return tokens, slot_targets
 
     def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
         """
@@ -234,6 +287,7 @@ class FilterDesignDataset(Dataset):
         scalar = torch.tensor([type_id, fc_hz], dtype=torch.float32)
 
         value_targets = None
+        macro_slot_targets = None
         if self.use_repr == "vact":
             tokens_raw = s.get("vact_tokens")
         elif self.use_repr == "vact_struct":
@@ -245,6 +299,9 @@ class FilterDesignDataset(Dataset):
             tokens_raw = s.get("dsl_tokens")
             value_targets = None
             tokens_raw = self._dsl_tokens_with_values(tokens_raw or [], s.get("dsl_slot_values") or [])
+        elif self.use_repr == "macro_ir":
+            tokens_raw, macro_slot_targets = self._macro_ir_tokens_and_targets(s)
+            value_targets = None
         elif self.use_repr == "sfci":
             tokens_raw = s.get("sfci_tokens")
         else:
@@ -272,6 +329,8 @@ class FilterDesignDataset(Dataset):
             "vact_struct_tokens": token_ids if self.use_repr == "vact_struct" else None,
             "dsl_tokens": token_ids if self.use_repr in ("dsl", "dsl_value") else None,
             "dsl_tokens_raw": list(tokens_raw or []) if self.use_repr in ("dsl", "dsl_value") else None,
+            "macro_ir_tokens": token_ids if self.use_repr == "macro_ir" else None,
+            "macro_slot_targets": macro_slot_targets if self.use_repr == "macro_ir" else None,
             "sfci_tokens": token_ids if self.use_repr == "sfci" else None,
             "action_tokens": token_ids if self.use_repr == "action" else None,
             "value_targets": value_targets,

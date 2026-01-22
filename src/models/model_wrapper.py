@@ -32,6 +32,9 @@ class VACTT5(nn.Module):
         mdr_cfg: MDRConfig = MDRConfig(),
         value_token_ids: Optional[Sequence[int]] = None,
         slot_type_token_to_idx: Optional[Mapping[int, int]] = None,
+        macro_slot_count: Optional[int] = None,
+        macro_value_loss_weight: float = 1.0,
+        macro_slot_mask: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_name)
@@ -65,6 +68,15 @@ class VACTT5(nn.Module):
             residual_log10_scale=float(mdr_cfg.residual_log10_scale),
             num_slot_types=int(torch.max(slot_lookup).item() + 1) if slot_type_token_to_idx else 0,
         )
+
+        self.macro_value_loss_weight = float(macro_value_loss_weight)
+        self.macro_value_head = None
+        if macro_slot_count is not None and int(macro_slot_count) > 0:
+            self.macro_value_head = nn.Linear(d_model, int(macro_slot_count))
+        if macro_slot_mask is not None:
+            self.register_buffer("macro_slot_mask", macro_slot_mask, persistent=False)
+        else:
+            self.register_buffer("macro_slot_mask", None, persistent=False)
 
     def encode(
         self,
@@ -107,39 +119,57 @@ class VACTT5(nn.Module):
             **kwargs,
         )
 
-        # mixed discrete-continuous loss: token CE + (mantissa CE + decade CE + residual regression)
-        if value_targets is None:
-            return outputs
+        dec_hidden = None
+        if value_targets is not None or kwargs.get("macro_slot_targets") is not None:
+            dec_hidden = outputs.decoder_hidden_states[-1]  # (B,L,d)
 
-        dec_hidden = outputs.decoder_hidden_states[-1]  # (B,L,d)
-        mant_tgt, dec_tgt, res_tgt, valid_vals = torch_decompose_mdr(value_targets, cfg=self.mdr_cfg)
-        valid_mask = valid_vals
-        if labels is not None and self.value_token_ids is not None:
-            val_ids = self.value_token_ids.to(labels.device)
-            if hasattr(torch, "isin"):
-                is_val_tok = torch.isin(labels, val_ids)
-            else:
-                is_val_tok = (labels.unsqueeze(-1) == val_ids.view(1, 1, -1)).any(-1)
-            valid_mask = valid_mask & is_val_tok
-        if valid_mask.any():
-            slot_type_ids = None
-            if labels is not None and self.slot_type_lookup is not None and self.value_head.slot_type_emb is not None:
-                vocab_size = self.slot_type_lookup.shape[0]
-                safe_labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
-                safe_labels = torch.clamp(safe_labels, 0, vocab_size - 1)
-                slot_type_ids = self.slot_type_lookup[safe_labels]
-                slot_type_ids = torch.where(slot_type_ids >= 0, slot_type_ids, torch.zeros_like(slot_type_ids))
-            pred = self.value_head(dec_hidden, slot_type_ids=slot_type_ids)
-            mant_loss = F.cross_entropy(pred.mantissa_logits[valid_mask], mant_tgt[valid_mask])
-            dec_loss = F.cross_entropy(pred.decade_logits[valid_mask], dec_tgt[valid_mask])
-            res_loss = F.mse_loss(pred.residual_log10[valid_mask], res_tgt[valid_mask])
-            value_loss = mant_loss + dec_loss + res_loss
-            loss = outputs.loss + self.value_loss_weight * value_loss if outputs.loss is not None else value_loss
-            outputs.loss = loss
-            outputs.value_loss = value_loss
-            outputs.value_loss_mantissa = mant_loss
-            outputs.value_loss_decade = dec_loss
-            outputs.value_loss_residual = res_loss
+        # mixed discrete-continuous loss: token CE + (mantissa CE + decade CE + residual regression)
+        if value_targets is not None:
+            mant_tgt, dec_tgt, res_tgt, valid_vals = torch_decompose_mdr(value_targets, cfg=self.mdr_cfg)
+            valid_mask = valid_vals
+            if labels is not None and self.value_token_ids is not None:
+                val_ids = self.value_token_ids.to(labels.device)
+                if hasattr(torch, "isin"):
+                    is_val_tok = torch.isin(labels, val_ids)
+                else:
+                    is_val_tok = (labels.unsqueeze(-1) == val_ids.view(1, 1, -1)).any(-1)
+                valid_mask = valid_mask & is_val_tok
+            if valid_mask.any():
+                slot_type_ids = None
+                if labels is not None and self.slot_type_lookup is not None and self.value_head.slot_type_emb is not None:
+                    vocab_size = self.slot_type_lookup.shape[0]
+                    safe_labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
+                    safe_labels = torch.clamp(safe_labels, 0, vocab_size - 1)
+                    slot_type_ids = self.slot_type_lookup[safe_labels]
+                    slot_type_ids = torch.where(slot_type_ids >= 0, slot_type_ids, torch.zeros_like(slot_type_ids))
+                pred = self.value_head(dec_hidden, slot_type_ids=slot_type_ids)
+                mant_loss = F.cross_entropy(pred.mantissa_logits[valid_mask], mant_tgt[valid_mask])
+                dec_loss = F.cross_entropy(pred.decade_logits[valid_mask], dec_tgt[valid_mask])
+                res_loss = F.mse_loss(pred.residual_log10[valid_mask], res_tgt[valid_mask])
+                value_loss = mant_loss + dec_loss + res_loss
+                loss = outputs.loss + self.value_loss_weight * value_loss if outputs.loss is not None else value_loss
+                outputs.loss = loss
+                outputs.value_loss = value_loss
+                outputs.value_loss_mantissa = mant_loss
+                outputs.value_loss_decade = dec_loss
+                outputs.value_loss_residual = res_loss
+
+        macro_slot_targets = kwargs.get("macro_slot_targets")
+        if macro_slot_targets is not None:
+            if self.macro_value_head is None or self.macro_slot_mask is None or labels is None:
+                raise ValueError("macro_slot_targets provided but macro_value_head/macro_slot_mask/labels missing.")
+            pred_raw = self.macro_value_head(dec_hidden)
+            vocab_size = self.macro_slot_mask.shape[0]
+            safe_labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
+            safe_labels = torch.clamp(safe_labels, 0, vocab_size - 1)
+            slot_mask = self.macro_slot_mask[safe_labels]
+            targets = macro_slot_targets.to(pred_raw.dtype)
+            valid = (slot_mask > 0) & torch.isfinite(targets)
+            if valid.any():
+                macro_loss = F.mse_loss(pred_raw[valid], targets[valid])
+                outputs.macro_value_loss = macro_loss
+                loss = outputs.loss + self.macro_value_loss_weight * macro_loss if outputs.loss is not None else macro_loss
+                outputs.loss = loss
         return outputs
 
     @torch.no_grad()
@@ -175,6 +205,30 @@ class VACTT5(nn.Module):
         dec_idx = torch.argmax(pred.decade_logits, dim=-1)
         values = torch_compose_value(mant_idx, dec_idx, pred.residual_log10, cfg=self.mdr_cfg, mode=mode)  # (B,L)
         return values
+
+    @torch.no_grad()
+    def predict_macro_values(
+        self,
+        wave: torch.Tensor,
+        filter_type: Optional[torch.Tensor] = None,
+        fc_hz: Optional[torch.Tensor] = None,
+        *,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict per-position raw slot values for macro tokens.
+        Returns raw values in log-space (same scale as bilevel slot_raw).
+        """
+        if self.macro_value_head is None:
+            raise ValueError("macro_value_head not initialized.")
+        encoder_outputs = self.encode(wave, filter_type, fc_hz)
+        out = self.t5(
+            encoder_outputs=encoder_outputs,
+            labels=token_ids,
+            output_hidden_states=True,
+        )
+        dec_hidden = out.decoder_hidden_states[-1]
+        return self.macro_value_head(dec_hidden)
 
     @torch.no_grad()
     def generate(

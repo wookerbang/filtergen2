@@ -21,7 +21,7 @@ from src.data.vact_codec import build_vact_vocab  # noqa: E402
 from src.data.vact_struct import build_vact_struct_vocab  # noqa: E402
 from src.data.sfci_net_codec import build_sfci_net_vocab  # noqa: E402
 from src.data.action_codec import build_action_vocab  # noqa: E402
-from src.data.dsl import build_dsl_vocab  # noqa: E402
+from src.data.dsl import build_dsl_vocab, build_macro_ir_vocab  # noqa: E402
 
 
 SPECIAL_TOKENS = ["<pad>", "</s>", "<unk>"]
@@ -103,6 +103,10 @@ def main() -> None:
     dsl_value_vocab += [f"<VAL_{label}>" for label in val_labels]
     build_wordlevel_tokenizer(dsl_value_vocab, out_dir / "dsl_value_tokenizer")
 
+    # Macro-IR vocab (macro sequence only)
+    macro_ir_vocab = SPECIAL_TOKENS + build_macro_ir_vocab(order_range=order_range)
+    build_wordlevel_tokenizer(macro_ir_vocab, out_dir / "macro_ir_tokenizer")
+
     # SFCI net-centric vocab
     sfci_vocab = SPECIAL_TOKENS + build_sfci_net_vocab(
         value_labels=val_labels,
@@ -119,6 +123,7 @@ def main() -> None:
     print(f"Saved VACT-Struct tokenizer to {out_dir / 'vact_struct_tokenizer'}")
     print(f"Saved DSL tokenizer to {out_dir / 'dsl_tokenizer'}")
     print(f"Saved DSL+Value tokenizer to {out_dir / 'dsl_value_tokenizer'}")
+    print(f"Saved Macro-IR tokenizer to {out_dir / 'macro_ir_tokenizer'}")
     print(f"Saved SFCI tokenizer to {out_dir / 'sfci_tokenizer'}")
     print(f"Saved Action tokenizer to {out_dir / 'action_tokenizer'}")
 

@@ -33,7 +33,7 @@ from src.data.vact_struct import (
     SHUNT_BLOCK_START,
     Z0_50,
 )
-from src.data.dsl import VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn
+from src.data.dsl import MACRO_LIBRARY, VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn, make_macro_ir_prefix_allowed_tokens_fn
 from src.models import VACTT5
 
 
@@ -41,7 +41,7 @@ def make_collate_fn(tokenizer, use_repr: str):
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
     vocab = tokenizer.get_vocab()
-    use_value_targets = use_repr != "dsl_value"
+    use_value_targets = use_repr not in ("dsl_value", "macro_ir")
     id_to_value = [float("nan")] * len(vocab)
     if use_value_targets:
         for tok, tid in vocab.items():
@@ -65,6 +65,8 @@ def make_collate_fn(tokenizer, use_repr: str):
             tokens_key = "dsl_tokens"
         elif use_repr == "dsl_value":
             tokens_key = "dsl_tokens"
+        elif use_repr == "macro_ir":
+            tokens_key = "macro_ir_tokens"
         else:
             tokens_key = "sfci_tokens"
         seqs = []
@@ -74,12 +76,25 @@ def make_collate_fn(tokenizer, use_repr: str):
             if not seq or seq[-1] != eos_id:
                 seq.append(eos_id)
             seqs.append(seq)
-            value_lists.append(b.get("value_targets"))
+            if use_repr == "macro_ir":
+                value_lists.append(b.get("macro_slot_targets"))
+            else:
+                value_lists.append(b.get("value_targets"))
         max_len = max(len(s) for s in seqs)
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         value_targets = None
+        macro_slot_targets = None
         if use_value_targets:
             value_targets = torch.full((len(batch), max_len), float("nan"), dtype=torch.float32)
+        if use_repr == "macro_ir":
+            slot_count = 0
+            for b in batch:
+                mts = b.get("macro_slot_targets") or []
+                if mts:
+                    slot_count = len(mts[0])
+                    break
+            if slot_count > 0:
+                macro_slot_targets = torch.full((len(batch), max_len, slot_count), float("nan"), dtype=torch.float32)
         for i, seq in enumerate(seqs):
             l = len(seq)
             input_ids[i, :l] = torch.tensor(seq, dtype=torch.long)
@@ -102,6 +117,17 @@ def make_collate_fn(tokenizer, use_repr: str):
         }
         if use_value_targets:
             batch_out["value_targets"] = value_targets
+        if use_repr == "macro_ir" and macro_slot_targets is not None:
+            for i, mts in enumerate(value_lists):
+                if not mts:
+                    continue
+                mlen = min(len(mts), max_len)
+                for t in range(mlen):
+                    row = mts[t]
+                    if row is None:
+                        continue
+                    macro_slot_targets[i, t, : len(row)] = torch.tensor(row, dtype=torch.float32)
+            batch_out["macro_slot_targets"] = macro_slot_targets
         return batch_out
 
     return collate
@@ -470,6 +496,27 @@ def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
             return masked
 
         return _mask_dsl
+    if repr_kind == "macro_ir":
+        prefix_allowed = make_macro_ir_prefix_allowed_tokens_fn(tokenizer)
+
+        def _mask_macro_ir(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            dec_in = _shift_right(labels, pad_id)
+            masked = logits.clone()
+            B, L, V = masked.shape
+            if V != vocab_size:
+                return masked
+            for b in range(B):
+                for t in range(L):
+                    if int(labels[b, t].item()) == -100:
+                        continue
+                    allowed = prefix_allowed(b, dec_in[b, : t + 1])
+                    allow = torch.tensor(sorted(set(allowed)), dtype=torch.long, device=masked.device)
+                    dis = torch.ones((V,), dtype=torch.bool, device=masked.device)
+                    dis[allow] = False
+                    masked[b, t, dis] = -1e9
+            return masked
+
+        return _mask_macro_ir
     return None
 
 
@@ -487,6 +534,7 @@ class Wave2CircuitTrainer(Trainer):
             fc_hz=inputs["fc_hz"],
             labels=inputs["labels"],
             value_targets=inputs.get("value_targets"),
+            macro_slot_targets=inputs.get("macro_slot_targets"),
         )
         if self.grammar_masker is None:
             loss = outputs.loss
@@ -502,6 +550,9 @@ class Wave2CircuitTrainer(Trainer):
             value_loss = getattr(outputs, "value_loss", None)
             if value_loss is not None:
                 token_loss = token_loss + float(getattr(model, "value_loss_weight", 1.0)) * value_loss
+            macro_loss = getattr(outputs, "macro_value_loss", None)
+            if macro_loss is not None:
+                token_loss = token_loss + float(getattr(model, "macro_value_loss_weight", 1.0)) * macro_loss
             loss = token_loss
         return (loss, outputs) if return_outputs else loss
 
@@ -572,7 +623,7 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(include_s11=True)
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "dsl_value", "sfci", "action"],
+        choices=["vact", "vact_struct", "dsl", "dsl_value", "macro_ir", "sfci", "action"],
         default="dsl",
         help="Which token sequence to train on.",
     )
@@ -595,6 +646,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fp16", action="store_true", help="Use fp16 training if CUDA is available.")
     p.add_argument("--bf16", action="store_true", help="Use bf16 training if supported.")
     p.add_argument("--value-loss-weight", type=float, default=1.0, help="Weight for continuous value loss.")
+    p.add_argument("--macro-order", action="store_true", help="Prefix Macro-IR with <ORDER_k> tokens.")
+    p.add_argument("--macro-value-loss-weight", type=float, default=1.0, help="Weight for Macro-IR slot MSE loss.")
     return p.parse_args()
 
 
@@ -613,6 +666,24 @@ def build_value_token_info(tokenizer) -> tuple[list[int], dict[int, int]]:
             if tok in slot_order:
                 slot_map[int(tid)] = int(slot_order[tok])
     return val_ids, slot_map
+
+
+def build_macro_slot_mask(tokenizer) -> tuple[int, torch.Tensor | None]:
+    vocab = tokenizer.get_vocab()
+    if not MACRO_LIBRARY:
+        return 0, None
+    slot_count = max(len(m.slot_types) for m in MACRO_LIBRARY.values())
+    if slot_count <= 0:
+        return 0, None
+    mask = torch.zeros((len(vocab), slot_count), dtype=torch.float32)
+    for macro_id, macro in MACRO_LIBRARY.items():
+        tid = vocab.get(macro_id)
+        if tid is None:
+            continue
+        slen = len(macro.slot_types)
+        if slen > 0:
+            mask[int(tid), :slen] = 1.0
+    return slot_count, mask
 
 
 def main() -> None:
@@ -642,6 +713,7 @@ def main() -> None:
         freq_mode=args.freq_mode,
         freq_scale=args.freq_scale,
         include_s11=args.include_s11,
+        macro_order=bool(args.macro_order),
     )
     eval_ds = None
     if args.eval_data:
@@ -655,11 +727,17 @@ def main() -> None:
             freq_mode=args.freq_mode,
             freq_scale=args.freq_scale,
             include_s11=args.include_s11,
+            macro_order=bool(args.macro_order),
         )
     collate_fn = make_collate_fn(tokenizer, use_repr=args.repr)
 
     sample_wave = train_ds[0]["wave"]
     in_channels = sample_wave.shape[0]
+    macro_slot_count = None
+    macro_slot_mask = None
+    if args.repr == "macro_ir":
+        macro_slot_count, macro_slot_mask = build_macro_slot_mask(tokenizer)
+
     model = VACTT5(
         t5_name=args.t5_name,
         waveform_in_channels=in_channels,
@@ -668,6 +746,9 @@ def main() -> None:
         value_loss_weight=args.value_loss_weight,
         value_token_ids=value_token_ids,
         slot_type_token_to_idx=slot_type_map,
+        macro_slot_count=macro_slot_count,
+        macro_value_loss_weight=args.macro_value_loss_weight,
+        macro_slot_mask=macro_slot_mask,
     )
     model.t5.config.eos_token_id = tokenizer.eos_token_id
     model.t5.config.pad_token_id = tokenizer.pad_token_id
@@ -748,6 +829,7 @@ def main() -> None:
         "include_s11": bool(args.include_s11),
         "spec_mode": args.spec_mode,
         "in_channels": int(in_channels),
+        "macro_order": bool(args.macro_order),
     }
     cfg_path = args.output / "input_config.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)

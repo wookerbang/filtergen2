@@ -24,6 +24,7 @@ from src.data.dsl import (
     VALUE_SLOTS,
     dsl_tokens_to_macro_values,
     make_dsl_prefix_allowed_tokens_fn,
+    make_macro_ir_prefix_allowed_tokens_fn,
 )  # noqa: E402
 from src.models import VACTT5  # noqa: E402
 from src.physics.differentiable_rf import (  # noqa: E402
@@ -331,7 +332,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", required=True, type=Path, help="Checkpoint dir (trainer save).")
     p.add_argument("--tokenizer", type=Path, help="Tokenizer path (defaults to --ckpt).")
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
-    p.add_argument("--repr", choices=["dsl", "dsl_value"], default="dsl_value")
+    p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir"], default="dsl_value")
     p.add_argument("--num", type=int, default=200, help="Number of samples to eval.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="ideal", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
@@ -496,6 +497,7 @@ def main() -> None:
         return val_ids, slot_map
 
     value_token_ids, slot_type_map = _build_value_token_info(tokenizer)
+    slot_count = max(len(m.slot_types) for m in MACRO_LIBRARY.values())
 
     in_channels = dataset[0]["wave"].shape[0]
     cfg_path = args.ckpt / "input_config.json"
@@ -541,6 +543,7 @@ def main() -> None:
         spec_mode=args.spec_mode,
         value_token_ids=value_token_ids,
         slot_type_token_to_idx=slot_type_map,
+        macro_slot_count=slot_count if args.repr == "macro_ir" else None,
     )
     state_path = args.ckpt / "pytorch_model.bin"
     if state_path.exists():
@@ -555,10 +558,15 @@ def main() -> None:
     model.t5.config.decoder_start_token_id = tokenizer.pad_token_id
     model.to(device).eval()
 
-    slot_count = max(len(m.slot_types) for m in MACRO_LIBRARY.values())
     assembler = DynamicCircuitAssembler(z0=50.0)
 
-    prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer) if args.syntax_mask else None
+    if args.syntax_mask:
+        if args.repr == "macro_ir":
+            prefix_allowed = make_macro_ir_prefix_allowed_tokens_fn(tokenizer)
+        else:
+            prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
+    else:
+        prefix_allowed = None
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
 
     total = 0
@@ -620,7 +628,8 @@ def main() -> None:
         seqs = outs.cpu().tolist()
 
         slot_values_seqs = None
-        if args.repr == "dsl":
+        macro_raw_seqs = None
+        if args.repr in ("dsl", "macro_ir"):
             seq_lens = [len(s) for s in seqs]
             max_len = max(seq_lens) if seq_lens else 0
             if max_len > 0:
@@ -628,16 +637,27 @@ def main() -> None:
                 seq_tensor = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
                 for i, s in enumerate(seqs):
                     seq_tensor[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-                with torch.no_grad():
-                    pred_vals = model.predict_values(
-                        wave,
-                        filter_type,
-                        fc_hz,
-                        token_ids=seq_tensor,
-                        mode=args.value_mode,
-                    )
-                pred_vals = pred_vals.detach().cpu().tolist()
-                slot_values_seqs = [pred_vals[i][: seq_lens[i]] for i in range(len(seqs))]
+                if args.repr == "dsl":
+                    with torch.no_grad():
+                        pred_vals = model.predict_values(
+                            wave,
+                            filter_type,
+                            fc_hz,
+                            token_ids=seq_tensor,
+                            mode=args.value_mode,
+                        )
+                    pred_vals = pred_vals.detach().cpu().tolist()
+                    slot_values_seqs = [pred_vals[i][: seq_lens[i]] for i in range(len(seqs))]
+                elif args.repr == "macro_ir":
+                    with torch.no_grad():
+                        pred_raw = model.predict_macro_values(
+                            wave,
+                            filter_type,
+                            fc_hz,
+                            token_ids=seq_tensor,
+                        )
+                    pred_raw = pred_raw.detach().cpu().tolist()
+                    macro_raw_seqs = [pred_raw[i][: seq_lens[i]] for i in range(len(seqs))]
 
         for b, seq in enumerate(seqs):
             total += 1
@@ -646,32 +666,58 @@ def main() -> None:
                     failed += 1
                     continue
                 tokens_full = tokenizer.convert_ids_to_tokens(seq, skip_special_tokens=False)
-                slot_vals = slot_values_seqs[b] if slot_values_seqs is not None else None
-                tokens = []
-                vals = []
-                for i_tok, (tid, tok) in enumerate(zip(seq, tokens_full)):
-                    if int(tid) in special_ids:
+                if args.repr == "macro_ir":
+                    macros = []
+                    macro_positions = []
+                    for i_tok, (tid, tok) in enumerate(zip(seq, tokens_full)):
+                        if int(tid) in special_ids:
+                            continue
+                        if tok in MACRO_LIBRARY:
+                            macros.append(tok)
+                            macro_positions.append(i_tok)
+                    if not macros:
+                        failed += 1
                         continue
-                    tokens.append(tok)
-                    if slot_vals is not None and i_tok < len(slot_vals):
-                        vals.append(float(slot_vals[i_tok]))
-                segments = dsl_tokens_to_macro_values(tokens, slot_values=vals if slot_vals is not None else None, strict=False)
-                if not segments:
-                    failed += 1
-                    continue
-                macros = [m for m, _ in segments]
-                slot_vals_by_macro = [vals_m for _, vals_m in segments]
+                    slot_mask = torch.zeros((len(macros), slot_count), dtype=dtype, device=device)
+                    slot_raw = torch.full((len(macros), slot_count), float(args.inner_raw_min), dtype=dtype, device=device)
+                    pred_seq = macro_raw_seqs[b] if macro_raw_seqs is not None else None
+                    for i_m, (macro, pos) in enumerate(zip(macros, macro_positions)):
+                        slen = len(MACRO_LIBRARY[macro].slot_types)
+                        slot_mask[i_m, :slen] = 1.0
+                        if pred_seq is None or pos >= len(pred_seq):
+                            continue
+                        row = pred_seq[pos]
+                        for j in range(min(slen, len(row))):
+                            v = float(row[j])
+                            if math.isfinite(v):
+                                slot_raw[i_m, j] = v
+                else:
+                    slot_vals = slot_values_seqs[b] if slot_values_seqs is not None else None
+                    tokens = []
+                    vals = []
+                    for i_tok, (tid, tok) in enumerate(zip(seq, tokens_full)):
+                        if int(tid) in special_ids:
+                            continue
+                        tokens.append(tok)
+                        if slot_vals is not None and i_tok < len(slot_vals):
+                            vals.append(float(slot_vals[i_tok]))
+                    segments = dsl_tokens_to_macro_values(tokens, slot_values=vals if slot_vals is not None else None, strict=False)
+                    if not segments:
+                        failed += 1
+                        continue
+                    macros = [m for m, _ in segments]
+                    slot_vals_by_macro = [vals_m for _, vals_m in segments]
 
-                slot_mask = torch.zeros((len(macros), slot_count), dtype=dtype, device=device)
-                slot_raw = torch.full((len(macros), slot_count), float(args.inner_raw_min), dtype=dtype, device=device)
-                for i_m, macro in enumerate(macros):
-                    slen = len(MACRO_LIBRARY[macro].slot_types)
-                    slot_mask[i_m, :slen] = 1.0
-                    vals_m = slot_vals_by_macro[i_m]
-                    for j in range(min(slen, len(vals_m))):
-                        v = float(vals_m[j])
-                        if math.isfinite(v) and v > 0.0:
-                            slot_raw[i_m, j] = math.log(v)
+                    slot_mask = torch.zeros((len(macros), slot_count), dtype=dtype, device=device)
+                    slot_raw = torch.full((len(macros), slot_count), float(args.inner_raw_min), dtype=dtype, device=device)
+                    for i_m, macro in enumerate(macros):
+                        slen = len(MACRO_LIBRARY[macro].slot_types)
+                        slot_mask[i_m, :slen] = 1.0
+                        vals_m = slot_vals_by_macro[i_m]
+                        for j in range(min(slen, len(vals_m))):
+                            v = float(vals_m[j])
+                            if math.isfinite(v) and v > 0.0:
+                                slot_raw[i_m, j] = math.log(v)
 
                 circuit, slot_idx = _build_circuit_and_indices(
                     macros,
