@@ -563,10 +563,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-data", type=Path, help="Optional path to eval jsonl for periodic eval.")
     p.add_argument("--tokenizer", type=str, required=True, help="Path or name of tokenizer.")
     p.add_argument("--output", type=Path, default=Path("checkpoints/wave2circuit"), help="Checkpoint dir.")
-    p.add_argument("--t5-name", type=str, default="t5-small", help="HF model name, e.g., t5-small or t5-base.")
-    p.add_argument("--batch-size", type=int, default=8, help="Per-device batch size.")
+    p.add_argument("--t5-name", type=str, default="t5-base", help="HF model name, e.g., t5-small or t5-base.")
+    p.add_argument("--batch-size", type=int, default=64, help="Per-device batch size.")
     p.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps.")
-    p.add_argument("--epochs", type=int, default=5, help="Number of epochs.")
+    p.add_argument("--epochs", type=int, default=20, help="Number of epochs.")
     p.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     p.add_argument("--log-steps", type=int, default=50, help="Logging steps.")
     p.add_argument("--eval-steps", type=int, default=200, help="Eval steps when --eval-data is provided.")
@@ -575,7 +575,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-wave",
         choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"],
-        default="ideal",
+        default="real",
         help="Which waveform to use (S21-only options: ideal_s21 / real_s21).",
     )
     p.add_argument(
@@ -611,7 +611,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--spec-mode",
         choices=["none", "type_fc"],
-        default="none",
+        default="type_fc",
         help="Spec token usage: none (wave-only) or type_fc (prepend filter type + fc token).",
     )
     p.add_argument(
@@ -620,11 +620,11 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Drop S11 channels from waveform input.",
     )
-    p.set_defaults(include_s11=True)
+    p.set_defaults(include_s11=False)
     p.add_argument(
         "--repr",
         choices=["vact", "vact_struct", "dsl", "dsl_value", "macro_ir", "sfci", "action"],
-        default="dsl",
+        default="macro_ir",
         help="Which token sequence to train on.",
     )
     p.add_argument(
