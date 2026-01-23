@@ -331,27 +331,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", required=True, type=Path, help="Path to dataset jsonl (val/test).")
     p.add_argument("--ckpt", required=True, type=Path, help="Checkpoint dir (trainer save).")
     p.add_argument("--tokenizer", type=Path, help="Tokenizer path (defaults to --ckpt).")
-    p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
-    p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir"], default="dsl_value")
+    p.add_argument("--t5-name", type=str, default="t5-base", help="Base T5 model name (for raw state_dict load).")
+    p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir"], default="macro_ir")
     p.add_argument("--num", type=int, default=200, help="Number of samples to eval.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
-    p.add_argument("--use-wave", default="ideal", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
-    p.add_argument("--target-wave", choices=["ideal", "real"], default="ideal")
+    p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
+    p.add_argument("--target-wave", choices=["ideal", "real"], default="real")
     p.add_argument("--wave-norm", action="store_true", help="Normalize waveforms (must match training if enabled).")
     p.add_argument(
         "--freq-mode",
         choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"],
-        default="log_fc",
+        default="log_f_centered",
     )
     p.add_argument(
         "--freq-scale",
         choices=["none", "log_fc", "log_f_mean"],
-        default="none",
+        default="log_f_mean",
     )
     p.add_argument(
         "--spec-mode",
         choices=["none", "type_fc"],
-        default="none",
+        default="type_fc",
         help="Spec token usage: none (wave-only) or type_fc (prepend filter type + fc token).",
     )
     p.add_argument("--no-s11", dest="include_s11", action="store_false", help="Drop S11 channels.")
@@ -359,7 +359,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allow-input-mismatch", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--pin-memory", action="store_true")
