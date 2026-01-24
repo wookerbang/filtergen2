@@ -279,6 +279,47 @@ def _has_constraints(mask_min: torch.Tensor, mask_max: torch.Tensor) -> bool:
     return bool(torch.isfinite(mask_min).any().item() or torch.isfinite(mask_max).any().item())
 
 
+def _dynamic_envelope_masks(
+    target_db: torch.Tensor,
+    *,
+    pass_drop_db: float,
+    stop_rel_db: float,
+    delta_pass: float,
+    delta_stop: float,
+    peak_quantile: float,
+    pass_max_db: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, bool, bool]:
+    target = target_db.reshape(-1)
+    mask_min = torch.full_like(target, float("nan"))
+    mask_max = torch.full_like(target, float("nan"))
+    finite = torch.isfinite(target)
+    if not bool(finite.any().item()):
+        return mask_min, mask_max, False, False
+    vals = target[finite]
+    q = float(peak_quantile)
+    if q >= 1.0:
+        peak = vals.max()
+    else:
+        peak = torch.quantile(vals, q)
+    pass_thresh = peak - float(pass_drop_db)
+    stop_thresh = peak - float(stop_rel_db)
+    pass_mask = finite & (target >= pass_thresh)
+    stop_mask = finite & (target <= stop_thresh)
+    stop_mask = stop_mask & ~pass_mask
+    if bool(pass_mask.any().item()):
+        mask_min[pass_mask] = target[pass_mask] - float(delta_pass)
+        pass_max = target[pass_mask] + float(delta_pass)
+        if pass_max_db is not None and math.isfinite(float(pass_max_db)):
+            pass_max = torch.minimum(
+                pass_max,
+                torch.tensor(float(pass_max_db), device=target.device, dtype=target.dtype),
+            )
+        mask_max[pass_mask] = pass_max
+    if bool(stop_mask.any().item()):
+        mask_max[stop_mask] = target[stop_mask] + float(delta_stop)
+    return mask_min, mask_max, bool(pass_mask.any().item()), bool(stop_mask.any().item())
+
+
 def _masked_mse_components(
     pred_db: torch.Tensor,
     target_db: torch.Tensor,
@@ -409,6 +450,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="S11 max (dB) for yield guard (disabled by default).",
     )
+    p.add_argument(
+        "--mask-mode",
+        choices=["dataset", "dynamic"],
+        default="dataset",
+        help="Mask source for yield/loss: dataset masks or dynamic envelope from target.",
+    )
+    p.add_argument("--mask-pass-drop-db", type=float, default=3.0)
+    p.add_argument("--mask-stop-rel-db", type=float, default=20.0)
+    p.add_argument("--mask-delta-pass", type=float, default=1.0)
+    p.add_argument("--mask-delta-stop", type=float, default=3.0)
+    p.add_argument("--mask-peak-quantile", type=float, default=1.0)
+    p.add_argument("--mask-pass-max-db", type=float, default=0.0)
 
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     p.add_argument("--output", type=Path, help="Optional JSON output path.")
@@ -426,6 +479,13 @@ def main() -> None:
     primary_tau = yield_taus[0]
     use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
     yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
+    mask_mode = str(args.mask_mode)
+    mask_pass_drop_db = float(args.mask_pass_drop_db)
+    mask_stop_rel_db = float(args.mask_stop_rel_db)
+    mask_delta_pass = float(args.mask_delta_pass)
+    mask_delta_stop = float(args.mask_delta_stop)
+    mask_peak_quantile = float(args.mask_peak_quantile)
+    mask_pass_max_db = float(args.mask_pass_max_db)
 
     tok_path = args.tokenizer or args.ckpt
     tokenizer = AutoTokenizer.from_pretrained(tok_path, use_fast=False)
@@ -586,6 +646,9 @@ def main() -> None:
     yield_pre_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
     yield_post_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
     yield_oracle_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+    mask_pass_empty = 0
+    mask_stop_empty = 0
+    mask_empty = 0
 
     for batch in loader:
         wave = batch["wave"].to(device=device, dtype=dtype, non_blocking=non_blocking)
@@ -665,6 +728,25 @@ def main() -> None:
                 if not torch.isfinite(target[b]).all():
                     failed += 1
                     continue
+                if mask_mode == "dynamic":
+                    mask_min_b, mask_max_b, pass_any, stop_any = _dynamic_envelope_masks(
+                        target[b],
+                        pass_drop_db=mask_pass_drop_db,
+                        stop_rel_db=mask_stop_rel_db,
+                        delta_pass=mask_delta_pass,
+                        delta_stop=mask_delta_stop,
+                        peak_quantile=mask_peak_quantile,
+                        pass_max_db=mask_pass_max_db,
+                    )
+                    if not pass_any:
+                        mask_pass_empty += 1
+                    if not stop_any:
+                        mask_stop_empty += 1
+                    if not (pass_any or stop_any):
+                        mask_empty += 1
+                else:
+                    mask_min_b = mask_min[b]
+                    mask_max_b = mask_max[b]
                 tokens_full = tokenizer.convert_ids_to_tokens(seq, skip_special_tokens=False)
                 if args.repr == "macro_ir":
                     macros = []
@@ -739,8 +821,8 @@ def main() -> None:
                 pre_mse, pre_constrained, pre_weighted = _masked_mse_components(
                     pred_pre,
                     target[b],
-                    mask_min[b],
-                    mask_max[b],
+                    mask_min_b,
+                    mask_max_b,
                     w_pass=w_pass,
                     w_stop=w_stop,
                 )
@@ -753,7 +835,7 @@ def main() -> None:
                     pre_loss = pre_weighted
                 elif loss_mode == "barrier_only":
                     pre_loss = float(barrier_weight) * float(
-                        barrier_loss(pred_pre, mask_min[b], mask_max[b]).item()
+                        barrier_loss(pred_pre, mask_min_b, mask_max_b).item()
                     )
                 else:
                     pre_loss = pre_mse
@@ -775,8 +857,8 @@ def main() -> None:
                     max_backoff=int(args.inner_nan_tries),
                     create_graph=False,
                     return_raw=True,
-                    mask_min_db=mask_min[b],
-                    mask_max_db=mask_max[b],
+                    mask_min_db=mask_min_b,
+                    mask_max_db=mask_max_b,
                     barrier_weight=barrier_weight,
                     loss_mode=loss_mode,
                     w_pass=w_pass,
@@ -794,8 +876,8 @@ def main() -> None:
                 post_mse, post_constrained, post_weighted = _masked_mse_components(
                     pred_post,
                     target[b],
-                    mask_min[b],
-                    mask_max[b],
+                    mask_min_b,
+                    mask_max_b,
                     w_pass=w_pass,
                     w_stop=w_stop,
                 )
@@ -808,7 +890,7 @@ def main() -> None:
                     post_loss = post_weighted
                 elif loss_mode == "barrier_only":
                     post_loss = float(barrier_weight) * float(
-                        barrier_loss(pred_post, mask_min[b], mask_max[b]).item()
+                        barrier_loss(pred_post, mask_min_b, mask_max_b).item()
                     )
                 else:
                     post_loss = post_mse
@@ -822,14 +904,14 @@ def main() -> None:
                 pre_loss_sum += pre_loss
                 post_loss_sum += post_loss
 
-                if _has_constraints(mask_min[b], mask_max[b]):
+                if _has_constraints(mask_min_b, mask_max_b):
                     yield_total += 1
                     oracle_s11 = target_s11[b] if use_s11_yield and target_s11 is not None else None
                     oracle_max = float(
                         calc_violation_max(
                             target[b],
-                            mask_min[b],
-                            mask_max[b],
+                            mask_min_b,
+                            mask_max_b,
                             pred_s11_db=oracle_s11,
                             s11_max_db=yield_s11_max_db,
                         ).item()
@@ -837,8 +919,8 @@ def main() -> None:
                     pre_max = float(
                         calc_violation_max(
                             pred_pre,
-                            mask_min[b],
-                            mask_max[b],
+                            mask_min_b,
+                            mask_max_b,
                             pred_s11_db=pred_pre_s11,
                             s11_max_db=yield_s11_max_db,
                         ).item()
@@ -846,8 +928,8 @@ def main() -> None:
                     post_max = float(
                         calc_violation_max(
                             pred_post,
-                            mask_min[b],
-                            mask_max[b],
+                            mask_min_b,
+                            mask_max_b,
                             pred_s11_db=pred_post_s11,
                             s11_max_db=yield_s11_max_db,
                         ).item()
@@ -863,8 +945,8 @@ def main() -> None:
                         oracle_q = float(
                             calc_violation_quantile(
                                 target[b],
-                                mask_min[b],
-                                mask_max[b],
+                                mask_min_b,
+                                mask_max_b,
                                 alpha=alpha_val,
                                 pred_s11_db=oracle_s11,
                                 s11_max_db=yield_s11_max_db,
@@ -873,8 +955,8 @@ def main() -> None:
                         pre_q = float(
                             calc_violation_quantile(
                                 pred_pre,
-                                mask_min[b],
-                                mask_max[b],
+                                mask_min_b,
+                                mask_max_b,
                                 alpha=alpha_val,
                                 pred_s11_db=pred_pre_s11,
                                 s11_max_db=yield_s11_max_db,
@@ -883,8 +965,8 @@ def main() -> None:
                         post_q = float(
                             calc_violation_quantile(
                                 pred_post,
-                                mask_min[b],
-                                mask_max[b],
+                                mask_min_b,
+                                mask_max_b,
                                 alpha=alpha_val,
                                 pred_s11_db=pred_post_s11,
                                 s11_max_db=yield_s11_max_db,
@@ -945,6 +1027,16 @@ def main() -> None:
         "yield_oracle_robust_by_tau": yield_oracle_robust_out,
         "yield_pre_robust_by_tau": yield_pre_robust_out,
         "yield_post_robust_by_tau": yield_post_robust_out,
+        "mask_mode": mask_mode,
+        "mask_pass_drop_db": mask_pass_drop_db,
+        "mask_stop_rel_db": mask_stop_rel_db,
+        "mask_delta_pass": mask_delta_pass,
+        "mask_delta_stop": mask_delta_stop,
+        "mask_peak_quantile": mask_peak_quantile,
+        "mask_pass_max_db": mask_pass_max_db,
+        "mask_pass_empty": mask_pass_empty,
+        "mask_stop_empty": mask_stop_empty,
+        "mask_empty": mask_empty,
         "target_wave": str(args.target_wave),
         "checkpoint": str(args.ckpt),
     }
