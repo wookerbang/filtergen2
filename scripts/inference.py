@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "dsl_value", "action"],
+        choices=["vact", "vact_struct", "dsl", "dsl_value", "sfci", "action"],
         default="vact_struct",
     )
     p.add_argument("--num", type=int, default=50, help="Number of samples to run.")

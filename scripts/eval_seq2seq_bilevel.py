@@ -26,6 +26,7 @@ from src.data.dsl import (
     make_dsl_prefix_allowed_tokens_fn,
     make_macro_ir_prefix_allowed_tokens_fn,
 )  # noqa: E402
+from src.data.token_decode import build_label_value_map, decode_components_from_token_ids  # noqa: E402
 from src.models import VACTT5  # noqa: E402
 from src.physics.differentiable_rf import (  # noqa: E402
     calc_violation_max,
@@ -373,7 +374,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", required=True, type=Path, help="Checkpoint dir (trainer save).")
     p.add_argument("--tokenizer", type=Path, help="Tokenizer path (defaults to --ckpt).")
     p.add_argument("--t5-name", type=str, default="t5-base", help="Base T5 model name (for raw state_dict load).")
-    p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir"], default="macro_ir")
+    p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir", "sfci"], default="macro_ir")
     p.add_argument("--num", type=int, default=200, help="Number of samples to eval.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
@@ -415,6 +416,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new", type=int, default=256)
     p.add_argument("--syntax-mask", action="store_true", help="Apply DSL grammar mask during decoding.")
     p.add_argument("--value-mode", choices=["standard", "precision"], default="precision")
+    p.add_argument("--predict-values", action="store_true", help="Predict continuous values for SFCI tokens.")
 
     # unroll refinement
     p.add_argument("--unroll-steps", type=int, default=10)
@@ -491,6 +493,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(tok_path, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    label_map = build_label_value_map(tokenizer)
 
     dataset = Seq2SeqEvalDataset(
         str(args.data),
@@ -620,13 +623,12 @@ def main() -> None:
 
     assembler = DynamicCircuitAssembler(z0=50.0)
 
+    prefix_allowed = None
     if args.syntax_mask:
         if args.repr == "macro_ir":
             prefix_allowed = make_macro_ir_prefix_allowed_tokens_fn(tokenizer)
-        else:
+        elif args.repr in ("dsl", "dsl_value"):
             prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
-    else:
-        prefix_allowed = None
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
 
     total = 0
@@ -692,7 +694,8 @@ def main() -> None:
 
         slot_values_seqs = None
         macro_raw_seqs = None
-        if args.repr in ("dsl", "macro_ir"):
+        predict_values = args.repr == "dsl" or (args.repr == "sfci" and args.predict_values)
+        if args.repr == "macro_ir" or predict_values:
             seq_lens = [len(s) for s in seqs]
             max_len = max(seq_lens) if seq_lens else 0
             if max_len > 0:
@@ -700,7 +703,17 @@ def main() -> None:
                 seq_tensor = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
                 for i, s in enumerate(seqs):
                     seq_tensor[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-                if args.repr == "dsl":
+                if args.repr == "macro_ir":
+                    with torch.no_grad():
+                        pred_raw = model.predict_macro_values(
+                            wave,
+                            filter_type,
+                            fc_hz,
+                            token_ids=seq_tensor,
+                        )
+                    pred_raw = pred_raw.detach().cpu().tolist()
+                    macro_raw_seqs = [pred_raw[i][: seq_lens[i]] for i in range(len(seqs))]
+                else:
                     with torch.no_grad():
                         pred_vals = model.predict_values(
                             wave,
@@ -711,16 +724,6 @@ def main() -> None:
                         )
                     pred_vals = pred_vals.detach().cpu().tolist()
                     slot_values_seqs = [pred_vals[i][: seq_lens[i]] for i in range(len(seqs))]
-                elif args.repr == "macro_ir":
-                    with torch.no_grad():
-                        pred_raw = model.predict_macro_values(
-                            wave,
-                            filter_type,
-                            fc_hz,
-                            token_ids=seq_tensor,
-                        )
-                    pred_raw = pred_raw.detach().cpu().tolist()
-                    macro_raw_seqs = [pred_raw[i][: seq_lens[i]] for i in range(len(seqs))]
 
         for b, seq in enumerate(seqs):
             total += 1
@@ -773,6 +776,39 @@ def main() -> None:
                             v = float(row[j])
                             if math.isfinite(v):
                                 slot_raw[i_m, j] = v
+                    circuit, slot_idx = _build_circuit_and_indices(
+                        macros,
+                        slot_count=slot_count,
+                        assembler=assembler,
+                        device=device,
+                        dtype=dtype,
+                    )
+                elif args.repr == "sfci":
+                    slot_vals = slot_values_seqs[b] if slot_values_seqs is not None else None
+                    comps, _ = decode_components_from_token_ids(
+                        seq,
+                        tokenizer,
+                        repr_kind="sfci",
+                        label_to_value=label_map,
+                        slot_values=slot_vals,
+                    )
+                    if not comps:
+                        failed += 1
+                        continue
+                    circuit, comps = assembler.assemble(comps, trainable=False, device=device, dtype=dtype)
+                    value_comp_indices = getattr(circuit, "value_comp_indices", None)
+                    if value_comp_indices is None:
+                        value_comp_indices = list(range(len(comps)))
+                    if not value_comp_indices:
+                        failed += 1
+                        continue
+                    slot_raw = torch.full((len(value_comp_indices),), float(args.inner_raw_min), dtype=dtype, device=device)
+                    for i_v, comp_idx in enumerate(value_comp_indices):
+                        v = float(comps[comp_idx].value_si)
+                        if math.isfinite(v) and v > 0.0:
+                            slot_raw[i_v] = math.log(v)
+                    slot_mask = torch.ones_like(slot_raw)
+                    slot_idx = torch.arange(len(value_comp_indices), device=device, dtype=torch.long)
                 else:
                     slot_vals = slot_values_seqs[b] if slot_values_seqs is not None else None
                     tokens = []
@@ -783,7 +819,11 @@ def main() -> None:
                         tokens.append(tok)
                         if slot_vals is not None and i_tok < len(slot_vals):
                             vals.append(float(slot_vals[i_tok]))
-                    segments = dsl_tokens_to_macro_values(tokens, slot_values=vals if slot_vals is not None else None, strict=False)
+                    segments = dsl_tokens_to_macro_values(
+                        tokens,
+                        slot_values=vals if slot_vals is not None else None,
+                        strict=False,
+                    )
                     if not segments:
                         failed += 1
                         continue
@@ -801,13 +841,13 @@ def main() -> None:
                             if math.isfinite(v) and v > 0.0:
                                 slot_raw[i_m, j] = math.log(v)
 
-                circuit, slot_idx = _build_circuit_and_indices(
-                    macros,
-                    slot_count=slot_count,
-                    assembler=assembler,
-                    device=device,
-                    dtype=dtype,
-                )
+                    circuit, slot_idx = _build_circuit_and_indices(
+                        macros,
+                        slot_count=slot_count,
+                        assembler=assembler,
+                        device=device,
+                        dtype=dtype,
+                    )
                 raw_pre = slot_raw.clamp(float(args.inner_raw_min), float(args.inner_raw_max))
                 values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
                 values_vec = values_flat.index_select(0, slot_idx)
