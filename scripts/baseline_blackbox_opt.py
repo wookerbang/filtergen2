@@ -93,6 +93,47 @@ def _resolve_bw_frac(sample: dict) -> float:
         return 0.2
 
 
+def _dynamic_envelope_masks(
+    target_db: torch.Tensor,
+    *,
+    pass_drop_db: float,
+    stop_rel_db: float,
+    delta_pass: float,
+    delta_stop: float,
+    peak_quantile: float,
+    pass_max_db: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, bool, bool]:
+    target = target_db.reshape(-1)
+    mask_min = torch.full_like(target, float("nan"))
+    mask_max = torch.full_like(target, float("nan"))
+    finite = torch.isfinite(target)
+    if not bool(finite.any().item()):
+        return mask_min, mask_max, False, False
+    vals = target[finite]
+    q = float(peak_quantile)
+    if q >= 1.0:
+        peak = vals.max()
+    else:
+        peak = torch.quantile(vals, q)
+    pass_thresh = peak - float(pass_drop_db)
+    stop_thresh = peak - float(stop_rel_db)
+    pass_mask = finite & (target >= pass_thresh)
+    stop_mask = finite & (target <= stop_thresh)
+    stop_mask = stop_mask & ~pass_mask
+    if bool(pass_mask.any().item()):
+        mask_min[pass_mask] = target[pass_mask] - float(delta_pass)
+        pass_max = target[pass_mask] + float(delta_pass)
+        if pass_max_db is not None and math.isfinite(float(pass_max_db)):
+            pass_max = torch.minimum(
+                pass_max,
+                torch.tensor(float(pass_max_db), device=target.device, dtype=target.dtype),
+            )
+        mask_max[pass_mask] = pass_max
+    if bool(stop_mask.any().item()):
+        mask_max[stop_mask] = target[stop_mask] + float(delta_stop)
+    return mask_min, mask_max, bool(pass_mask.any().item()), bool(stop_mask.any().item())
+
+
 def _choose_topology(mode: str, rng: random.Random) -> str:
     mode = mode.lower()
     if mode == "pi":
@@ -260,6 +301,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-pass", type=float, default=1.0)
     p.add_argument("--w-stop", type=float, default=5.0)
     p.add_argument("--barrier-weight", type=float, default=0.0)
+    p.add_argument(
+        "--mask-mode",
+        choices=["dataset", "dynamic"],
+        default="dataset",
+        help="Mask source: dataset masks or dynamic envelope from target.",
+    )
+    p.add_argument("--mask-pass-drop-db", type=float, default=3.0)
+    p.add_argument("--mask-stop-rel-db", type=float, default=20.0)
+    p.add_argument("--mask-delta-pass", type=float, default=1.0)
+    p.add_argument("--mask-delta-stop", type=float, default=3.0)
+    p.add_argument("--mask-peak-quantile", type=float, default=1.0)
+    p.add_argument("--mask-pass-max-db", type=float, default=0.0)
     p.add_argument("--raw-min", type=float, default=-32.0)
     p.add_argument("--raw-max", type=float, default=-12.0)
     p.add_argument("--pop-size", type=int, default=32)
@@ -303,6 +356,13 @@ def main() -> None:
     primary_tau = yield_taus[0]
     use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
     yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
+    mask_mode = str(args.mask_mode)
+    mask_pass_drop_db = float(args.mask_pass_drop_db)
+    mask_stop_rel_db = float(args.mask_stop_rel_db)
+    mask_delta_pass = float(args.mask_delta_pass)
+    mask_delta_stop = float(args.mask_delta_stop)
+    mask_peak_quantile = float(args.mask_peak_quantile)
+    mask_pass_max_db = float(args.mask_pass_max_db)
 
     with open(args.data, "r") as f:
         samples = [json.loads(line) for line in f if line.strip()]
@@ -331,6 +391,9 @@ def main() -> None:
     yield_post_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
     yield_oracle_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
     sim_calls = 0
+    mask_pass_empty = 0
+    mask_stop_empty = 0
+    mask_empty = 0
 
     for sample in samples:
         total += 1
@@ -338,14 +401,31 @@ def main() -> None:
             freq = torch.tensor(sample["freq_hz"], dtype=dtype, device=device)
             target_key = "real_s21_db" if args.target_wave == "real" else "ideal_s21_db"
             target = torch.tensor(sample[target_key], dtype=dtype, device=device)
-            mask_min_raw = sample.get("mask_min_db")
-            mask_max_raw = sample.get("mask_max_db")
-            if mask_min_raw is None:
-                mask_min_raw = [float("nan")] * len(sample["freq_hz"])
-            if mask_max_raw is None:
-                mask_max_raw = [float("nan")] * len(sample["freq_hz"])
-            mask_min = torch.tensor(mask_min_raw, dtype=dtype, device=device)
-            mask_max = torch.tensor(mask_max_raw, dtype=dtype, device=device)
+            if mask_mode == "dynamic":
+                mask_min, mask_max, pass_any, stop_any = _dynamic_envelope_masks(
+                    target,
+                    pass_drop_db=mask_pass_drop_db,
+                    stop_rel_db=mask_stop_rel_db,
+                    delta_pass=mask_delta_pass,
+                    delta_stop=mask_delta_stop,
+                    peak_quantile=mask_peak_quantile,
+                    pass_max_db=mask_pass_max_db,
+                )
+                if not pass_any:
+                    mask_pass_empty += 1
+                if not stop_any:
+                    mask_stop_empty += 1
+                if not (pass_any or stop_any):
+                    mask_empty += 1
+            else:
+                mask_min_raw = sample.get("mask_min_db")
+                mask_max_raw = sample.get("mask_max_db")
+                if mask_min_raw is None:
+                    mask_min_raw = [float("nan")] * len(sample["freq_hz"])
+                if mask_max_raw is None:
+                    mask_max_raw = [float("nan")] * len(sample["freq_hz"])
+                mask_min = torch.tensor(mask_min_raw, dtype=dtype, device=device)
+                mask_max = torch.tensor(mask_max_raw, dtype=dtype, device=device)
             if not torch.isfinite(target).all():
                 failed += 1
                 continue
@@ -613,6 +693,16 @@ def main() -> None:
         "bp_topology_mode": args.bp_topology_mode,
         "bp_cascade_order": args.bp_cascade_order,
         "target_wave": args.target_wave,
+        "mask_mode": mask_mode,
+        "mask_pass_drop_db": mask_pass_drop_db,
+        "mask_stop_rel_db": mask_stop_rel_db,
+        "mask_delta_pass": mask_delta_pass,
+        "mask_delta_stop": mask_delta_stop,
+        "mask_peak_quantile": mask_peak_quantile,
+        "mask_pass_max_db": mask_pass_max_db,
+        "mask_pass_empty": mask_pass_empty,
+        "mask_stop_empty": mask_stop_empty,
+        "mask_empty": mask_empty,
     }
 
     print(json.dumps(results, indent=2))

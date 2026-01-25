@@ -119,6 +119,47 @@ def _circuit_s11_db(
     return DifferentiablePhysicsKernel.s11_db(s11)
 
 
+def _dynamic_envelope_masks(
+    target_db: torch.Tensor,
+    *,
+    pass_drop_db: float,
+    stop_rel_db: float,
+    delta_pass: float,
+    delta_stop: float,
+    peak_quantile: float,
+    pass_max_db: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, bool, bool]:
+    target = target_db.reshape(-1)
+    mask_min = torch.full_like(target, float("nan"))
+    mask_max = torch.full_like(target, float("nan"))
+    finite = torch.isfinite(target)
+    if not bool(finite.any().item()):
+        return mask_min, mask_max, False, False
+    vals = target[finite]
+    q = float(peak_quantile)
+    if q >= 1.0:
+        peak = vals.max()
+    else:
+        peak = torch.quantile(vals, q)
+    pass_thresh = peak - float(pass_drop_db)
+    stop_thresh = peak - float(stop_rel_db)
+    pass_mask = finite & (target >= pass_thresh)
+    stop_mask = finite & (target <= stop_thresh)
+    stop_mask = stop_mask & ~pass_mask
+    if bool(pass_mask.any().item()):
+        mask_min[pass_mask] = target[pass_mask] - float(delta_pass)
+        pass_max = target[pass_mask] + float(delta_pass)
+        if pass_max_db is not None and math.isfinite(float(pass_max_db)):
+            pass_max = torch.minimum(
+                pass_max,
+                torch.tensor(float(pass_max_db), device=target.device, dtype=target.dtype),
+            )
+        mask_max[pass_mask] = pass_max
+    if bool(stop_mask.any().item()):
+        mask_max[stop_mask] = target[stop_mask] + float(delta_stop)
+    return mask_min, mask_max, bool(pass_mask.any().item()), bool(stop_mask.any().item())
+
+
 def _sample_random_macros(
     gt_macros: List[str],
     *,
@@ -260,6 +301,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-pass", type=float, default=None)
     p.add_argument("--w-stop", type=float, default=None)
     p.add_argument("--barrier-weight", type=float, default=None)
+    p.add_argument(
+        "--mask-mode",
+        choices=["dataset", "dynamic"],
+        default="dataset",
+        help="Mask source: dataset masks or dynamic envelope from target.",
+    )
+    p.add_argument("--mask-pass-drop-db", type=float, default=3.0)
+    p.add_argument("--mask-stop-rel-db", type=float, default=20.0)
+    p.add_argument("--mask-delta-pass", type=float, default=1.0)
+    p.add_argument("--mask-delta-stop", type=float, default=3.0)
+    p.add_argument("--mask-peak-quantile", type=float, default=1.0)
+    p.add_argument("--mask-pass-max-db", type=float, default=0.0)
     p.add_argument("--yield-threshold", type=float, default=1.0)
     p.add_argument("--yield-tau", type=float, default=0.0, help="Yield tau slack in dB.")
     p.add_argument(
@@ -288,6 +341,13 @@ def main() -> None:
     w_pass = float(args.w_pass) if args.w_pass is not None else float(cfg.get("w_pass", 1.0))
     w_stop = float(args.w_stop) if args.w_stop is not None else float(cfg.get("w_stop", 5.0))
     barrier_weight = float(args.barrier_weight) if args.barrier_weight is not None else float(cfg.get("barrier_weight", 1.0))
+    mask_mode = str(args.mask_mode)
+    mask_pass_drop_db = float(args.mask_pass_drop_db)
+    mask_stop_rel_db = float(args.mask_stop_rel_db)
+    mask_delta_pass = float(args.mask_delta_pass)
+    mask_delta_stop = float(args.mask_delta_stop)
+    mask_peak_quantile = float(args.mask_peak_quantile)
+    mask_pass_max_db = float(args.mask_pass_max_db)
 
     samples: List[dict] = []
     macro_seqs: List[List[str]] = []
@@ -340,6 +400,9 @@ def main() -> None:
     success_count = 0
     success_pre = 0
     total_sims = 0
+    mask_pass_empty = 0
+    mask_stop_empty = 0
+    mask_empty = 0
 
     for idx in idxs:
         s = samples[idx]
@@ -390,8 +453,25 @@ def main() -> None:
         else:
             target = real if s.get("real_s21_db") is not None else ideal
 
-        mask_min = torch.tensor(s.get("mask_min_db") or [float("nan")] * len(freq), dtype=torch.float32, device=device)
-        mask_max = torch.tensor(s.get("mask_max_db") or [float("nan")] * len(freq), dtype=torch.float32, device=device)
+        if mask_mode == "dynamic":
+            mask_min, mask_max, pass_any, stop_any = _dynamic_envelope_masks(
+                target,
+                pass_drop_db=mask_pass_drop_db,
+                stop_rel_db=mask_stop_rel_db,
+                delta_pass=mask_delta_pass,
+                delta_stop=mask_delta_stop,
+                peak_quantile=mask_peak_quantile,
+                pass_max_db=mask_pass_max_db,
+            )
+            if not pass_any:
+                mask_pass_empty += 1
+            if not stop_any:
+                mask_stop_empty += 1
+            if not (pass_any or stop_any):
+                mask_empty += 1
+        else:
+            mask_min = torch.tensor(s.get("mask_min_db") or [float("nan")] * len(freq), dtype=torch.float32, device=device)
+            mask_max = torch.tensor(s.get("mask_max_db") or [float("nan")] * len(freq), dtype=torch.float32, device=device)
 
         slot_raw = torch.empty((len(macros), slot_count), device=device).uniform_(
             float(args.raw_min), float(args.raw_max)
@@ -486,6 +566,8 @@ def main() -> None:
         print(f"steps_to_success_mean={step_mean:.2f}")
     else:
         print("steps_to_success_mean=None")
+    if mask_mode == "dynamic":
+        print(f"mask_pass_empty={mask_pass_empty} mask_stop_empty={mask_stop_empty} mask_empty={mask_empty}")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
