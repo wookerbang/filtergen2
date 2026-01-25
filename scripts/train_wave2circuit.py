@@ -84,7 +84,10 @@ def make_collate_fn(tokenizer, use_repr: str):
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         value_targets = None
         macro_slot_targets = None
-        if use_value_targets:
+        use_value_targets_batch = use_value_targets
+        if use_repr == "sfci":
+            use_value_targets_batch = any(v is not None for v in value_lists)
+        if use_value_targets_batch:
             value_targets = torch.full((len(batch), max_len), float("nan"), dtype=torch.float32)
         if use_repr == "macro_ir":
             slot_count = 0
@@ -98,7 +101,7 @@ def make_collate_fn(tokenizer, use_repr: str):
         for i, seq in enumerate(seqs):
             l = len(seq)
             input_ids[i, :l] = torch.tensor(seq, dtype=torch.long)
-            if use_value_targets:
+            if use_value_targets_batch:
                 vt_list = value_lists[i] if value_lists[i] is not None else None
                 for t, tid in enumerate(seq):
                     if t >= max_len:
@@ -115,7 +118,7 @@ def make_collate_fn(tokenizer, use_repr: str):
             "fc_hz": fc_hz,
             "labels": labels,
         }
-        if use_value_targets:
+        if use_value_targets_batch:
             batch_out["value_targets"] = value_targets
         if use_repr == "macro_ir" and macro_slot_targets is not None:
             for i, mts in enumerate(value_lists):
@@ -624,7 +627,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--repr",
         choices=["vact", "vact_struct", "dsl", "dsl_value", "macro_ir", "sfci", "action"],
-        default="macro_ir",
+        default="sfci",
         help="Which token sequence to train on.",
     )
     p.add_argument(

@@ -15,7 +15,7 @@ from .gen_prototype import synthesize_filter
 from .quantization import quantize_components
 from .schema import ComponentSpec, FilterSample
 from .vact_codec import components_to_vact_tokens
-from .sfci_net_codec import components_to_sfci_net_tokens
+from .sfci_net_codec import components_to_sfci_net_tokens, components_to_sfci_net_tokens_and_values
 from .spice_runner import simulate_real_waveform
 from .vact_struct import components_to_vact_struct_tokens
 from .node_canonicalizer import canonicalize_nodes
@@ -54,6 +54,8 @@ def _serialize_sample(sample: FilterSample) -> dict:
         data["dsl_slot_values"] = sample.dsl_slot_values
     if sample.sfci_tokens is not None:
         data["sfci_tokens"] = sample.sfci_tokens
+    if sample.sfci_slot_values is not None:
+        data["sfci_slot_values"] = sample.sfci_slot_values
     if sample.action_tokens is not None:
         data["action_tokens"] = sample.action_tokens
     return data
@@ -73,6 +75,7 @@ def build_dataset(
     emit_actions: bool = False,
     emit_dsl: bool = True,
     emit_sfci: bool = False,
+    sfci_value_mode: str = "discrete",
     dsl_include_order: bool = True,
     dsl_use_cell_indices: bool = False,
     dsl_strict: bool = False,
@@ -88,6 +91,7 @@ def build_dataset(
     spec_ranges: Mapping[str, object] | None = None,
     narrow_freq_grid: bool = False,
     narrow_freq_span: float = 0.5,
+    quantize_series: str | None = "E24",
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -136,7 +140,12 @@ def build_dataset(
             base_components = canonicalize_nodes(base_components, max_nodes=max_nodes)
 
             # Output label: nominal standard parts (no tolerance, no loss).
-            discrete_components = quantize_components(base_components, series="E24")
+            if quantize_series is None or str(quantize_series).lower() == "none":
+                discrete_components = list(base_components)
+                variant = "ideal"
+            else:
+                discrete_components = quantize_components(base_components, series=str(quantize_series))
+                variant = "quantized"
             ideal_components = base_components
             ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
             if need_sim_for_ideal and use_ngspice:
@@ -256,7 +265,22 @@ def build_dataset(
                 if dsl_strict and dsl_tokens and VAL_NONE in dsl_tokens:
                     print(f"Sample {i}: DSL contains <VAL_NONE>; skipping due to --dsl-strict.")
                     continue
-            sfci_tokens = components_to_sfci_net_tokens(discrete_components) if emit_sfci else None
+            sfci_tokens = None
+            sfci_slot_values = None
+            if emit_sfci:
+                mode = str(sfci_value_mode or "discrete").lower()
+                if mode == "continuous":
+                    sfci_tokens, sfci_slot_values = components_to_sfci_net_tokens_and_values(
+                        discrete_components,
+                        value_mode="continuous",
+                    )
+                elif mode in ("none", "discrete"):
+                    sfci_tokens = components_to_sfci_net_tokens(
+                        discrete_components,
+                        value_mode="none" if mode == "none" else "discrete",
+                    )
+                else:
+                    raise ValueError(f"Unknown sfci_value_mode: {sfci_value_mode}")
             action_tokens = components_to_action_tokens(discrete_components) if emit_actions else None
             sample = FilterSample(
                 spec_id=i,
@@ -267,7 +291,7 @@ def build_dataset(
                 order=spec["order"],
                 ripple_db=spec["ripple_db"],
                 fc_hz=spec["fc_hz"],
-                variant="quantized",
+                variant=variant,
                 z0=z0,
                 num_L=sum(1 for c in base_components if c.ctype == "L"),
                 num_C=sum(1 for c in base_components if c.ctype == "C"),
@@ -298,6 +322,7 @@ def build_dataset(
                 dsl_slot_values=dsl_slot_values,
                 macro_ir_macros=macro_ir_macros,
                 sfci_tokens=sfci_tokens,
+                sfci_slot_values=sfci_slot_values,
                 action_tokens=action_tokens,
             )
 

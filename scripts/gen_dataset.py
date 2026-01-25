@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         choices=["freq_dependent", "fixed_ref"],
         help="Q modeling for real waveforms: freq_dependent (Fast Track) or fixed_ref (SPICE-style).",
     )
+    p.add_argument(
+        "--quantize",
+        choices=["E24", "E12", "none"],
+        default="E24",
+        help="Quantize component values to E-series (none keeps continuous values).",
+    )
     p.add_argument("--vact", dest="vact", action="store_true", help="Emit VACT-Seq tokens.")
     p.add_argument("--no-vact", dest="vact", action="store_false", help="Disable VACT-Seq token emission.")
     p.set_defaults(vact=False)
@@ -61,10 +67,30 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(actions=False)
     p.add_argument("--dsl", dest="dsl", action="store_true", help="Emit DSL tokens (macro/repeat).")
     p.add_argument("--no-dsl", dest="dsl", action="store_false", help="Disable DSL token emission.")
-    p.set_defaults(dsl=True)
+    p.set_defaults(dsl=False)
     p.add_argument("--sfci", dest="sfci", action="store_true", help="Emit SFCI tokens.")
     p.add_argument("--no-sfci", dest="sfci", action="store_false", help="Disable SFCI token emission.")
-    p.set_defaults(sfci=False)
+    p.set_defaults(sfci=True)
+    p.add_argument(
+        "--sfci-value-mode",
+        choices=["discrete", "none", "continuous"],
+        default="discrete",
+        help="SFCI value tokens: discrete labels, none (<VAL_NONE>), or continuous placeholders.",
+    )
+    p.add_argument(
+        "--sfci-values",
+        dest="sfci_value_mode",
+        action="store_const",
+        const="discrete",
+        help="Alias for --sfci-value-mode discrete.",
+    )
+    p.add_argument(
+        "--no-sfci-values",
+        dest="sfci_value_mode",
+        action="store_const",
+        const="none",
+        help="Alias for --sfci-value-mode none.",
+    )
     p.add_argument("--dsl-order", dest="dsl_order", action="store_true", help="Prepend <ORDER_k> in DSL tokens.")
     p.add_argument("--no-dsl-order", dest="dsl_order", action="store_false", help="Disable <ORDER_k> in DSL tokens.")
     p.set_defaults(dsl_order=True)
@@ -186,6 +212,7 @@ def main() -> None:
         emit_actions=bool(args.actions),
         emit_dsl=bool(args.dsl),
         emit_sfci=bool(args.sfci),
+        sfci_value_mode=str(args.sfci_value_mode),
         dsl_include_order=bool(args.dsl_order),
         dsl_use_cell_indices=bool(args.dsl_cell_indices),
         dsl_strict=bool(args.dsl_strict),
@@ -201,6 +228,7 @@ def main() -> None:
         spec_ranges=spec_ranges,
         narrow_freq_grid=bool(args.narrow_freq_grid),
         narrow_freq_span=float(args.narrow_freq_span),
+        quantize_series=None if str(args.quantize).lower() == "none" else str(args.quantize),
     )
     print(f"Dataset written to {path}")
 

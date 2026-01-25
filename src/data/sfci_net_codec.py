@@ -7,9 +7,10 @@ the hyperedge-list spirit of SFCI, while keeping parsing simple for LC ladders.
 
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Sequence, Set, Tuple
+from typing import Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
 from .schema import ComponentSpec
+from .dsl import VAL_NONE, VALUE_SLOTS
 
 
 def _node_order(node: str) -> int:
@@ -27,7 +28,11 @@ def _node_order(node: str) -> int:
     return 30_000
 
 
-def components_to_sfci_net_tokens(components: List[ComponentSpec]) -> List[str]:
+def components_to_sfci_net_tokens(
+    components: List[ComponentSpec],
+    *,
+    value_mode: Literal["discrete", "none", "continuous"] = "discrete",
+) -> List[str]:
     """
     Net-centric SFCI-like encoding:
       <NODE_x> (<DEV_L0> <ROLE_SERIES> <VAL_label> <PEER_y>)* <ENDNODE>
@@ -42,17 +47,25 @@ def components_to_sfci_net_tokens(components: List[ComponentSpec]) -> List[str]:
         comp_meta.append((comp, idx))
 
     # build adjacency
-    node_map: Dict[str, List[Tuple[str, str, str, str, int]]] = {}
+    node_map: Dict[str, List[Tuple[str, str, str, str, int, float]]] = {}
     for comp, idx in comp_meta:
-        label = comp.std_label or "NA"
+        if value_mode == "none":
+            label = "NONE"
+        elif value_mode == "continuous":
+            label = "L" if comp.ctype == "L" else "C"
+        elif value_mode == "discrete":
+            label = comp.std_label or "NA"
+        else:
+            raise ValueError(f"Unknown value_mode: {value_mode}")
         for node, peer in [(comp.node1, comp.node2), (comp.node2, comp.node1)]:
-            node_map.setdefault(node, []).append((comp.ctype, comp.role, label, peer, idx))
+            value = float(comp.value_si) if value_mode == "continuous" else float("nan")
+            node_map.setdefault(node, []).append((comp.ctype, comp.role, label, peer, idx, value))
 
     tokens: List[str] = []
     for node in sorted(node_map.keys(), key=_node_order):
         tokens.append(f"<NODE_{node}>")
         # order devices on node: type, id
-        for ctype, role, label, peer, idx in sorted(node_map[node], key=lambda x: (x[0], x[4])):
+        for ctype, role, label, peer, idx, _ in sorted(node_map[node], key=lambda x: (x[0], x[4])):
             tokens.extend(
                 [
                     f"<DEV_{ctype}{idx}>",
@@ -65,7 +78,71 @@ def components_to_sfci_net_tokens(components: List[ComponentSpec]) -> List[str]:
     return tokens
 
 
-def sfci_net_tokens_to_components(tokens: List[str], label_to_value: Mapping[str, float] | None = None) -> List[ComponentSpec]:
+def components_to_sfci_net_tokens_and_values(
+    components: List[ComponentSpec],
+    *,
+    value_mode: Literal["continuous", "none", "discrete"] = "continuous",
+) -> Tuple[List[str], List[float]]:
+    """
+    Return SFCI tokens + aligned value targets for continuous value prediction.
+    """
+    # assign deterministic IDs per ctype
+    type_counters: Dict[str, int] = {}
+    comp_meta: List[Tuple[ComponentSpec, int]] = []
+    for comp in sorted(components, key=lambda c: (c.ctype, _node_order(c.node1), _node_order(c.node2))):
+        idx = type_counters.get(comp.ctype, 0)
+        type_counters[comp.ctype] = idx + 1
+        comp_meta.append((comp, idx))
+
+    node_map: Dict[str, List[Tuple[str, str, str, str, int, float]]] = {}
+    for comp, idx in comp_meta:
+        if value_mode == "none":
+            label = "NONE"
+            value = float("nan")
+        elif value_mode == "continuous":
+            label = "L" if comp.ctype == "L" else "C"
+            value = float(comp.value_si)
+        elif value_mode == "discrete":
+            label = comp.std_label or "NA"
+            value = float("nan")
+        else:
+            raise ValueError(f"Unknown value_mode: {value_mode}")
+        for node, peer in [(comp.node1, comp.node2), (comp.node2, comp.node1)]:
+            node_map.setdefault(node, []).append((comp.ctype, comp.role, label, peer, idx, value))
+
+    tokens: List[str] = []
+    values: List[float] = []
+    for node in sorted(node_map.keys(), key=_node_order):
+        tokens.append(f"<NODE_{node}>")
+        values.append(float("nan"))
+        for ctype, role, label, peer, idx, value in sorted(node_map[node], key=lambda x: (x[0], x[4])):
+            tokens.extend(
+                [
+                    f"<DEV_{ctype}{idx}>",
+                    f"<ROLE_{role.upper()}>",
+                    f"<VAL_{label}>",
+                    f"<PEER_{peer}>",
+                ]
+            )
+            values.extend([float("nan"), float("nan"), value, float("nan")])
+        tokens.append("<ENDNODE>")
+        values.append(float("nan"))
+    return tokens, values
+
+
+def _default_value_for_type(ctype: str) -> float:
+    if ctype == "L":
+        return 1e-9
+    if ctype == "C":
+        return 1e-12
+    return 1.0
+
+
+def sfci_net_tokens_to_components(
+    tokens: List[str],
+    label_to_value: Mapping[str, float] | None = None,
+    slot_values: Sequence[float] | None = None,
+) -> List[ComponentSpec]:
     """
     Decode net-centric tokens back to components.
     Components are reconstructed once per undirected pair (node, peer, ctype, id).
@@ -100,22 +177,26 @@ def sfci_net_tokens_to_components(tokens: List[str], label_to_value: Mapping[str
             key = tuple(sorted([current_node, peer]) + [ctype, dev_id])
             if key not in seen:
                 seen.add(key)
-                value = 0.0
-                if val != "NA":
+                value = _default_value_for_type(ctype)
+                if slot_values is not None and len(slot_values) == len(tokens):
+                    v = slot_values[i + 2]
+                    if v == v and v > 0.0:
+                        value = float(v)
+                elif val not in ("NA", "NONE", "L", "C"):
                     if label_to_value is not None:
-                        value = float(label_to_value.get(val, 0.0))
+                        value = float(label_to_value.get(val, value))
                     else:
                         try:
                             from .quantization import label_to_value as _label_to_value
                             value = float(_label_to_value(val))
                         except Exception:
-                            value = 0.0
+                            value = value
                 comps.append(
                     ComponentSpec(
                         ctype=ctype,
                         role=role,
                         value_si=value,
-                        std_label=None if val == "NA" else val,
+                        std_label=None if val in ("NA", "NONE", "L", "C") else val,
                         node1=current_node,
                         node2=peer,
                     )
@@ -148,6 +229,8 @@ def build_sfci_net_vocab(
         for i in range(int(max_id) + 1):
             vocab.add(f"<DEV_{ctype}{i}>")
     vocab.update([f"<ROLE_SERIES>", f"<ROLE_SHUNT>"])
+    vocab.add(VAL_NONE)
+    vocab.update(VALUE_SLOTS)
     for label in value_labels:
         vocab.add(f"<VAL_{label}>")
     return sorted(vocab)

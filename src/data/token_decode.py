@@ -45,6 +45,20 @@ def decode_components_from_token_ids(
         comps = vact_struct_tokens_to_components(tokens, label_to_value=label_to_value, drop_non_component_tokens=True)
         return comps, tokens
     if repr_kind == "sfci":
+        if slot_values is not None:
+            if len(slot_values) != len(ids):
+                raise ValueError(f"slot_values must align with token_ids: {len(slot_values)} != {len(ids)}")
+            full_tokens = tokenizer.convert_ids_to_tokens(ids, skip_special_tokens=False)
+            special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+            filtered_tokens: List[str] = []
+            filtered_values: List[float] = []
+            for tid, tok, v in zip(ids, full_tokens, slot_values):
+                if int(tid) in special_ids:
+                    continue
+                filtered_tokens.append(tok)
+                filtered_values.append(float(v))
+            comps = sfci_net_tokens_to_components(filtered_tokens, label_to_value=label_to_value, slot_values=filtered_values)
+            return comps, filtered_tokens
         comps = sfci_net_tokens_to_components(tokens, label_to_value=label_to_value)
         return comps, tokens
     if repr_kind in ("dsl", "dsl_value"):

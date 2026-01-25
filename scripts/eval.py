@@ -160,7 +160,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty for generation (>1 discourages repeats).")
     p.add_argument("--max-new", type=int, default=256, help="Max new tokens.")
     p.add_argument("--syntax-mask", action="store_true", help="Apply representation grammar mask during decoding.")
-    p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL slots.")
+    p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for continuous value heads.")
+    p.add_argument("--predict-values", action="store_true", help="Predict continuous values for SFCI tokens.")
 
     # simulation + metric
     p.add_argument("--use-ngspice", dest="use_ngspice", action="store_true", help="Use ngspice for evaluation (fallback to Fast Track).")
@@ -384,7 +385,8 @@ def main() -> None:
         seqs = outs.cpu().tolist()
 
         slot_values_seqs = None
-        if args.repr == "dsl":
+        predict_values = args.repr == "dsl" or (args.repr == "sfci" and args.predict_values)
+        if predict_values:
             # Second pass: predict numeric values from decoder hidden states.
             seq_lens = [len(s) for s in seqs]
             max_len = max(seq_lens) if seq_lens else 0

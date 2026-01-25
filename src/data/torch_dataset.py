@@ -304,6 +304,7 @@ class FilterDesignDataset(Dataset):
             value_targets = None
         elif self.use_repr == "sfci":
             tokens_raw = s.get("sfci_tokens")
+            value_targets = s.get("sfci_slot_values")
         else:
             tokens_raw = s.get("action_tokens")
         tokens_raw = tokens_raw or []
