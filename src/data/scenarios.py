@@ -127,6 +127,12 @@ def _apply_spec_overrides(
             hi = max(lo, hi)
             spec["bw_frac"] = float(rng.uniform(lo, hi))
 
+        stopband_range = _parse_range(spec_ranges.get("stopband_max_db"))
+        if stopband_range is not None:
+            lo, hi = float(stopband_range[0]), float(stopband_range[1])
+            lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+            spec["stopband_max_db"] = float(rng.uniform(lo, hi))
+
     if spec_fixed:
         spec.update(spec_fixed)
 
@@ -450,6 +456,7 @@ def sample_scenario_spec(
     topology_type_override: Optional[str] = None,
     spec_fixed: Mapping[str, object] | None = None,
     spec_ranges: Mapping[str, object] | None = None,
+    spec_profile: Mapping[str, Mapping[str, object]] | None = None,
 ) -> Dict[str, object]:
     rng = rng or np.random.default_rng()
     if scenario is None or str(scenario).lower() == "random":
@@ -460,6 +467,32 @@ def sample_scenario_spec(
     scenario = str(scenario)
     if scenario not in SCENARIO_SAMPLERS:
         raise ValueError(f"Unknown scenario: {scenario}")
+    scenario_entry = None
+    if spec_profile:
+        scenario_entry = spec_profile.get(scenario)
+    scenario_fixed = None
+    scenario_ranges = None
+    if isinstance(scenario_entry, Mapping):
+        scenario_fixed = scenario_entry.get("fixed") or scenario_entry.get("spec_fixed")
+        scenario_ranges = scenario_entry.get("ranges") or scenario_entry.get("spec_ranges")
+    spec_fixed_combined: Dict[str, object] | None
+    if spec_fixed or scenario_fixed:
+        spec_fixed_combined = {}
+        if spec_fixed:
+            spec_fixed_combined.update(spec_fixed)
+        if scenario_fixed:
+            spec_fixed_combined.update(scenario_fixed)
+    else:
+        spec_fixed_combined = None
+    spec_ranges_combined: Dict[str, object] | None
+    if spec_ranges or scenario_ranges:
+        spec_ranges_combined = {}
+        if spec_ranges:
+            spec_ranges_combined.update(spec_ranges)
+        if scenario_ranges:
+            spec_ranges_combined.update(scenario_ranges)
+    else:
+        spec_ranges_combined = None
     spec = SCENARIO_SAMPLERS[scenario](
         rng,
         filter_type_override=filter_type_override,
@@ -468,8 +501,8 @@ def sample_scenario_spec(
     )
     return _apply_spec_overrides(
         spec,
-        spec_fixed=spec_fixed,
-        spec_ranges=spec_ranges,
+        spec_fixed=spec_fixed_combined,
+        spec_ranges=spec_ranges_combined,
         rng=rng,
     )
 

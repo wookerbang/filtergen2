@@ -15,6 +15,20 @@ if str(ROOT) not in sys.path:
 from src.data.dataset_builder import build_dataset
 
 
+def _load_json_arg(arg: str | None, *, label: str) -> dict | None:
+    if arg is None:
+        return None
+    path = Path(arg)
+    try:
+        payload = path.read_text() if path.exists() else arg
+    except OSError as exc:
+        raise ValueError(f"Failed to read --{label}: {exc}") from exc
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid --{label} JSON: {exc}") from exc
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate LC filter dataset jsonl.")
     p.add_argument("--num-samples", type=int, default=10, help="Number of samples to generate.")
@@ -50,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--quantize",
         choices=["E24", "E12", "none"],
-        default="E24",
+        default="none",
         help="Quantize component values to E-series (none keeps continuous values).",
     )
     p.add_argument("--vact", dest="vact", action="store_true", help="Emit VACT-Seq tokens.")
@@ -74,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--sfci-value-mode",
         choices=["discrete", "none", "continuous"],
-        default="discrete",
+        default="none",
         help="SFCI value tokens: discrete labels, none (<VAL_NONE>), or continuous placeholders.",
     )
     p.add_argument(
@@ -164,6 +178,61 @@ def parse_args() -> argparse.Namespace:
             "'{\"order\":[2,6],\"fc_hz\":[1e8,1e9],\"bw_frac\":[0.05,0.2],\"ripple_db\":[0.1,0.5]}'."
         ),
     )
+    p.add_argument(
+        "--spec-profile",
+        type=str,
+        help=(
+            "Optional JSON (or path to JSON) mapping scenario -> {fixed:{}, ranges:{}} "
+            "for per-scenario specs."
+        ),
+    )
+    p.add_argument(
+        "--mask-mode",
+        choices=["data", "spec"],
+        default="data",
+        help="Mask generation mode: data-driven masks or spec masks.",
+    )
+    p.add_argument(
+        "--ensure-spec",
+        action="store_true",
+        help="Reject samples that do not satisfy spec masks (re-sample until enough samples).",
+    )
+    p.add_argument(
+        "--ensure-spec-wave",
+        choices=["real", "ideal"],
+        default="real",
+        help="Waveform used for spec compliance checks.",
+    )
+    p.add_argument(
+        "--ensure-max-tries",
+        type=int,
+        default=0,
+        help="Max attempts when --ensure-spec is on (0 = no limit).",
+    )
+    p.add_argument(
+        "--ensure-spec-strategy",
+        choices=["resample", "struct", "order", "mixed"],
+        default="mixed",
+        help="Strategy for spec-compliant generation when --ensure-spec is enabled.",
+    )
+    p.add_argument(
+        "--ensure-struct-tries",
+        type=int,
+        default=2,
+        help="Attempts to resample structure before falling back (mixed strategy).",
+    )
+    p.add_argument(
+        "--ensure-order-tries",
+        type=int,
+        default=2,
+        help="Attempts to resample order before falling back (mixed strategy).",
+    )
+    p.add_argument(
+        "--ensure-order-bias",
+        type=float,
+        default=0.7,
+        help="Bias toward higher order when resampling order (0..1).",
+    )
     return p.parse_args()
 
 
@@ -177,18 +246,9 @@ def main() -> None:
             scenario_weights = json.loads(args.scenario_weights)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid --scenario-weights JSON: {exc}") from exc
-    spec_fixed = None
-    if args.spec_fixed:
-        try:
-            spec_fixed = json.loads(args.spec_fixed)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid --spec-fixed JSON: {exc}") from exc
-    spec_ranges = None
-    if args.spec_ranges:
-        try:
-            spec_ranges = json.loads(args.spec_ranges)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid --spec-ranges JSON: {exc}") from exc
+    spec_fixed = _load_json_arg(args.spec_fixed, label="spec-fixed")
+    spec_ranges = _load_json_arg(args.spec_ranges, label="spec-ranges")
+    spec_profile = _load_json_arg(args.spec_profile, label="spec-profile")
     if args.bp_order_lp is not None or args.bp_order_hp is not None or args.bp_cascade_order is not None:
         if spec_fixed is None:
             spec_fixed = {}
@@ -226,9 +286,18 @@ def main() -> None:
         topology_type_override=args.topology_type,
         spec_fixed=spec_fixed,
         spec_ranges=spec_ranges,
+        spec_profile=spec_profile,
         narrow_freq_grid=bool(args.narrow_freq_grid),
         narrow_freq_span=float(args.narrow_freq_span),
         quantize_series=None if str(args.quantize).lower() == "none" else str(args.quantize),
+        mask_mode=str(args.mask_mode),
+        ensure_spec=bool(args.ensure_spec),
+        ensure_spec_wave=str(args.ensure_spec_wave),
+        ensure_max_tries=int(args.ensure_max_tries),
+        ensure_spec_strategy=str(args.ensure_spec_strategy),
+        ensure_struct_tries=int(args.ensure_struct_tries),
+        ensure_order_tries=int(args.ensure_order_tries),
+        ensure_order_bias=float(args.ensure_order_bias),
     )
     print(f"Dataset written to {path}")
 
