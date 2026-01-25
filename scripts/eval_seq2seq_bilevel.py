@@ -375,7 +375,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokenizer", type=Path, help="Tokenizer path (defaults to --ckpt).")
     p.add_argument("--t5-name", type=str, default="t5-base", help="Base T5 model name (for raw state_dict load).")
     p.add_argument("--repr", choices=["dsl", "dsl_value", "macro_ir", "sfci"], default="macro_ir")
-    p.add_argument("--num", type=int, default=200, help="Number of samples to eval.")
+    p.add_argument("--num", type=int, default=2000, help="Number of samples to eval.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
     p.add_argument("--target-wave", choices=["ideal", "real"], default="real")

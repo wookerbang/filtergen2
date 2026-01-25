@@ -31,6 +31,7 @@ from src.data.dsl import (
     MACRO_SHUNT_NOTCH,
     MACRO_SHUNT_RESO,
     SERIES_MACROS,
+    dsl_tokens_to_macro_values,
     dsl_tokens_to_macro_sequence,
 )
 from src.utils.macro_transition import build_transition_matrices, expected_transition_penalty
@@ -242,6 +243,7 @@ class BilevelDataset(Dataset):
         mask_max = torch.tensor(mask_max, dtype=torch.float32)
 
         dsl_tokens = s.get("dsl_tokens") or []
+        dsl_slot_values = s.get("dsl_slot_values") or []
         return {
             "freq": freq,
             "wave": wave,
@@ -257,6 +259,7 @@ class BilevelDataset(Dataset):
             "mask_min_db": mask_min,
             "mask_max_db": mask_max,
             "dsl_tokens": dsl_tokens,
+            "dsl_slot_values": dsl_slot_values,
             "macro_ir_macros": self.macro_ir_macros[idx],
         }
 
@@ -502,7 +505,7 @@ class CircuitCache:
             self.evictions += 1
         return circuit, slot_idx
 
-def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
+def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int, slot_count: int):
     def collate(batch: List[dict]) -> dict:
         waves = torch.stack([b["wave"] for b in batch])
         scalars = torch.stack([b["scalar"] for b in batch])
@@ -519,6 +522,7 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
         mask_max_db = torch.stack([b["mask_max_db"] for b in batch])
 
         macro_ids = torch.full((len(batch), k_max), int(skip_id), dtype=torch.long)
+        slot_targets = torch.full((len(batch), k_max, slot_count), float("nan"), dtype=torch.float32)
         for i, b in enumerate(batch):
             macros = b.get("macro_ir_macros")
             if macros is None:
@@ -529,6 +533,21 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
                 if m not in macro_to_id:
                     raise ValueError(f"Macro {m} missing from macro vocab.")
                 macro_ids[i, j] = int(macro_to_id[m])
+            if slot_count > 0:
+                dsl_tokens = b.get("dsl_tokens") or []
+                dsl_vals = b.get("dsl_slot_values") or []
+                if dsl_tokens and dsl_vals:
+                    try:
+                        segments = dsl_tokens_to_macro_values(dsl_tokens, slot_values=dsl_vals, strict=False)
+                    except Exception:
+                        segments = []
+                    if segments and len(segments) >= len(macros):
+                        for j, (macro, vals) in enumerate(segments[: len(macros)]):
+                            if macro != macros[j]:
+                                continue
+                            for s_idx, v in enumerate(vals[:slot_count]):
+                                if math.isfinite(v) and v > 0.0:
+                                    slot_targets[i, j, s_idx] = math.log(v)
 
         return {
             "wave": waves,
@@ -546,6 +565,7 @@ def make_collate_fn(macro_to_id: dict, *, skip_id: int, k_max: int):
             "mask_min_db": mask_min_db,
             "mask_max_db": mask_max_db,
             "macro_ids": macro_ids,
+            "slot_targets": slot_targets,
         }
 
     return collate
@@ -708,6 +728,7 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(force_order_length=False)
     p.add_argument("--no-macro-ce", dest="use_macro_ce", action="store_false", help="Disable macro CE loss.")
     p.set_defaults(use_macro_ce=True)
+    p.add_argument("--slot-sup-weight", type=float, default=0.0, help="Weight for supervised slot value regression.")
     p.add_argument("--use-token-loss", action="store_true", help="(Reserved) include token loss during bilevel.")
     p.add_argument("--c-reg-weight", type=float, default=0.0, help="Weight for transition regularizer (0 disables).")
     p.add_argument("--c-skip-penalty", type=float, default=100.0, help="Soft penalty for SKIP->nonSKIP transitions.")
@@ -918,6 +939,7 @@ def main() -> None:
         "alpha_min": args.alpha_min,
         "alpha_decay_frac": args.alpha_decay_frac,
         "use_macro_ce": bool(args.use_macro_ce),
+        "slot_sup_weight": args.slot_sup_weight,
         "len_weight": args.len_weight,
         "unroll_steps": args.unroll_steps,
         "use_unroll": bool(args.use_unroll),
@@ -967,7 +989,7 @@ def main() -> None:
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=make_collate_fn(macro_to_id, skip_id=skip_id, k_max=k_max),
+        collate_fn=make_collate_fn(macro_to_id, skip_id=skip_id, k_max=k_max, slot_count=slot_count),
         **loader_kwargs,
     )
     non_blocking = bool(pin_memory)
@@ -1136,6 +1158,7 @@ def main() -> None:
         epoch_phys_weighted = 0.0
         epoch_phys_barrier = 0.0
         epoch_macro_ce = 0.0
+        epoch_slot_sup = 0.0
         epoch_len = 0.0
         epoch_c_reg = 0.0
         epoch_sym = 0.0
@@ -1236,6 +1259,17 @@ def main() -> None:
             sym_loss = torch.tensor(0.0, device=device, dtype=dtype)
             if float(args.sym_weight) > 0.0:
                 sym_loss = model.query_symmetry_loss(core_only=bool(args.sym_core_only)).to(dtype)
+            slot_sup_loss = None
+            slot_sup_weight = float(args.slot_sup_weight)
+            if slot_sup_weight > 0.0:
+                slot_targets = batch.get("slot_targets")
+                if slot_targets is not None:
+                    slot_targets = slot_targets.to(device, dtype=dtype, non_blocking=non_blocking)
+                    valid = torch.isfinite(slot_targets)
+                    if valid.any():
+                        slot_sup_loss = F.mse_loss(slot_raw[valid], slot_targets[valid])
+                    else:
+                        slot_sup_loss = slot_raw.new_zeros(())
 
             metric_note = ""
             yield_pre_pass = _init_yield_pass_dict()
@@ -1906,6 +1940,8 @@ def main() -> None:
             loss = phys_weight * physics_loss
             if alpha_used != 0.0:
                 loss = loss + float(alpha_used) * macro_ce
+            if slot_sup_loss is not None:
+                loss = loss + float(slot_sup_weight) * slot_sup_loss
             len_weight = float(args.len_weight)
             if len_weight != 0.0:
                 loss = loss + len_weight * len_loss
@@ -1942,6 +1978,8 @@ def main() -> None:
                 if physics_barrier is not None:
                     epoch_phys_barrier += float(physics_barrier.item()) * batch_size
                 epoch_macro_ce += float(macro_ce.item()) * batch_size
+                if slot_sup_loss is not None:
+                    epoch_slot_sup += float(slot_sup_loss.item()) * batch_size
                 epoch_len += float(len_loss.item()) * batch_size
                 epoch_c_reg += float(c_reg.item()) * batch_size
                 epoch_sym += float(sym_loss.item()) * batch_size
@@ -1968,10 +2006,13 @@ def main() -> None:
                 reg_note = ""
                 ste_note = ""
                 phys_note = ""
+                slot_note = ""
                 if float(args.c_reg_weight) > 0.0:
                     reg_note += f" c_reg={c_reg.item():.4f}"
                 if float(args.sym_weight) > 0.0:
                     reg_note += f" sym={sym_loss.item():.4f}"
+                if slot_sup_loss is not None:
+                    slot_note = f" slot_sup={slot_sup_loss.item():.4f}"
                 if args.ste_phys:
                     ste_note = f" ste_k={int(ste_k)}"
                     if physics_loss_soft is not None:
@@ -1997,6 +2038,7 @@ def main() -> None:
                     + (f" skipped={skipped_nonfinite}" if skipped_nonfinite else "")
                     + metric_note
                     + reg_note
+                    + slot_note
                     + phys_note
                     + ste_note
                     + cache_note
@@ -2016,6 +2058,7 @@ def main() -> None:
             avg_loss = epoch_loss / float(epoch_samples)
             avg_phys = epoch_phys / float(epoch_samples)
             avg_macro_ce = epoch_macro_ce / float(epoch_samples)
+            avg_slot_sup = epoch_slot_sup / float(epoch_samples)
             avg_len = epoch_len / float(epoch_samples)
             avg_c_reg = epoch_c_reg / float(epoch_samples)
             avg_sym = epoch_sym / float(epoch_samples)
@@ -2058,9 +2101,10 @@ def main() -> None:
             if args.loss_mode == "weighted_mse":
                 phys_note += f" w_mse={avg_phys_weighted:.4f}"
             phys_note += f" bar={avg_phys_barrier:.4f}"
+            slot_note = f" slot_sup={avg_slot_sup:.4f}" if float(args.slot_sup_weight) > 0.0 else ""
             print(
                 f"[epoch {epoch+1}] avg loss={avg_loss:.4f} phys={avg_phys:.4f} "
-                f"macro_ce={avg_macro_ce:.4f} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
+                f"macro_ce={avg_macro_ce:.4f}{slot_note} len={avg_len:.4f} alpha={avg_alpha:.3f} tau={avg_tau:.3f} "
                 f"mac_acc={macro_acc:.3f} mac_ns={macro_non_skip_acc:.3f} "
                 f"len_mae={len_mae:.3f} len_exact={len_exact:.3f} "
                 f"yield_pre={avg_yield_pre:.3f} yield_post={avg_yield_post:.3f}" + extra_yield + phys_note + reg_note + ste_note
