@@ -296,7 +296,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--loss-mode",
         choices=["full_mse", "constrained_mse", "weighted_mse", "barrier_only"],
-        default="full_mse",
+        default="barrier_only",
     )
     p.add_argument("--w-pass", type=float, default=1.0)
     p.add_argument("--w-stop", type=float, default=5.0)

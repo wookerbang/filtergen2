@@ -280,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Random-topology + refine baseline.")
     p.add_argument("--data", type=Path, required=True, help="Path to eval jsonl.")
     p.add_argument("--config", type=Path, help="Optional input_config.json to sync refine loss settings.")
-    p.add_argument("--num", type=int, default=200, help="Number of samples to evaluate (0=all).")
+    p.add_argument("--num", type=int, default=4000, help="Number of samples to evaluate (0=all).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--target-wave", choices=["auto", "ideal", "real"], default="auto")

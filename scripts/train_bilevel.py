@@ -860,7 +860,7 @@ def main() -> None:
         print("[warn] Matrix Mix mode overridden by STE (--ste-phys enabled).")
     use_matrix_mix = bool(args.matrix_mix and not args.ste_phys)
     if args.ste_phys and not args.use_unroll:
-        print("[warn] STE enabled with --no-unroll; hard path uses direct physics, soft path still unrolls.")
+        print("[warn] STE enabled with --no-unroll; both paths skip unroll (soft uses mixed forward loss).")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1613,27 +1613,44 @@ def main() -> None:
                                 pred_post_s11=pred_s11,
                             )
                         _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
-                    loss_soft = unroll_refine_slots_mixed(
-                        slot_raw[b],
-                        g_sparse[b],
-                        macro_bank,
-                        freq[b],
-                        target[b],
-                        steps=args.unroll_steps,
-                        lr=args.inner_lr,
-                        max_step=args.inner_max_step,
-                        raw_min=args.inner_raw_min,
-                        raw_max=args.inner_raw_max,
-                        nan_backoff=args.inner_nan_backoff,
-                        max_backoff=args.inner_nan_tries,
-                        create_graph=args.unroll_create_graph,
-                        mask_min_db=mask_min_db[b],
-                        mask_max_db=mask_max_db[b],
-                        barrier_weight=barrier_weight_eff,
-                        loss_mode=args.loss_mode,
-                        w_pass=args.w_pass,
-                        w_stop=args.w_stop,
-                    )
+                    if args.use_unroll:
+                        loss_soft = unroll_refine_slots_mixed(
+                            slot_raw[b],
+                            g_sparse[b],
+                            macro_bank,
+                            freq[b],
+                            target[b],
+                            steps=args.unroll_steps,
+                            lr=args.inner_lr,
+                            max_step=args.inner_max_step,
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                            nan_backoff=args.inner_nan_backoff,
+                            max_backoff=args.inner_nan_tries,
+                            create_graph=args.unroll_create_graph,
+                            mask_min_db=mask_min_db[b],
+                            mask_max_db=mask_max_db[b],
+                            barrier_weight=barrier_weight_eff,
+                            loss_mode=args.loss_mode,
+                            w_pass=args.w_pass,
+                            w_stop=args.w_stop,
+                        )
+                    else:
+                        pred_soft = mixed_s21_db(
+                            slot_raw[b],
+                            g_sparse[b],
+                            macro_bank,
+                            freq[b],
+                            raw_min=args.inner_raw_min,
+                            raw_max=args.inner_raw_max,
+                        )
+                        loss_soft, _, _, _, _ = _loss_components(
+                            pred_soft,
+                            target[b],
+                            mask_min_db[b],
+                            mask_max_db[b],
+                            barrier_weight_eff=barrier_weight_eff,
+                        )
                     physics_losses_hard.append(loss_hard)
                     physics_losses_soft.append(loss_soft)
                 physics_loss_hard = torch.stack(physics_losses_hard).mean()
