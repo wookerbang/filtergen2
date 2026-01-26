@@ -668,6 +668,22 @@ def main() -> None:
     def _rate(val: int) -> float | None:
         return (val / yield_total) if yield_total else None
 
+    yield_oracle_tight = {f"{tau:g}": _rate(yield_oracle_pass[tau]) for tau in yield_taus}
+    yield_pre_tight = {f"{tau:g}": _rate(yield_pre_pass[tau]) for tau in yield_taus}
+    yield_post_tight = {f"{tau:g}": _rate(yield_post_pass[tau]) for tau in yield_taus}
+    yield_oracle_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_oracle_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_pre_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_pre_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_post_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_post_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+
     results = {
         "num_samples": total,
         "failed_samples": failed,
@@ -687,6 +703,12 @@ def main() -> None:
         "yield_taus_db": yield_taus,
         "yield_alphas": yield_alphas,
         "yield_s11_max_db": yield_s11_max_db,
+        "yield_oracle_tight_by_tau": yield_oracle_tight,
+        "yield_pre_tight_by_tau": yield_pre_tight,
+        "yield_post_tight_by_tau": yield_post_tight,
+        "yield_oracle_robust_by_tau": yield_oracle_robust_out,
+        "yield_pre_robust_by_tau": yield_pre_robust_out,
+        "yield_post_robust_by_tau": yield_post_robust_out,
         "sim_calls": int(sim_calls),
         "sim_calls_per_sample": (sim_calls / max(1, total - failed)),
         "topology_mode": args.topology_mode,

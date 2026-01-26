@@ -20,7 +20,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.dsl import MACRO_LIBRARY, SERIES_MACROS, dsl_tokens_to_macro_sequence
-from src.physics.differentiable_rf import DynamicCircuitAssembler, barrier_loss, calc_yield, DifferentiablePhysicsKernel
+from src.physics.differentiable_rf import (
+    DynamicCircuitAssembler,
+    barrier_loss,
+    calc_violation_max,
+    calc_violation_quantile,
+    calc_yield,
+    DifferentiablePhysicsKernel,
+)
 
 
 def _expand_macros_with_placeholders(macro_seq: List[Tuple[int, str]], slot_count: int) -> Tuple[list, List[int]]:
@@ -108,6 +115,10 @@ def _resolve_bw_frac(sample: dict, fc_hz: float, f_min: float, f_max: float) -> 
         return float(bw)
     except Exception:
         return 0.0
+
+
+def _parse_csv_floats(s: str) -> List[float]:
+    return [float(x) for x in s.split(",") if x.strip()]
 
 
 def _circuit_s11_db(
@@ -316,12 +327,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yield-threshold", type=float, default=1.0)
     p.add_argument("--yield-tau", type=float, default=0.0, help="Yield tau slack in dB.")
     p.add_argument(
+        "--yield-taus",
+        type=str,
+        default="0,0.25,0.5,1.0",
+        help="Comma-separated tau (dB) slack for yield reporting.",
+    )
+    p.add_argument(
+        "--yield-alphas",
+        type=str,
+        default="0.01,0.03,0.05",
+        help="Comma-separated alpha for robust yield reporting.",
+    )
+    p.add_argument(
         "--yield-s11-max-db",
         type=float,
         default=None,
         help="S11 max (dB) for yield guard (disabled by default).",
     )
     p.add_argument("--output", type=Path, help="Optional JSONL output path.")
+    p.add_argument("--summary-output", type=Path, help="Optional JSON summary output path.")
     return p.parse_args()
 
 
@@ -330,9 +354,17 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    yield_taus = sorted({t for t in _parse_csv_floats(args.yield_taus) if math.isfinite(t) and t >= 0.0})
+    yield_alphas = sorted({a for a in _parse_csv_floats(args.yield_alphas) if math.isfinite(a) and 0.0 < a < 1.0})
     use_s11_yield = args.yield_s11_max_db is not None and math.isfinite(float(args.yield_s11_max_db))
     yield_s11_max_db = float(args.yield_s11_max_db) if use_s11_yield else None
     yield_tau = float(args.yield_tau)
+    if not yield_taus:
+        yield_taus = [yield_tau]
+    if yield_tau not in yield_taus:
+        yield_taus.append(yield_tau)
+        yield_taus = sorted(set(yield_taus))
+    primary_tau = yield_tau
     cfg = {}
     if args.config is not None:
         with args.config.open("r", encoding="utf-8") as f:
@@ -403,6 +435,13 @@ def main() -> None:
     mask_pass_empty = 0
     mask_stop_empty = 0
     mask_empty = 0
+    yield_total = 0
+    yield_pre_pass = {tau: 0 for tau in yield_taus}
+    yield_post_pass = {tau: 0 for tau in yield_taus}
+    yield_oracle_pass = {tau: 0 for tau in yield_taus}
+    yield_pre_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+    yield_post_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
+    yield_oracle_robust = {(tau, alpha): 0 for tau in yield_taus for alpha in yield_alphas}
 
     for idx in idxs:
         s = samples[idx]
@@ -493,6 +532,69 @@ def main() -> None:
         )
         if float(pre_yield.item()) >= float(args.yield_threshold):
             success_pre += 1
+        if torch.isfinite(mask_min).any() or torch.isfinite(mask_max).any():
+            yield_total += 1
+            oracle_s11 = None
+            if use_s11_yield:
+                if args.target_wave == "ideal":
+                    oracle_s11 = torch.tensor(s.get("ideal_s11_db"), dtype=torch.float32, device=device)
+                elif args.target_wave == "real":
+                    oracle_s11 = torch.tensor(s.get("real_s11_db"), dtype=torch.float32, device=device)
+                else:
+                    oracle_s11 = torch.tensor(
+                        s.get("real_s11_db") or s.get("ideal_s11_db"),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+            oracle_max = float(
+                calc_violation_max(
+                    target,
+                    mask_min,
+                    mask_max,
+                    pred_s11_db=oracle_s11,
+                    s11_max_db=yield_s11_max_db,
+                ).item()
+            )
+            pre_max = float(
+                calc_violation_max(
+                    pred_pre,
+                    mask_min,
+                    mask_max,
+                    pred_s11_db=pred_pre_s11,
+                    s11_max_db=yield_s11_max_db,
+                ).item()
+            )
+            for tau_val in yield_taus:
+                if oracle_max <= tau_val:
+                    yield_oracle_pass[tau_val] += 1
+                if pre_max <= tau_val:
+                    yield_pre_pass[tau_val] += 1
+            for alpha_val in yield_alphas:
+                oracle_q = float(
+                    calc_violation_quantile(
+                        target,
+                        mask_min,
+                        mask_max,
+                        alpha=alpha_val,
+                        pred_s11_db=oracle_s11,
+                        s11_max_db=yield_s11_max_db,
+                    ).item()
+                )
+                pre_q = float(
+                    calc_violation_quantile(
+                        pred_pre,
+                        mask_min,
+                        mask_max,
+                        alpha=alpha_val,
+                        pred_s11_db=pred_pre_s11,
+                        s11_max_db=yield_s11_max_db,
+                    ).item()
+                )
+                for tau_val in yield_taus:
+                    if oracle_q <= tau_val:
+                        yield_oracle_robust[(tau_val, alpha_val)] += 1
+                    if pre_q <= tau_val:
+                        yield_pre_robust[(tau_val, alpha_val)] += 1
 
         refined_raw, loss_hist, steps_to_success = _refine_slots(
             slot_raw,
@@ -535,6 +637,33 @@ def main() -> None:
             s11_max_db=yield_s11_max_db,
             tau_db=yield_tau,
         )
+        if torch.isfinite(mask_min).any() or torch.isfinite(mask_max).any():
+            post_max = float(
+                calc_violation_max(
+                    pred_post,
+                    mask_min,
+                    mask_max,
+                    pred_s11_db=pred_post_s11,
+                    s11_max_db=yield_s11_max_db,
+                ).item()
+            )
+            for tau_val in yield_taus:
+                if post_max <= tau_val:
+                    yield_post_pass[tau_val] += 1
+            for alpha_val in yield_alphas:
+                post_q = float(
+                    calc_violation_quantile(
+                        pred_post,
+                        mask_min,
+                        mask_max,
+                        alpha=alpha_val,
+                        pred_s11_db=pred_post_s11,
+                        s11_max_db=yield_s11_max_db,
+                    ).item()
+                )
+                for tau_val in yield_taus:
+                    if post_q <= tau_val:
+                        yield_post_robust[(tau_val, alpha_val)] += 1
 
         results.append(
             {
@@ -569,12 +698,71 @@ def main() -> None:
     if mask_mode == "dynamic":
         print(f"mask_pass_empty={mask_pass_empty} mask_stop_empty={mask_stop_empty} mask_empty={mask_empty}")
 
+    def _rate(val: int) -> float | None:
+        return (val / yield_total) if yield_total else None
+
+    yield_oracle_tight = {f"{tau:g}": _rate(yield_oracle_pass[tau]) for tau in yield_taus}
+    yield_pre_tight = {f"{tau:g}": _rate(yield_pre_pass[tau]) for tau in yield_taus}
+    yield_post_tight = {f"{tau:g}": _rate(yield_post_pass[tau]) for tau in yield_taus}
+    yield_oracle_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_oracle_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_pre_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_pre_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+    yield_post_robust_out = {
+        f"{alpha:g}": {f"{tau:g}": _rate(yield_post_robust[(tau, alpha)]) for tau in yield_taus}
+        for alpha in yield_alphas
+    }
+
+    summary = {
+        "num_samples": len(results),
+        "pre_mse_avg": avg_pre,
+        "post_mse_avg": avg_post,
+        "pre_yield_avg": avg_pre_y,
+        "post_yield_avg": avg_post_y,
+        "success_rate": success_rate,
+        "success_per_sim": success_per_sim,
+        "steps_to_success_mean": step_mean,
+        "yield_total": yield_total,
+        "yield_oracle": _rate(yield_oracle_pass[primary_tau]),
+        "yield_pre": _rate(yield_pre_pass[primary_tau]),
+        "yield_post": _rate(yield_post_pass[primary_tau]),
+        "yield_taus_db": yield_taus,
+        "yield_alphas": yield_alphas,
+        "yield_s11_max_db": yield_s11_max_db,
+        "yield_oracle_tight_by_tau": yield_oracle_tight,
+        "yield_pre_tight_by_tau": yield_pre_tight,
+        "yield_post_tight_by_tau": yield_post_tight,
+        "yield_oracle_robust_by_tau": yield_oracle_robust_out,
+        "yield_pre_robust_by_tau": yield_pre_robust_out,
+        "yield_post_robust_by_tau": yield_post_robust_out,
+        "mask_mode": mask_mode,
+        "mask_pass_drop_db": mask_pass_drop_db,
+        "mask_stop_rel_db": mask_stop_rel_db,
+        "mask_delta_pass": mask_delta_pass,
+        "mask_delta_stop": mask_delta_stop,
+        "mask_peak_quantile": mask_peak_quantile,
+        "mask_pass_max_db": mask_pass_max_db,
+        "mask_pass_empty": mask_pass_empty,
+        "mask_stop_empty": mask_stop_empty,
+        "mask_empty": mask_empty,
+    }
+    print(json.dumps(summary, indent=2))
+
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("w") as f:
             for row in results:
                 f.write(json.dumps(row) + "\n")
         print(f"Wrote {args.output}")
+    if args.summary_output:
+        args.summary_output.parent.mkdir(parents=True, exist_ok=True)
+        with args.summary_output.open("w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Wrote {args.summary_output}")
 
 
 if __name__ == "__main__":
