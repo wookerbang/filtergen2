@@ -742,6 +742,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ste-topk", type=int, default=3, help="Top-k sparsity for STE soft mixing.")
     p.add_argument("--ste-topk-anneal-frac", type=float, default=0.2, help="Anneal top-k to 1 over last fraction.")
     p.add_argument("--ste-phys-weight", type=float, default=1.0, help="Weight for STE soft physics loss.")
+    p.add_argument("--rl-topo", action="store_true", help="Use REINFORCE on hard topology samples.")
+    p.add_argument("--rl-weight", type=float, default=1.0, help="Weight for RL (policy gradient) loss.")
+    p.add_argument(
+        "--rl-baseline-momentum",
+        type=float,
+        default=0.9,
+        help="EMA momentum for RL reward baseline.",
+    )
     p.add_argument(
         "--oracle-macros",
         action="store_true",
@@ -859,6 +867,10 @@ def main() -> None:
     if args.ste_phys and args.matrix_mix:
         print("[warn] Matrix Mix mode overridden by STE (--ste-phys enabled).")
     use_matrix_mix = bool(args.matrix_mix and not args.ste_phys)
+    if args.rl_topo and (args.ste_phys or use_matrix_mix):
+        print("[warn] RL-topo enabled; disabling STE/matrix_mix.")
+        args.ste_phys = False
+        use_matrix_mix = False
     if args.ste_phys and not args.use_unroll:
         print("[warn] STE enabled with --no-unroll; both paths skip unroll (soft uses mixed forward loss).")
     random.seed(args.seed)
@@ -965,6 +977,9 @@ def main() -> None:
         "ste_topk": args.ste_topk,
         "ste_topk_anneal_frac": args.ste_topk_anneal_frac,
         "ste_phys_weight": args.ste_phys_weight,
+        "rl_topo": bool(args.rl_topo),
+        "rl_weight": float(args.rl_weight),
+        "rl_baseline_momentum": float(args.rl_baseline_momentum),
         "oracle_macros": bool(args.oracle_macros),
         "c_reg_weight": args.c_reg_weight,
         "c_skip_penalty": args.c_skip_penalty,
@@ -1142,6 +1157,7 @@ def main() -> None:
 
     model.train()
     skipped_nonfinite = 0
+    rl_baseline = 0.0
     for epoch in range(int(args.epochs)):
         epoch_samples = 0
         epoch_tokens = 0
@@ -1387,6 +1403,7 @@ def main() -> None:
                 phys_barrier.append(barrier_val)
 
             physics_loss_soft = None
+            rl_loss = torch.tensor(0.0, device=device, dtype=dtype)
             if args.oracle_macros:
                 physics_losses = []
                 for b in range(wave.shape[0]):
@@ -1497,6 +1514,129 @@ def main() -> None:
                         _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
                     physics_losses.append(loss_b)
                 physics_loss = torch.stack(physics_losses).mean()
+            elif args.rl_topo:
+                physics_losses = []
+                logp_list = []
+                reward_list = []
+                for b in range(wave.shape[0]):
+                    probs = F.softmax(g_logits[b], dim=-1)
+                    dist = torch.distributions.Categorical(probs)
+                    macro_ids_raw = dist.sample()
+                    macro_ids_hard = _enforce_non_empty(macro_ids_raw, g_logits[b], skip_id)
+                    logp = dist.log_prob(macro_ids_hard).sum()
+                    logp_list.append(logp)
+                    slot_mask = macro_slot_mask[macro_ids_hard].to(dtype)
+                    circuit, slot_idx = circuit_cache.get(macro_ids_hard)
+                    pred_pre = None
+                    pred_pre_s11 = None
+                    if log_yield:
+                        raw_pre = slot_raw[b].to(dtype).clamp(inner_raw_min, inner_raw_max)
+                        values_flat = torch.exp(raw_pre.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                        values_vec = values_flat.index_select(0, slot_idx)
+                        pred_pre = circuit(freq[b], values=values_vec, output="s21_db")
+                        if use_s11_yield:
+                            pred_pre_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
+                    if args.use_unroll:
+                        need_raw = bool(log_yield or log_phys_metrics)
+                        if need_raw:
+                            loss_b, raw_post = unroll_refine_slots(
+                                slot_raw[b],
+                                slot_mask,
+                                slot_idx,
+                                circuit,
+                                freq[b],
+                                target[b],
+                                steps=args.unroll_steps,
+                                lr=args.inner_lr,
+                                max_step=args.inner_max_step,
+                                raw_min=args.inner_raw_min,
+                                raw_max=args.inner_raw_max,
+                                nan_backoff=args.inner_nan_backoff,
+                                max_backoff=args.inner_nan_tries,
+                                create_graph=args.unroll_create_graph,
+                                return_raw=True,
+                                mask_min_db=mask_min_db[b],
+                                mask_max_db=mask_max_db[b],
+                                barrier_weight=barrier_weight_eff,
+                                loss_mode=args.loss_mode,
+                                w_pass=args.w_pass,
+                                w_stop=args.w_stop,
+                            )
+                            raw_post = raw_post.detach()
+                            values_flat_post = torch.exp(raw_post.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                            values_vec_post = values_flat_post.index_select(0, slot_idx)
+                            pred_post = circuit(freq[b], values=values_vec_post, output="s21_db")
+                            pred_post_s11 = None
+                            if log_yield and use_s11_yield:
+                                pred_post_s11 = _circuit_s11_db(circuit, freq[b], values_vec_post)
+                            if log_yield:
+                                _accum_yield(
+                                    pred_pre,
+                                    pred_post,
+                                    mask_min_db[b],
+                                    mask_max_db[b],
+                                    pred_pre_s11=pred_pre_s11,
+                                    pred_post_s11=pred_post_s11,
+                                )
+                            _record_phys(pred_post, target[b], mask_min_db[b], mask_max_db[b])
+                        else:
+                            loss_b = unroll_refine_slots(
+                                slot_raw[b],
+                                slot_mask,
+                                slot_idx,
+                                circuit,
+                                freq[b],
+                                target[b],
+                                steps=args.unroll_steps,
+                                lr=args.inner_lr,
+                                max_step=args.inner_max_step,
+                                raw_min=args.inner_raw_min,
+                                raw_max=args.inner_raw_max,
+                                nan_backoff=args.inner_nan_backoff,
+                                max_backoff=args.inner_nan_tries,
+                                create_graph=args.unroll_create_graph,
+                                mask_min_db=mask_min_db[b],
+                                mask_max_db=mask_max_db[b],
+                                barrier_weight=barrier_weight_eff,
+                                loss_mode=args.loss_mode,
+                                w_pass=args.w_pass,
+                                w_stop=args.w_stop,
+                            )
+                    else:
+                        raw = slot_raw[b].clamp(min=float(args.inner_raw_min), max=float(args.inner_raw_max))
+                        values_flat = torch.exp(raw.reshape(-1)) * slot_mask.reshape(-1) + 1e-30
+                        values_vec = values_flat.index_select(0, slot_idx)
+                        pred = circuit(freq[b], values=values_vec, output="s21_db")
+                        loss_b, _, _, _, _ = _loss_components(
+                            pred,
+                            target[b],
+                            mask_min_db[b],
+                            mask_max_db[b],
+                            barrier_weight_eff=barrier_weight_eff,
+                        )
+                        if log_yield:
+                            pred_s11 = None
+                            if use_s11_yield:
+                                pred_s11 = _circuit_s11_db(circuit, freq[b], values_vec)
+                            _accum_yield(
+                                pred,
+                                pred,
+                                mask_min_db[b],
+                                mask_max_db[b],
+                                pred_pre_s11=pred_s11,
+                                pred_post_s11=pred_s11,
+                            )
+                        _record_phys(pred, target[b], mask_min_db[b], mask_max_db[b])
+                    physics_losses.append(loss_b)
+                    reward_list.append(-loss_b.detach())
+                physics_loss = torch.stack(physics_losses).mean()
+                if logp_list:
+                    logp = torch.stack(logp_list)
+                    rewards = torch.stack(reward_list)
+                    reward_mean = float(rewards.mean().item())
+                    rl_baseline = float(args.rl_baseline_momentum) * rl_baseline + (1.0 - float(args.rl_baseline_momentum)) * reward_mean
+                    adv = rewards - rl_baseline
+                    rl_loss = -(adv * logp).mean()
             elif args.ste_phys:
                 if macro_bank is None or g_sparse is None:
                     raise ValueError("STE enabled but macro_bank/g_sparse not initialized.")
@@ -1953,6 +2093,8 @@ def main() -> None:
 
             alpha = _alpha_schedule(step, total_steps, alpha_start=args.alpha_start, alpha_min=args.alpha_min, decay_frac=args.alpha_decay_frac)
             alpha_used = float(alpha) if bool(args.use_macro_ce) else 0.0
+            if args.rl_topo:
+                alpha_used = 0.0
             phys_weight = float(args.phys_weight)
             loss = phys_weight * physics_loss
             if alpha_used != 0.0:
@@ -1966,6 +2108,8 @@ def main() -> None:
                 loss = loss + float(args.c_reg_weight) * c_reg
             if float(args.sym_weight) > 0.0:
                 loss = loss + float(args.sym_weight) * sym_loss
+            if args.rl_topo:
+                loss = loss + float(args.rl_weight) * rl_loss
             if not torch.isfinite(loss):
                 skipped_nonfinite += 1
                 if not args.skip_nonfinite and skipped_nonfinite <= 3:
@@ -2048,6 +2192,7 @@ def main() -> None:
                         phys_note += f" w_mse={physics_mse_weighted.item():.4f}"
                     if physics_barrier is not None:
                         phys_note += f" bar={physics_barrier.item():.4f} bar_w={barrier_weight_eff:.2f}"
+                rl_note = f" rl={rl_loss.item():.4f}" if args.rl_topo else ""
                 print(
                     f"[epoch {epoch+1}] step={step} loss={loss.item():.4f} "
                     f"phys={physics_loss.item():.4f} phys_w={phys_weight:.1e} "
@@ -2057,6 +2202,7 @@ def main() -> None:
                     + reg_note
                     + slot_note
                     + phys_note
+                    + rl_note
                     + ste_note
                     + cache_note
                 )
